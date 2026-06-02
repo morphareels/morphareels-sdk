@@ -1,0 +1,12 @@
+{
+  "name": "morpha-studio-sdk-source",
+  "private": true,
+  "description": "Source workspace for the morpha-studio-sdk npm package. The package lives in sdk/; src/ and editor/src/ are the shared core it is built from. Install once at the root, then build the sdk workspace.",
+  "license": "MIT",
+  "workspaces": [
+    "sdk"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace sdk"
+  }
+}

@@ -1,0 +1,49 @@
+// morpha-studio-sdk — the Morpha SDK.
+//
+// Build, caption, and render short-form video projects in code. The project-
+// building half is pure (no browser, no ffmpeg); renderFrame() drives a real
+// browser to render a composited frame (no ffmpeg — see ./render.ts).
+
+// ── Pure project core (no browser, no ffmpeg) ───────────────────────────────
+// Every Morpha tool as a pure (project, args) => { project, result } function,
+// plus the catalog metadata.
+export { dispatch, TOOL_DEFINITIONS } from "../../src/tools.ts";
+export type { ToolFunction, ToolResult, ToolDispatch } from "../../src/tools.ts";
+
+// A blank, schema-valid project to start from.
+export { blankProject } from "../../src/blank-project.ts";
+export type { BlankProjectOpts } from "../../src/blank-project.ts";
+
+// Schema: validate + migrate project JSON, and the project/layer types.
+export { projectSchema, migrateProject } from "../../src/schemas.ts";
+export type {
+  Project,
+  ImageLayer,
+  VideoLayer,
+  TextLayer,
+  LayerStyle,
+  Easing,
+} from "../../src/schemas.ts";
+
+// Captioning: transcript words -> synced caption track.
+export {
+  transcriptToCaptionLines,
+  buildCaptionsForClip,
+  hasCaptionsForClip,
+  removeCaptionsForClip,
+  videoElementIdForClip,
+} from "../../src/captions.ts";
+export type { CaptionLine, TranscriptWordLike } from "../../src/captions.ts";
+
+// ── Rendering (real browser, no ffmpeg) ─────────────────────────────────────
+export { renderFrame } from "./render.ts";
+export type { RenderFrameOptions } from "./render.ts";
+
+// ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───
+// createClient({ token }) → getProject / listTools / callTool / renderFrame.
+export { createClient } from "./client.ts";
+export type {
+  MorphaClient,
+  MorphaClientOptions,
+  ToolCallResult,
+} from "./client.ts";
