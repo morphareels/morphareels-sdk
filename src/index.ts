@@ -7,15 +7,15 @@
 // ── Pure project core (no browser, no ffmpeg) ───────────────────────────────
 // Every Morpha tool as a pure (project, args) => { project, result } function,
 // plus the catalog metadata.
-export { dispatch, TOOL_DEFINITIONS } from "../../src/tools.ts";
-export type { ToolFunction, ToolResult, ToolDispatch } from "../../src/tools.ts";
+export { dispatch, TOOL_DEFINITIONS } from "./core/tools.ts";
+export type { ToolFunction, ToolResult, ToolDispatch } from "./core/tools.ts";
 
 // A blank, schema-valid project to start from.
-export { blankProject } from "../../src/blank-project.ts";
-export type { BlankProjectOpts } from "../../src/blank-project.ts";
+export { blankProject } from "./core/blank-project.ts";
+export type { BlankProjectOpts } from "./core/blank-project.ts";
 
 // Schema: validate + migrate project JSON, and the project/layer types.
-export { projectSchema, migrateProject } from "../../src/schemas.ts";
+export { projectSchema, migrateProject } from "./core/schemas.ts";
 export type {
   Project,
   ImageLayer,
@@ -23,7 +23,7 @@ export type {
   TextLayer,
   LayerStyle,
   Easing,
-} from "../../src/schemas.ts";
+} from "./core/schemas.ts";
 
 // Captioning: transcript words -> synced caption track.
 export {
@@ -32,8 +32,8 @@ export {
   hasCaptionsForClip,
   removeCaptionsForClip,
   videoElementIdForClip,
-} from "../../src/captions.ts";
-export type { CaptionLine, TranscriptWordLike } from "../../src/captions.ts";
+} from "./core/captions.ts";
+export type { CaptionLine, TranscriptWordLike } from "./core/captions.ts";
 
 // ── Rendering (real browser, no ffmpeg) ─────────────────────────────────────
 export { renderFrame } from "./render.ts";

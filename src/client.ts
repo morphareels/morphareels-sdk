@@ -10,8 +10,8 @@
 // Bearer API key (mp_…). Every tool you can call over MCP, you can call here
 // with `client.callTool(projectId, name, args)` — same catalog, same effects.
 
-import { migrateProject, projectSchema, type Project } from "../../src/schemas.ts";
-import type { ToolFunction, ToolResult } from "../../src/tools.ts";
+import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
+import type { ToolFunction, ToolResult } from "./core/tools.ts";
 import { renderFrame, type RenderFrameOptions } from "./render.ts";
 
 export interface MorphaClientOptions {

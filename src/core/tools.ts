@@ -24,7 +24,7 @@ import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 import {
   allFontEntries,
   type FontSource,
-} from "../editor/src/font-sources.ts";
+} from "./font-sources.ts";
 import {
   fillSchema,
   findParentGroup,

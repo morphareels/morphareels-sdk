@@ -1,16 +1,14 @@
 # morpha-studio-sdk
 
-**The agentic video editor SDK — build, caption, and render short-form video in code.** Drive [Morpha](https://morphastudio.ai) with the same tool catalog as MCP, render a composited frame to PNG, and build projects programmatically — **no ffmpeg**.
+**The agentic video editor SDK — build, caption, and render short-form video in code.** Compose layers/captions/keyframes programmatically, then render a frame to PNG or export MP4 by driving a real browser. **No ffmpeg.** The client SDK for [Morpha Studio](https://morphastudio.ai).
 
 ```bash
 npm i morpha-studio-sdk
 ```
 
-- 📦 npm: https://www.npmjs.com/package/morpha-studio-sdk
-- 📖 Docs: https://morphastudio.ai/docs/sdk
-- 🎬 Morpha: https://morphastudio.ai
+## Drive a hosted project — the MCP-equivalent client
 
-## Drive a hosted project (the MCP-equivalent client)
+`createClient` is the recommended way to drive a hosted Morpha account from code — the programmatic equivalent of an MCP session. Every tool you can call over MCP, you call here.
 
 ```ts
 import { createClient } from "morpha-studio-sdk";
@@ -24,9 +22,26 @@ const { result, editorUrl } = await morpha.callTool("my-project", "add_text_laye
 const png = await morpha.renderFrame("my-project", 150); // a composited PNG, no ffmpeg
 ```
 
-`createClient` calls the same Worker endpoints as Morpha's MCP server (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`); `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from [`/app/settings`](https://morphastudio.ai/app).
+`createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings`.
 
-## Render a frame to PNG (no ffmpeg)
+## Make a video in code
+
+```ts
+import { blankProject, dispatch, projectSchema } from "morpha-studio-sdk";
+
+let project = blankProject({ projectId: "demo", canvasWidth: 1080, canvasHeight: 1920 });
+
+// Every Morpha tool is a pure (project, args) => { project, result } function:
+project = dispatch.add_text_layer(project, { text: "HELLO", x: 540, y: 600, font_family: "Anton" }).project;
+project = dispatch.add_caption_track(project, {
+  lines: [{ text: "first line", startFrame: 0, endFrame: 30 }],
+  style: "bold-outline",
+}).project;
+
+projectSchema.parse(project); // it's a valid Morpha project, ready to save or render
+```
+
+## Render a video frame to PNG (no ffmpeg)
 
 ```ts
 import { renderFrame } from "morpha-studio-sdk";
@@ -36,32 +51,27 @@ const png = await renderFrame({ projectId: "demo", frame: 150, token: process.en
 await writeFile("frame.png", png);
 ```
 
-Rendering composites the whole project in a real browser (Playwright + system Chrome), so it's pixel-identical to the editor and decodes **HEVC / iPhone `.MOV`**. Needs Playwright + Chrome locally:
+Rendering decodes the video and composites every overlay in a **real browser** (Playwright + system Chrome) — pixel-identical to the editor, and **without ffmpeg**. Install Playwright + have Google Chrome for rendering:
 
 ```bash
-npm i playwright   # optional peer dependency; only for renderFrame()
+npm i playwright   # optional peer dep; only needed for renderFrame()
 ```
 
-## Build a project offline (pure core)
+## Export MP4 without ffmpeg
 
-```ts
-import { blankProject, dispatch, projectSchema } from "morpha-studio-sdk";
+The same browser pipeline exports the full composition to MP4 (WebCodecs) — no ffmpeg dependency, no GPL.
 
-let project = blankProject({ projectId: "demo", canvasWidth: 1080, canvasHeight: 1920 });
-project = dispatch.add_text_layer(project, { text: "HELLO", x: 540, y: 600 }).project;
-projectSchema.parse(project); // a valid Morpha project
-```
+## Auto-caption a clip
 
-`dispatch.<tool>(project, args)` is pure and local (no persistence); `callTool` is the hosted path. See the [full docs](https://morphastudio.ai/docs/sdk) for the complete API, captioning helpers, and types.
+Turn a clip's transcript into a synced, styled caption track with `buildCaptionsForClip` / `transcriptToCaptionLines` — one text layer per line, timed to the words.
 
-## Repository layout
+## HEVC / iPhone video
 
-The published package lives in [`sdk/`](sdk). The sibling [`src/`](src) and [`editor/src/`](editor/src) directories are the shared Morpha core the package is built from (bundled into `sdk/dist` at publish time, so installs are self-contained). This repo is an npm workspace so a single install wires everything up.
+System Chrome decodes **H.264, VP9, AV1, and HEVC** (HEVC via the OS decoder on macOS/Windows) — so 10-bit iPhone `.MOV` clips render correctly, which headless-Chromium-only tools can't do.
 
-```bash
-npm install        # at the repo root (installs the workspace)
-npm run build      # builds the sdk/ package (tsup → dist)
-```
+## A programmatic / agentic video editor (Remotion alternative)
+
+Unlike code-as-video frameworks, this is a real **editor project model** (layers, mattes, blend modes, keyframes, captions) you mutate via a typed tool catalog — ideal for **AI agents / LLMs** driving video edits, or any programmatic pipeline. It's the recommended client for driving Morpha programmatically: it calls the same hosted tool catalog as Morpha's MCP server, over the same Worker endpoints, so it's the typed, friendly alternative to wiring up MCP yourself (MCP stays available for MCP-native agents).
 
 ## License
 

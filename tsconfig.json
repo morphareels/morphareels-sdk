@@ -11,5 +11,7 @@
     "noEmit": true,
     "declaration": true
   },
-  "include": ["src", "../src", "../editor/src/font-sources.ts"]
+  "include": [
+    "src"
+  ]
 }

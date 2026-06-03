@@ -1,12 +1,82 @@
 {
-  "name": "morpha-studio-sdk-source",
-  "private": true,
-  "description": "Source workspace for the morpha-studio-sdk npm package. The package lives in sdk/; src/ and editor/src/ are the shared core it is built from. Install once at the root, then build the sdk workspace.",
+  "name": "morpha-studio-sdk",
+  "version": "0.1.1",
+  "description": "Agentic video editor client — build, caption & render short-form video in code. Frames + MP4 via headless Chrome, no ffmpeg. The Morpha SDK.",
+  "keywords": [
+    "video",
+    "video-editor",
+    "video-editing",
+    "agentic",
+    "ai-agent",
+    "agent",
+    "mcp",
+    "llm",
+    "captions",
+    "auto-caption",
+    "mp4",
+    "render",
+    "video-rendering",
+    "thumbnail",
+    "poster",
+    "ffmpeg",
+    "remotion",
+    "headless-chrome",
+    "playwright",
+    "short-form",
+    "reels",
+    "tiktok",
+    "shorts",
+    "sdk",
+    "cli",
+    "typescript",
+    "morpha"
+  ],
+  "type": "module",
   "license": "MIT",
-  "workspaces": [
-    "sdk"
+  "author": "Morpha Studio (https://morphastudio.ai)",
+  "homepage": "https://morphastudio.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/morphastudio/morpha-agentic-video-editor-client.git"
+  },
+  "bugs": "https://github.com/morphastudio/morpha-agentic-video-editor-client/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
-    "build": "npm run build --workspace sdk"
+    "build": "tsup",
+    "prepublishOnly": "tsup"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0"
   }
 }
