@@ -120,3 +120,101 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
     await browser.close();
   }
 };
+
+export interface RenderVideoOptions {
+  /** Project id, served at `${origin}/render-export?project=<id>`. */
+  projectId: string;
+  /** Origin serving /render-export + /api/project + /clips. Default https://morphastudio.ai */
+  origin?: string;
+  /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
+  token?: string;
+  /**
+   * Browser channel. Defaults to system Chrome ("chrome") so the WebCodecs
+   * H.264 encoder is available. Do NOT use "chromium" — it ships without the
+   * proprietary codec and the export will fail.
+   */
+  channel?: string;
+  /**
+   * Milliseconds to wait for the in-browser encode to finish. Default 600000
+   * (10 min). A 30 s 1080×1920 composition encodes in well under a minute on a
+   * modern machine; long projects or slow-loading clips need more headroom.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Render a project's FULL composition to an MP4 Buffer using a REAL local
+ * browser — the same in-browser WebCodecs H.264 pipeline the editor's Render
+ * button uses (no ffmpeg, no server). Drives the `/render-export` page with the
+ * project loaded, waits for the encode to finish, and returns the MP4 bytes.
+ * Requires `playwright` installed (optional peer dependency) and Google Chrome
+ * available (the default `channel: "chrome"` — Chromium can't encode H.264).
+ */
+export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => {
+  let pw: typeof import("playwright");
+  try {
+    pw = await import("playwright");
+  } catch {
+    throw new Error(
+      "renderVideo() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
+    );
+  }
+  const origin = opts.origin ?? "https://morphastudio.ai";
+  const timeout = opts.timeoutMs ?? 600_000;
+
+  const browser = await pw.chromium.launch({
+    channel: opts.channel ?? "chrome",
+    headless: true,
+  });
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 1080, height: 1920 },
+    });
+    if (opts.token) {
+      await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
+    }
+    const page = await ctx.newPage();
+    const url = `${origin}/render-export?project=${encodeURIComponent(opts.projectId)}`;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+    try {
+      await page.waitForFunction(
+        () =>
+          (window as unknown as { __morphaExportReady?: boolean })
+            .__morphaExportReady === true,
+        { timeout },
+      );
+    } catch {
+      throw new Error(
+        `Morpha export timed out after ${Math.round(timeout / 1000)}s for project ${opts.projectId} — raise timeoutMs for long projects or large clips.`,
+      );
+    }
+
+    const status = (await page.evaluate(() => {
+      const w = window as unknown as {
+        __morphaExportStatus?: string;
+        __morphaExportError?: string;
+      };
+      return { status: w.__morphaExportStatus, error: w.__morphaExportError };
+    })) as { status?: string; error?: string };
+    if (status.status !== "ok") {
+      throw new Error(
+        `Morpha export failed for project ${opts.projectId}: ${status.error ?? "export reported not-ok"}`,
+      );
+    }
+
+    const base64 = (await page.evaluate(
+      () =>
+        (window as unknown as { __morphaExportBase64?: string })
+          .__morphaExportBase64 ?? "",
+    )) as string;
+    if (!base64) {
+      throw new Error(
+        `Morpha export produced an empty MP4 for project ${opts.projectId}`,
+      );
+    }
+    return Buffer.from(base64, "base64");
+  } finally {
+    await browser.close();
+  }
+};

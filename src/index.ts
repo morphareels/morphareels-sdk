@@ -35,9 +35,11 @@ export {
 } from "./core/captions.ts";
 export type { CaptionLine, TranscriptWordLike } from "./core/captions.ts";
 
-// ── Rendering (real browser, no ffmpeg) ─────────────────────────────────────
-export { renderFrame } from "./render.ts";
-export type { RenderFrameOptions } from "./render.ts";
+// ── Rendering (real local browser, no ffmpeg, no server) ────────────────────
+// renderFrame → one composited PNG; renderVideo → the full MP4 (the same
+// in-browser WebCodecs pipeline the editor's Render button uses).
+export { renderFrame, renderVideo } from "./render.ts";
+export type { RenderFrameOptions, RenderVideoOptions } from "./render.ts";
 
 // ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───
 // createClient({ token }) → getProject / listTools / callTool / renderFrame.

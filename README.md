@@ -20,6 +20,7 @@ const { result, editorUrl } = await morpha.callTool("my-project", "add_text_laye
   text: "HELLO", x: 540, y: 600, font_family: "Anton",
 });
 const png = await morpha.renderFrame("my-project", 150); // a composited PNG, no ffmpeg
+const mp4 = await morpha.renderVideo("my-project");      // the full composition as MP4, no ffmpeg
 ```
 
 `createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings`.
@@ -59,7 +60,17 @@ npm i playwright   # optional peer dep; only needed for renderFrame()
 
 ## Export MP4 without ffmpeg
 
-The same browser pipeline exports the full composition to MP4 (WebCodecs) — no ffmpeg dependency, no GPL.
+`renderVideo()` exports the full composition to MP4 — the same in-browser WebCodecs H.264 pipeline the editor's Render button uses, driven by a real local browser. No ffmpeg dependency, no GPL, no server.
+
+```ts
+import { renderVideo } from "morpha-studio-sdk";
+import { writeFile } from "node:fs/promises";
+
+const mp4 = await renderVideo({ projectId: "demo", token: process.env.MORPHA_TOKEN });
+await writeFile("video.mp4", mp4);
+```
+
+Like `renderFrame()`, this needs Playwright + system Chrome (`channel: "chrome"` — Chromium can't encode H.264).
 
 ## Auto-caption a clip
 

@@ -12,7 +12,12 @@
 
 import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
 import type { ToolFunction, ToolResult } from "./core/tools.ts";
-import { renderFrame, type RenderFrameOptions } from "./render.ts";
+import {
+  renderFrame,
+  renderVideo,
+  type RenderFrameOptions,
+  type RenderVideoOptions,
+} from "./render.ts";
 
 export interface MorphaClientOptions {
   /** API origin. Default https://morphastudio.ai */
@@ -65,6 +70,16 @@ export interface MorphaClient {
     projectId: string,
     frame?: number,
     opts?: Omit<RenderFrameOptions, "projectId" | "frame">,
+  ): Promise<Buffer>;
+  /**
+   * Render a hosted project's FULL composition to an MP4 (real local browser,
+   * same WebCodecs pipeline as the editor's Render button — no ffmpeg, no
+   * server). Convenience wrapper over the standalone `renderVideo()` with this
+   * client's `origin`/`token` applied; pass `opts` to override channel/timeoutMs.
+   */
+  renderVideo(
+    projectId: string,
+    opts?: Omit<RenderVideoOptions, "projectId">,
   ): Promise<Buffer>;
 }
 
@@ -156,5 +171,17 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
   ): Promise<Buffer> =>
     renderFrame({ origin, token, ...opts, projectId, frame });
 
-  return { getProject, listTools, callTool, renderFrame: renderFrameForProject };
+  const renderVideoForProject = (
+    projectId: string,
+    opts: Omit<RenderVideoOptions, "projectId"> = {},
+  ): Promise<Buffer> =>
+    renderVideo({ origin, token, ...opts, projectId });
+
+  return {
+    getProject,
+    listTools,
+    callTool,
+    renderFrame: renderFrameForProject,
+    renderVideo: renderVideoForProject,
+  };
 };

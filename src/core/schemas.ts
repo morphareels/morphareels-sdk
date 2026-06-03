@@ -1380,6 +1380,14 @@ export const projectSchema = z.preprocess(
       // (probed mp4 length when the project has a video layer, else 30).
       // 30 fps; durationInFrames = ceil(duration_seconds * 30).
       duration_seconds: z.number().positive().default(30),
+      // Poster timestamp in SECONDS the editor seeks to on first load instead
+      // of frame 0 — so a freshly-opened project doesn't sit on a blank /
+      // cold-open frame. The landing "Try" templates set this to a composed
+      // still (their builds finish a few seconds in, then hold). Clamped into
+      // the comp on load; clones carry it. null/absent ⇒ open at frame 0 (the
+      // historic behaviour). A returning user's saved scrub position still
+      // wins — see the editor load path in App.tsx.
+      start_at: z.number().nonnegative().nullable().default(null),
       // Audio overlays — independent sound clips scheduled at frame-aligned
       // starts. Played in the editor preview via WebAudio and mixed into the
       // MP4 export's AAC track alongside any source-mp4 audio. Default [] so
@@ -1442,6 +1450,13 @@ export const projectSchema = z.preprocess(
       // Partner-overridable attributes exposed via the <morpha-video> tag.
       // See publicPropertySchema above for shape + semantics.
       public_properties: z.array(publicPropertySchema).default([]),
+      // Email allowlist for read-only sharing. Lowercased Google-account
+      // emails the OWNER has granted view access to. Empty ⇒ private (only the
+      // owner can load it). A signed-in viewer whose email is on this list gets
+      // a read-only copy of the project; everyone else 404s. Mirrored into the
+      // KV project index on save so the worker can resolve owner-from-id for a
+      // non-owner request. See worker/src/embed.ts + routes/project.ts.
+      shared_with_emails: z.array(z.string()).default([]),
       // Custom (non-Google) typefaces registered on the project. See
       // customFontSchema. Text layers reference them by family name via
       // font_family. Default [] so older projects parse cleanly.
