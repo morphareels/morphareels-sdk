@@ -1,4 +1,4 @@
-// morpha-studio-sdk — the Morpha SDK.
+// morphareels-sdk — the Morpha SDK.
 //
 // Build, caption, and render short-form video projects in code. The project-
 // building half is pure (no browser, no ffmpeg); renderFrame() drives a real

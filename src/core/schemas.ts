@@ -112,6 +112,21 @@ export const textSpanSchema = z
   .strict();
 export type TextSpan = z.infer<typeof textSpanSchema>;
 
+// Per-element data that formerly lived in four top-level maps keyed by element
+// id (project.animations / styles / color_tracks / track_loops). It now lives
+// ON each layer record so an element is self-contained: clones carry it intact
+// and id-minting ops (paste / duplicate) no longer have to re-key parallel
+// maps. `style` is the singular form of the old `styles[eid]` entry. z.lazy
+// defers the value-schema references because those schemas (elementTracks /
+// layerStyle / elementColorTracks / trackLoops) are declared further down this
+// file than the layer schemas that spread these fields in.
+const perElementDataFields = {
+  animations: z.lazy(() => elementTracksSchema).optional(),
+  style: z.lazy(() => layerStyleSchema).optional(),
+  color_tracks: z.lazy(() => elementColorTracksSchema).optional(),
+  track_loops: z.lazy(() => trackLoopsSchema).optional(),
+};
+
 // One per image layer on the project. (x, y) is the CENTRE of the layer's
 // bounding box in canvas coords (1080×1920); width/height the box extents.
 // Centre-anchor matches Premiere/FCP/Motion conventions and aligns with the
@@ -125,6 +140,7 @@ export type TextSpan = z.infer<typeof textSpanSchema>;
 // z-stack and refuse deletion / reorder from the UI + tools.
 export const imageLayerSchema = z
   .object({
+    ...perElementDataFields,
     id: z.string().min(1),
     // Optional for `is_background` (the canvas backdrop has no bitmap).
     // Worker / tool layer enforces non-empty for regular image layers.
@@ -161,6 +177,10 @@ export const imageLayerSchema = z
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
     matte_source_id: z.string().nullable().optional(),
+    // When the layer is masked, invert the mask so the host shows everywhere
+    // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
+    // on leaf hosts (the canvas matte path); ignored on group hosts for now.
+    matte_inverted: z.boolean().optional(),
     text: z.string().optional(),
     text_size: z.number().positive().optional(),
     font_family: z.string().optional(),
@@ -182,6 +202,7 @@ export const imageLayerSchema = z
 // path image filenames take under the assets bucket.
 export const videoLayerSchema = z
   .object({
+    ...perElementDataFields,
     id: z.string().min(1),
     clip: z.string().min(1),
     name: z.string().optional(),
@@ -208,7 +229,16 @@ export const videoLayerSchema = z
     fill: fillSchema.nullable().default(null),
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
+    // When true, this layer's baked audio is silenced in preview AND export.
+    // Set when the editor splits the clip's audio into a standalone overlay on
+    // upload (NLE-style linked A/V), so the source audio doesn't double with
+    // the new track. Absent/false = mix the baked audio as before.
+    muted: z.boolean().optional(),
     matte_source_id: z.string().nullable().optional(),
+    // When the layer is masked, invert the mask so the host shows everywhere
+    // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
+    // on leaf hosts (the canvas matte path); ignored on group hosts for now.
+    matte_inverted: z.boolean().optional(),
     speed_keyframes: z
       .array(
         z
@@ -236,6 +266,7 @@ export type SpeedKeyframe = NonNullable<
 // mechanism — there is no text-specific sequencing.
 export const textLayerSchema = z
   .object({
+    ...perElementDataFields,
     id: z.string().min(1),
     // The text to render. Newlines are honoured as hard line breaks.
     text: z.string().default(""),
@@ -253,16 +284,20 @@ export const textLayerSchema = z
     // Google Fonts family name (e.g. "Anton"). Loaded from the Google Fonts
     // CSS2 API before rendering — see editor/src/fonts.ts.
     font_family: z.string().default("Anton"),
-    // Desired font size in px; the renderer shrinks from here to fit the box.
-    // Omitted ⇒ derived from the layer box height.
+    // Desired font size in px. Rendered VERBATIM by default (fixed size — the
+    // size you set is the size that renders); shrunk to fit the box when
+    // text_autofit is "shrink", ignored entirely when it is "fit" (the box
+    // drives the size). Omitted ⇒ derived from the layer box height.
     text_size: z.number().positive().optional(),
-    // How text fills its box. "shrink" (default): word-wrap, then auto-shrink
-    // the font from text_size until the whole block fits — so a longer line
-    // renders smaller. "wrap": hold text_size FIXED and only word-wrap
-    // (hard-breaking a single word too wide to fit), never shrink — so every
-    // line keeps the same height. Captions use "wrap" to stop the per-line
-    // size bounce.
-    text_autofit: z.enum(["shrink", "wrap"]).optional(),
+    // How text fills its box. "wrap" (default): hold text_size FIXED and only
+    // word-wrap (hard-breaking a single word too wide to fit), never shrink —
+    // the size you set is the size rendered, every line the same height.
+    // "fit": ignore text_size and auto-size the font BOTH ways — grow and
+    // shrink — to the largest size whose wrapped block fills the box, so
+    // resizing the box resizes the text. "shrink" (legacy): word-wrap, then
+    // auto-shrink the font from text_size until the block fits — never grows.
+    // Captions use "wrap" to stop size bounce.
+    text_autofit: z.enum(["fit", "shrink", "wrap"]).default("wrap"),
     // Text fill colour as #rrggbb. Defaults to white when omitted.
     text_color: z.string().optional(),
     // Optional backdrop fill painted in the layer's local rect behind the text.
@@ -306,6 +341,10 @@ export const textLayerSchema = z
     // Track matte: when set, this text layer (the host) shows only through
     // the referenced leaf's alpha. Mirrors image/video/shape layers.
     matte_source_id: z.string().nullable().optional(),
+    // When the layer is masked, invert the mask so the host shows everywhere
+    // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
+    // on leaf hosts (the canvas matte path); ignored on group hosts for now.
+    matte_inverted: z.boolean().optional(),
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
     // Optional Inspector colour-label tag.
@@ -485,6 +524,7 @@ export const shapeKindSchema = z.enum(SHAPE_IDS).default("rect");
 // by `migrateColorsToFills` during preprocess.
 export const shapeSchema = z
   .object({
+    ...perElementDataFields,
     id: z.string().min(1),
     kind: shapeKindSchema,
     // Optional friendly label shown in the Inspector + Timeline lane.
@@ -502,6 +542,10 @@ export const shapeSchema = z
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
     matte_source_id: z.string().nullable().optional(),
+    // When the layer is masked, invert the mask so the host shows everywhere
+    // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
+    // on leaf hosts (the canvas matte path); ignored on group hosts for now.
+    matte_inverted: z.boolean().optional(),
     // Optional Inspector colour-label tag.
     color_label: colorLabelSchema.optional(),
     // Curve / arrow geometry (only used by kind "curve"). `points` are control
@@ -806,6 +850,7 @@ export type AudioOverlay = z.infer<typeof audioOverlaySchema>;
 // base position for groups.
 export const groupSchema = z
   .object({
+    ...perElementDataFields,
     id: z.string().min(1),
     name: z.string().default(""),
     pivotX: z.number(),
@@ -824,6 +869,10 @@ export const groupSchema = z
     // anything a leaf can host, it can too. Used e.g. to show a marching
     // chevron strip + black backing only inside an arrow / band shape.
     matte_source_id: z.string().nullable().optional(),
+    // When the layer is masked, invert the mask so the host shows everywhere
+    // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
+    // on leaf hosts (the canvas matte path); ignored on group hosts for now.
+    matte_inverted: z.boolean().optional(),
     locked: z.boolean().optional(),
     hidden: z.boolean().optional(),
     // Optional Inspector colour-label tag.
@@ -1263,11 +1312,82 @@ const migrateImageTextLayers = (raw: unknown): unknown => {
   return next;
 };
 
+// Flatten the four legacy top-level per-element maps (animations / styles /
+// color_tracks / track_loops, keyed by element id) ONTO each layer record as
+// nested `animations` / `style` / `color_tracks` / `track_loops` fields, then
+// drop the top-level maps. Runs OUTERMOST in the preprocess chain so the
+// earlier migrators (which still rekey the top-level maps by element id — e.g.
+// background→image, image→text) have finished settling those maps before we
+// distribute them onto records. Orphan entries (no matching layer) are dropped.
+// Idempotent: an already-flattened project has no top-level maps, so this
+// no-ops. Non-destructive: clones the layer arrays it touches rather than
+// mutating the caller's input.
+const migrateFlattenPerElementMaps = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  const isObj = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v);
+  if (
+    !isObj(r.animations) &&
+    !isObj(r.styles) &&
+    !isObj(r.color_tracks) &&
+    !isObj(r.track_loops)
+  ) {
+    return raw; // already flattened (or never had the maps)
+  }
+
+  const next = { ...r };
+  // Clone the layer arrays (shallow per-layer) so attaching nested fields
+  // doesn't mutate the caller's objects, then index every layer by element id.
+  const byEid = new Map<string, Record<string, unknown>>();
+  const cloneAndIndex = (kind: string, key: string): void => {
+    const list = next[key];
+    if (!Array.isArray(list)) return;
+    const cloned = list.map((entry) =>
+      isObj(entry) ? { ...entry } : entry,
+    );
+    next[key] = cloned;
+    for (const entry of cloned) {
+      if (isObj(entry) && typeof entry.id === "string") {
+        byEid.set(`${kind}.${entry.id}`, entry);
+      }
+    }
+  };
+  cloneAndIndex("image", "image_layers");
+  cloneAndIndex("video", "video_layers");
+  cloneAndIndex("text", "text_layers");
+  cloneAndIndex("shapes", "shapes");
+  cloneAndIndex("group", "groups");
+
+  const distribute = (map: unknown, field: string): void => {
+    if (!isObj(map)) return;
+    for (const [eid, value] of Object.entries(map)) {
+      const layer = byEid.get(eid);
+      // Only attach non-empty entries; orphans (no layer) are dropped.
+      if (layer && isObj(value) && Object.keys(value).length > 0) {
+        layer[field] = value;
+      }
+    }
+  };
+  distribute(r.animations, "animations");
+  distribute(r.styles, "style"); // styles[eid] → layer.style (singular)
+  distribute(r.color_tracks, "color_tracks");
+  distribute(r.track_loops, "track_loops");
+
+  delete next.animations;
+  delete next.styles;
+  delete next.color_tracks;
+  delete next.track_loops;
+  return next;
+};
+
 const preprocessProject = (raw: unknown): unknown =>
-  migrateImageTextLayers(
-    migrateBackgroundToImageLayer(
-      migrateShapeColorsToFills(
-        migrateTranslateToAbsolute(stripLegacyClipFrame(raw)),
+  migrateFlattenPerElementMaps(
+    migrateImageTextLayers(
+      migrateBackgroundToImageLayer(
+        migrateShapeColorsToFills(
+          migrateTranslateToAbsolute(stripLegacyClipFrame(raw)),
+        ),
       ),
     ),
   );
@@ -1360,8 +1480,6 @@ export const projectSchema = z.preprocess(
       // Text layers — first-class leaf type, addressed as text.<id>.
       text_layers: z.array(textLayerSchema).default([]),
       shapes: z.array(shapeSchema).default([]),
-      animations: animationsSchema.default({}),
-      styles: stylesSchema.default({}),
       // Ordered list of ROOT-LEVEL element ids defining the top of the z-stack
       // tree (later in array = higher z = on top). Element ids:
       // "video.<id>", "image.<id>", "shapes.<id>", "group.<id>". Children of
@@ -1374,12 +1492,14 @@ export const projectSchema = z.preprocess(
       // Layer groups. See groupSchema. Empty by default; older projects parse
       // cleanly because the field defaults to [].
       groups: z.array(groupSchema).default([]),
-      // First-class composition duration in seconds (drives the timeline /
-      // export length). Old projects without this field default to 30s — the
-      // App.tsx load path then seeds the field intelligently the first time
-      // (probed mp4 length when the project has a video layer, else 30).
-      // 30 fps; durationInFrames = ceil(duration_seconds * 30).
-      duration_seconds: z.number().positive().default(30),
+      // Composition duration in seconds (drives the timeline / export length).
+      // DERIVED from content, not set by hand: the editor (store
+      // recomputeDuration) and the worker (write-back) re-fit it to the
+      // furthest video-window / keyframe / audio end on every change, with a
+      // 1s floor (see src/content-duration.ts). This stored value is the last
+      // fitted result; the default only applies to a field-less project until
+      // the first re-fit. 30 fps; durationInFrames = ceil(duration_seconds * 30).
+      duration_seconds: z.number().positive().default(1),
       // Poster timestamp in SECONDS the editor seeks to on first load instead
       // of frame 0 — so a freshly-opened project doesn't sit on a blank /
       // cold-open frame. The landing "Try" templates set this to a composed
@@ -1422,17 +1542,6 @@ export const projectSchema = z.preprocess(
       // loop was authored before this field existed.
       loop_start_frame: z.number().int().min(0).default(0),
       loop_end_frame: z.number().int().min(1).nullable().default(null),
-      // Per-element, per-property extrapolation mode for animation tracks.
-      // Default {} so older projects parse cleanly — when a track isn't
-      // listed here, evaluateTrack uses "hold" (the historic behaviour).
-      // See loopModeSchema for the four modes.
-      track_loops: projectLoopsSchema.default({}),
-      // Fill-valued keyframe tracks, parallel to `animations`. Element id
-      // conventions mirror `animations`, with the addition of the project-
-      // level pseudo-id "palette" for the canvas backdrop. Default {} so
-      // older projects parse cleanly — when no track exists for an
-      // element/property, the renderer falls back to the static field.
-      color_tracks: colorTracksSchema.default({}),
       // The version this project state is checkpointed against. null when
       // no version exists yet (brand-new project or pre-versions JSON).
       // Set by the worker on save_version / restore_version; the editor
@@ -1457,6 +1566,12 @@ export const projectSchema = z.preprocess(
       // KV project index on save so the worker can resolve owner-from-id for a
       // non-owner request. See worker/src/embed.ts + routes/project.ts.
       shared_with_emails: z.array(z.string()).default([]),
+      // Subset of shared_with_emails granted EDIT access. An editor saves
+      // straight into the owner's copy (worker routes write to the owner's
+      // namespace); everyone else on shared_with_emails is a read-only
+      // viewer. Kept as a parallel list (not a role field per entry) so all
+      // existing view-path code keyed on shared_with_emails is untouched.
+      shared_with_editors: z.array(z.string()).default([]),
       // Custom (non-Google) typefaces registered on the project. See
       // customFontSchema. Text layers reference them by family name via
       // font_family. Default [] so older projects parse cleanly.
@@ -1491,6 +1606,25 @@ export type LinearGradient = z.infer<typeof linearGradientSchema>;
 export type RadialGradient = z.infer<typeof radialGradientSchema>;
 export type MaskFill = z.infer<typeof maskFillSchema>;
 export type Fill = z.infer<typeof fillSchema>;
+
+// A sensible default font size (px) for a NEW text layer: the median of the
+// project's existing explicit text_size values, or ~10% of the canvas height
+// when there are none. Used by both the editor's addTextLayer and the headless
+// add_text_layer tool so editor- and agent-created text get the SAME explicit
+// size — text_size is the single source of truth for the font, so it must
+// always be set; an unset text_size makes the renderer derive the font from the
+// box height, which lets a box resize silently change the font.
+export const resolveDefaultTextSize = (project: Project): number => {
+  const sizes = project.text_layers
+    .map((t) => t.text_size)
+    .filter((s): s is number => typeof s === "number" && s > 0)
+    .sort((a, b) => a - b);
+  if (sizes.length === 0) return Math.round(project.canvas_height * 0.1);
+  const mid = Math.floor(sizes.length / 2);
+  return sizes.length % 2 === 1
+    ? sizes[mid]
+    : (sizes[mid - 1] + sizes[mid]) / 2;
+};
 
 // Legacy source-clip entry. Pre-refactor, projects had a global "shortlist" of
 // candidate source clips and the editor flipped between them via an active-
@@ -1764,4 +1898,69 @@ export const getGroupDescendants = (
 // already invoke `migrateProject(raw)` keep working — the historical v0/v1
 // transforms are gone (data has been wiped), so this is now just a parse.
 export const migrateProject = (raw: unknown): Project => projectSchema.parse(raw);
+
+// Any leaf or group layer record. Per-element data (animations / style /
+// color_tracks / track_loops) lives on these directly — see perElementDataFields.
+export type AnyLayer = ImageLayer | VideoLayer | TextLayer | Shape | Group;
+
+// Resolve an element id ("image.abc", "group.g1", "shapes.s2") to its layer
+// record across the five kind-arrays. Returns null when the id has no matching
+// layer. The single lookup that replaces the ~25 inline
+// `if (eid.startsWith("image.")) { …find… }` dispatches across editor + tools.
+export const findLayerByElementId = (
+  project: Project,
+  elementId: string,
+): AnyLayer | null => {
+  const dot = elementId.indexOf(".");
+  if (dot < 1) return null;
+  const kind = elementId.slice(0, dot);
+  const id = elementId.slice(dot + 1);
+  const list: readonly AnyLayer[] | null =
+    kind === "image"
+      ? project.image_layers
+      : kind === "video"
+        ? project.video_layers
+        : kind === "text"
+          ? project.text_layers
+          : kind === "shapes"
+            ? project.shapes
+            : kind === "group"
+              ? project.groups
+              : null;
+  if (!list) return null;
+  return list.find((l) => l.id === id) ?? null;
+};
+
+// Per-Project-identity cache of element id → layer record. The store clones the
+// project (structuredClone) on every mutation, so a fresh identity invalidates
+// this automatically — no manual invalidation needed.
+const elementIndexCache = new WeakMap<Project, Map<string, AnyLayer>>();
+
+// Build (once per Project identity, then cached) a map from element id → layer.
+// For per-frame hot paths (renderer/geometry samplers) that previously did O(1)
+// `project.animations[eid]` map lookups and must stay O(1) now that the data
+// is on the records.
+export const elementIndex = (project: Project): Map<string, AnyLayer> => {
+  const cached = elementIndexCache.get(project);
+  if (cached) return cached;
+  const idx = new Map<string, AnyLayer>();
+  for (const l of project.image_layers) idx.set(`image.${l.id}`, l);
+  for (const l of project.video_layers) idx.set(`video.${l.id}`, l);
+  for (const l of project.text_layers) idx.set(`text.${l.id}`, l);
+  for (const l of project.shapes) idx.set(`shapes.${l.id}`, l);
+  for (const l of project.groups) idx.set(`group.${l.id}`, l);
+  elementIndexCache.set(project, idx);
+  return idx;
+};
+
+// Cached element id → layer lookup for hot paths. Falls back to a direct scan
+// on a miss (the cached index may predate a layer added on the same Project
+// identity); never caches a null. Mutators in src/tools.ts that splice layer
+// arrays mid-function should use findLayerByElementId (uncached) instead.
+export const layerOf = (
+  project: Project,
+  elementId: string,
+): AnyLayer | null =>
+  elementIndex(project).get(elementId) ??
+  findLayerByElementId(project, elementId);
 

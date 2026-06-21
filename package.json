@@ -1,6 +1,6 @@
 {
-  "name": "morpha-studio-sdk",
-  "version": "0.2.0",
+  "name": "morphareels-sdk",
+  "version": "0.3.0",
   "description": "Agentic video editor client — build, caption & render short-form video in code. Frames + MP4 via headless Chrome, no ffmpeg. The Morpha SDK.",
   "keywords": [
     "video",
@@ -29,17 +29,18 @@
     "sdk",
     "cli",
     "typescript",
-    "morpha"
+    "morpha",
+    "morphareels"
   ],
   "type": "module",
   "license": "MIT",
-  "author": "Morpha Studio (https://morphastudio.ai)",
-  "homepage": "https://morphastudio.ai",
+  "author": "Morpha (https://morphareels.ai)",
+  "homepage": "https://morphareels.ai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/morphastudio/morpha-agentic-video-editor-client.git"
+    "url": "git+https://github.com/morphareels/morphareels-sdk.git"
   },
-  "bugs": "https://github.com/morphastudio/morpha-agentic-video-editor-client/issues",
+  "bugs": "https://github.com/morphareels/morphareels-sdk/issues",
   "engines": {
     "node": ">=20"
   },
@@ -77,6 +78,6 @@
   "devDependencies": {
     "playwright": "^1.60.0",
     "tsup": "^8.3.0",
-    "typescript": "^5.6.0"
+    "typescript": "5.9.3"
   }
 }

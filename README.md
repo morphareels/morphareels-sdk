@@ -1,19 +1,21 @@
-# morpha-studio-sdk
+# morphareels-sdk
 
-**The agentic video editor SDK — build, caption, and render short-form video in code.** Compose layers/captions/keyframes programmatically, then render a frame to PNG or export MP4 by driving a real browser. **No ffmpeg.** The client SDK for [Morpha Studio](https://morphastudio.ai).
+**The agentic video editor SDK — build, caption, and render short-form video in code.** Compose layers/captions/keyframes programmatically, then render a frame to PNG or export MP4 by driving a real browser. **No ffmpeg.** The client SDK for [Morpha Studio](https://morphareels.ai).
 
 ```bash
-npm i morpha-studio-sdk
+npm i morphareels-sdk
 ```
+
+Requires **Node ≥ 20**.
 
 ## Drive a hosted project — the MCP-equivalent client
 
 `createClient` is the recommended way to drive a hosted Morpha account from code — the programmatic equivalent of an MCP session. Every tool you can call over MCP, you call here.
 
 ```ts
-import { createClient } from "morpha-studio-sdk";
+import { createClient } from "morphareels-sdk";
 
-const morpha = createClient({ token: process.env.MORPHA_TOKEN }); // origin defaults to https://morphastudio.ai
+const morpha = createClient({ token: process.env.MORPHA_API_KEY }); // origin defaults to https://morphareels.ai
 
 const project = await morpha.getProject("my-project");
 const { result, editorUrl } = await morpha.callTool("my-project", "add_text_layer", {
@@ -28,7 +30,7 @@ const mp4 = await morpha.renderVideo("my-project");      // the full composition
 ## Make a video in code
 
 ```ts
-import { blankProject, dispatch, projectSchema } from "morpha-studio-sdk";
+import { blankProject, dispatch, projectSchema } from "morphareels-sdk";
 
 let project = blankProject({ projectId: "demo", canvasWidth: 1080, canvasHeight: 1920 });
 
@@ -45,10 +47,10 @@ projectSchema.parse(project); // it's a valid Morpha project, ready to save or r
 ## Render a video frame to PNG (no ffmpeg)
 
 ```ts
-import { renderFrame } from "morpha-studio-sdk";
+import { renderFrame } from "morphareels-sdk";
 import { writeFile } from "node:fs/promises";
 
-const png = await renderFrame({ projectId: "demo", frame: 150, token: process.env.MORPHA_TOKEN });
+const png = await renderFrame({ projectId: "demo", frame: 150, token: process.env.MORPHA_API_KEY });
 await writeFile("frame.png", png);
 ```
 
@@ -63,10 +65,10 @@ npm i playwright   # optional peer dep; only needed for renderFrame()
 `renderVideo()` exports the full composition to MP4 — the same in-browser WebCodecs H.264 pipeline the editor's Render button uses, driven by a real local browser. No ffmpeg dependency, no GPL, no server.
 
 ```ts
-import { renderVideo } from "morpha-studio-sdk";
+import { renderVideo } from "morphareels-sdk";
 import { writeFile } from "node:fs/promises";
 
-const mp4 = await renderVideo({ projectId: "demo", token: process.env.MORPHA_TOKEN });
+const mp4 = await renderVideo({ projectId: "demo", token: process.env.MORPHA_API_KEY });
 await writeFile("video.mp4", mp4);
 ```
 
@@ -86,4 +88,4 @@ Unlike code-as-video frameworks, this is a real **editor project model** (layers
 
 ## License
 
-MIT © [Morpha Studio](https://morphastudio.ai)
+MIT © [Morpha Studio](https://morphareels.ai)

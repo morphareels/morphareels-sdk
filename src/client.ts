@@ -20,7 +20,7 @@ import {
 } from "./render.ts";
 
 export interface MorphaClientOptions {
-  /** API origin. Default https://morphastudio.ai */
+  /** API origin. Default https://morphareels.ai */
   origin?: string;
   /** Bearer API key (mp_…), sent as `Authorization: Bearer <token>`. Required
    *  against a hosted account; omit only when pointing at a dev origin whose
@@ -96,14 +96,14 @@ const safeText = async (res: Response): Promise<string> => {
  * MCP, you can do here:
  *
  * ```ts
- * import { createClient } from "morpha-studio-sdk";
- * const morpha = createClient({ token: process.env.MORPHA_TOKEN });
+ * import { createClient } from "morphareels-sdk";
+ * const morpha = createClient({ token: process.env.MORPHA_API_KEY });
  * await morpha.callTool("my-project", "add_text_layer", { text: "HELLO", x: 540, y: 600 });
  * const png = await morpha.renderFrame("my-project", 150);
  * ```
  */
 export const createClient = (options: MorphaClientOptions = {}): MorphaClient => {
-  const origin = (options.origin ?? "https://morphastudio.ai").replace(/\/+$/, "");
+  const origin = (options.origin ?? "https://morphareels.ai").replace(/\/+$/, "");
   const token = options.token;
   const doFetch = options.fetch ?? globalThis.fetch;
   if (typeof doFetch !== "function") {

@@ -3,7 +3,7 @@ export interface RenderFrameOptions {
   projectId: string;
   /** Composition frame (0-indexed, 30 fps). Default 0. */
   frame?: number;
-  /** Origin serving /render-canvas + /api/project + /clips. Default https://morphastudio.ai */
+  /** Origin serving /render-canvas + /api/project + /clips. Default https://morphareels.ai */
   origin?: string;
   /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
   token?: string;
@@ -41,7 +41,7 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
       "renderFrame() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
     );
   }
-  const origin = opts.origin ?? "https://morphastudio.ai";
+  const origin = opts.origin ?? "https://morphareels.ai";
   const frame = Math.max(0, Math.round(opts.frame ?? 0));
   const width = Math.max(64, Math.round(opts.width ?? 1080));
   const height = Math.max(64, Math.round(opts.height ?? 1920));
@@ -124,7 +124,7 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
 export interface RenderVideoOptions {
   /** Project id, served at `${origin}/render-export?project=<id>`. */
   projectId: string;
-  /** Origin serving /render-export + /api/project + /clips. Default https://morphastudio.ai */
+  /** Origin serving /render-export + /api/project + /clips. Default https://morphareels.ai */
   origin?: string;
   /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
   token?: string;
@@ -159,7 +159,7 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
       "renderVideo() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
     );
   }
-  const origin = opts.origin ?? "https://morphastudio.ai";
+  const origin = opts.origin ?? "https://morphareels.ai";
   const timeout = opts.timeoutMs ?? 600_000;
 
   const browser = await pw.chromium.launch({

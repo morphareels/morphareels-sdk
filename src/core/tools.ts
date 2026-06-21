@@ -27,9 +27,12 @@ import {
 } from "./font-sources.ts";
 import {
   fillSchema,
+  findLayerByElementId,
   findParentGroup,
   getGroupDescendants,
+  resolveDefaultTextSize,
   resolveLayerTree,
+  type AnyLayer,
   type AudioOverlay,
   type ColorKeyframe,
   type Easing,
@@ -155,10 +158,11 @@ const ensureTrack = (
   elementId: string,
   property: TrackProperty,
 ): Keyframe[] => {
-  if (!project.animations[elementId]) {
-    project.animations[elementId] = {} as ElementTracks;
-  }
-  const tracks = project.animations[elementId];
+  const layer = findLayerByElementId(project, elementId);
+  // Callers pre-validate the element id; a miss here is defensive. Return a
+  // detached array so the caller doesn't crash (the write is simply dropped).
+  if (!layer) return [];
+  const tracks: ElementTracks = (layer.animations ??= {} as ElementTracks);
   if (!tracks[property]) {
     tracks[property] = [];
   }
@@ -283,9 +287,10 @@ export const generateLayerId = (project: Project, kind: LayerKind): string => {
 // Rewrite every reference to `oldElementId` so they point at `newElementId`.
 // Mutates `project` in place — call on a cloned project. Covers every
 // reference site found in `projectSchema`:
-//   - the layer's own `.id` field (bare suffix after the dot)
+//   - the layer's own `.id` field (bare suffix after the dot); the per-element
+//     animations / style / track_loops / color_tracks now ride along with the
+//     layer record, so changing `.id` re-keys them implicitly.
 //   - `layer_order[]`
-//   - keys of `animations` / `styles` / `track_loops` / `color_tracks`
 //   - `groups[*].children[]`
 //   - `matte_source_id` on every layer kind (image / video / text / shapes / group)
 //   - `mask`-type `.fill.layer_id` on every layer's fill
@@ -336,27 +341,18 @@ export const rekeyElementId = (
     id === oldElementId ? newElementId : id,
   );
 
-  // 3. animations / styles / track_loops / color_tracks — top-level Records
-  const rekeyMap = <V>(rec: Record<string, V> | undefined): void => {
-    if (!rec) return;
-    if (oldElementId in rec) {
-      rec[newElementId] = rec[oldElementId];
-      delete rec[oldElementId];
-    }
-  };
-  rekeyMap(project.animations as Record<string, unknown> as Record<string, ElementTracks>);
-  rekeyMap(project.styles as unknown as Record<string, LayerStyle>);
-  rekeyMap(project.track_loops as unknown as Record<string, unknown>);
-  rekeyMap(project.color_tracks as unknown as Record<string, ElementColorTracks>);
+  // (Per-element animations / style / track_loops / color_tracks now live on
+  // the layer record itself and rode along when site 1 rewrote `layer.id` — no
+  // separate re-key needed.)
 
-  // 4. groups[*].children[]
+  // 3. groups[*].children[]
   for (const g of project.groups) {
     g.children = g.children.map((id) =>
       id === oldElementId ? newElementId : id,
     );
   }
 
-  // 5. matte_source_id on every layer kind
+  // 4. matte_source_id on every layer kind
   const fixMatte = (layer: { matte_source_id?: string | null }): void => {
     if (layer.matte_source_id === oldElementId) {
       layer.matte_source_id = newElementId;
@@ -368,7 +364,7 @@ export const rekeyElementId = (
   project.shapes.forEach(fixMatte);
   project.groups.forEach(fixMatte);
 
-  // 6. mask-type fills (.fill.layer_id) — discriminated union, check type
+  // 5. mask-type fills (.fill.layer_id) — discriminated union, check type
   const fixMaskFill = (layer: { fill?: Fill | null }): void => {
     if (layer.fill && layer.fill.type === "mask") {
       if (layer.fill.layer_id === oldElementId) {
@@ -382,7 +378,7 @@ export const rekeyElementId = (
   project.shapes.forEach(fixMaskFill);
   project.groups.forEach(fixMaskFill);
 
-  // 7. loop[*].overrides[*].elementId
+  // 6. loop[*].overrides[*].elementId
   if (project.loop) {
     for (const pass of project.loop) {
       for (const ov of pass.overrides) {
@@ -391,11 +387,76 @@ export const rekeyElementId = (
     }
   }
 
-  // 8. public_properties[*].layer_id
+  // 7. public_properties[*].layer_id
   if (project.public_properties) {
     for (const pp of project.public_properties) {
       if (pp.layer_id === oldElementId) pp.layer_id = newElementId;
     }
+  }
+};
+
+// Drop every dangling reference to `elementId` once its primary layer object
+// has been spliced out by the caller. The deletion-mirror of rekeyElementId —
+// it MUST cover the same reference sites (2–7; site 1, the layer's own record,
+// is the caller's splice, which also carries off its per-element animations /
+// style / track_loops / color_tracks). When a reference site is added to
+// rekeyElementId, add it here too.
+const purgeElementId = (project: Project, elementId: string): void => {
+  // 2. layer_order
+  project.layer_order = project.layer_order.filter((id) => id !== elementId);
+
+  // (The per-element animations / style / track_loops / color_tracks lived on
+  // the spliced-out layer record, so they're already gone — nothing to delete.)
+
+  // 3. groups[*].children[]
+  for (const g of project.groups) {
+    g.children = g.children.filter((id) => id !== elementId);
+  }
+
+  // 4. matte_source_id on every layer kind
+  const clearMatte = (layer: { matte_source_id?: string | null }): void => {
+    if (layer.matte_source_id === elementId) layer.matte_source_id = null;
+  };
+  project.image_layers.forEach(clearMatte);
+  project.video_layers.forEach(clearMatte);
+  project.text_layers.forEach(clearMatte);
+  project.shapes.forEach(clearMatte);
+  project.groups.forEach(clearMatte);
+
+  // 5. mask-type fills (.fill.layer_id). Nullable-fill kinds drop the fill;
+  // shapes require a fill, so the orphaned mask degrades to a solid of its
+  // own colour rather than leaving an unresolvable layer_id behind.
+  const dropMaskFill = (layer: { fill?: Fill | null }): void => {
+    if (
+      layer.fill &&
+      layer.fill.type === "mask" &&
+      layer.fill.layer_id === elementId
+    ) {
+      layer.fill = null;
+    }
+  };
+  project.image_layers.forEach(dropMaskFill);
+  project.video_layers.forEach(dropMaskFill);
+  project.text_layers.forEach(dropMaskFill);
+  project.groups.forEach(dropMaskFill);
+  for (const s of project.shapes) {
+    if (s.fill.type === "mask" && s.fill.layer_id === elementId) {
+      s.fill = { type: "solid", color: s.fill.color, opacity: s.fill.opacity };
+    }
+  }
+
+  // 6. loop[*].overrides[*].elementId
+  if (project.loop) {
+    for (const pass of project.loop) {
+      pass.overrides = pass.overrides.filter((ov) => ov.elementId !== elementId);
+    }
+  }
+
+  // 7. public_properties[*].layer_id
+  if (project.public_properties) {
+    project.public_properties = project.public_properties.filter(
+      (pp) => pp.layer_id !== elementId,
+    );
   }
 };
 
@@ -439,9 +500,6 @@ export const normalizeProjectLayerIds = (
   }
   return rekeys;
 };
-
-const COMP_W = 1080;
-const COMP_H = 1920;
 
 // ---------------------------------------------------------------------------
 // describe_video
@@ -498,15 +556,14 @@ const bareIdOf = (elementId: string, type: ElementType): string =>
 // keyframe arrays themselves — that's the whole point of the overview.
 const animatedProps = (project: Project, elementId: string): string[] => {
   const out: string[] = [];
-  const tracks = project.animations[elementId] as
-    | Record<string, unknown[]>
-    | undefined;
+  const layer = findLayerByElementId(project, elementId);
+  const tracks = layer?.animations as Record<string, unknown[]> | undefined;
   if (tracks) {
     for (const k of Object.keys(tracks)) {
       if (Array.isArray(tracks[k]) && tracks[k].length > 0) out.push(k);
     }
   }
-  const color = project.color_tracks?.[elementId];
+  const color = layer?.color_tracks;
   if (color?.fill && (color.fill as unknown[]).length > 0) out.push("fill");
   return out;
 };
@@ -527,6 +584,9 @@ type OverviewNode = {
   width?: number;
   height?: number;
   rotation?: number;
+  source_in_frame?: number;
+  source_out_frame?: number | null;
+  timeline_start_frame?: number;
   pivotX?: number;
   pivotY?: number;
   childCount?: number;
@@ -592,6 +652,9 @@ const overviewNode = (
       width: v.width,
       height: v.height,
       rotation: v.rotation,
+      source_in_frame: v.source_in_frame,
+      source_out_frame: v.source_out_frame,
+      timeline_start_frame: v.timeline_start_frame,
       ...animField,
     };
   }
@@ -725,10 +788,10 @@ const fullLayerRecord = (
     elementId,
     type,
     ...layer,
-    animations: project.animations[elementId] ?? null,
-    color_tracks: project.color_tracks?.[elementId] ?? null,
-    track_loops: project.track_loops?.[elementId] ?? null,
-    style: project.styles[elementId] ?? null,
+    animations: layer.animations ?? null,
+    color_tracks: layer.color_tracks ?? null,
+    track_loops: layer.track_loops ?? null,
+    style: layer.style ?? null,
   };
 };
 
@@ -786,6 +849,21 @@ const moveLayer: ToolDispatch<MoveLayerArgs> = (project, args) => {
   const { elementId, x, y, width, height, rotation } = args;
   if (!elementId || typeof elementId !== "string") {
     return { project, result: { ok: false, error: "elementId is required" } };
+  }
+  if (x !== undefined && !Number.isFinite(x)) {
+    return { project, result: { ok: false, error: `invalid x: ${x}` } };
+  }
+  if (y !== undefined && !Number.isFinite(y)) {
+    return { project, result: { ok: false, error: `invalid y: ${y}` } };
+  }
+  if (rotation !== undefined && !Number.isFinite(rotation)) {
+    return { project, result: { ok: false, error: `invalid rotation: ${rotation}` } };
+  }
+  if (width !== undefined && (!Number.isFinite(width) || width <= 0)) {
+    return { project, result: { ok: false, error: `invalid width: ${width}` } };
+  }
+  if (height !== undefined && (!Number.isFinite(height) || height <= 0)) {
+    return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
 
   const next = cloneProject(project);
@@ -1038,10 +1116,13 @@ const addKeyframe: ToolDispatch<AddKeyframeArgs> = (project, args) => {
   if (!Number.isFinite(value)) {
     return { project, result: { ok: false, error: `invalid value: ${value}` } };
   }
-  const easingArg =
-    easing && VALID_EASINGS.includes(easing as Easing)
-      ? (easing as Easing)
-      : undefined;
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
+  if (easing !== undefined && !VALID_EASINGS.includes(easing as Easing)) {
+    return { project, result: { ok: false, error: `invalid easing: ${easing}` } };
+  }
+  const easingArg = easing as Easing | undefined;
   const next = cloneProject(project);
   upsertKeyframe(
     next,
@@ -1108,6 +1189,12 @@ const setKeyframesBatch: ToolDispatch<SetKeyframesBatchArgs> = (project, args) =
       return {
         project,
         result: { ok: false, error: `entry ${i}: elementId is required` },
+      };
+    }
+    if (!isValidColorTarget(project, elementId)) {
+      return {
+        project,
+        result: { ok: false, error: `entry ${i}: unknown elementId: ${elementId}` },
       };
     }
     if (
@@ -1195,6 +1282,9 @@ const addKeyframes: ToolDispatch<AddKeyframesArgs> = (project, args) => {
       result: { ok: false, error: "keyframes must be a non-empty array" },
     };
   }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
   let loopMode: LoopModeArg | undefined;
   if (loop !== undefined && loop !== null) {
     if (typeof loop !== "string" || !VALID_LOOP_MODES.includes(loop as LoopModeArg)) {
@@ -1255,24 +1345,19 @@ const addKeyframes: ToolDispatch<AddKeyframesArgs> = (project, args) => {
   // Optional: fold the loop-mode update into the same call. "hold" is the
   // default — clear any existing override; other modes write to track_loops.
   if (loopMode !== undefined) {
+    const layer = findLayerByElementId(next, elementId);
+    if (!layer) {
+      return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+    }
     if (loopMode === "hold") {
-      if (next.track_loops?.[elementId]) {
-        const tracks = { ...next.track_loops[elementId] };
+      if (layer.track_loops?.[prop]) {
+        const tracks = { ...layer.track_loops };
         delete tracks[prop];
-        if (Object.keys(tracks).length === 0) {
-          const allLoops = { ...next.track_loops };
-          delete allLoops[elementId];
-          next.track_loops = allLoops;
-        } else {
-          next.track_loops = { ...next.track_loops, [elementId]: tracks };
-        }
+        layer.track_loops =
+          Object.keys(tracks).length === 0 ? undefined : tracks;
       }
     } else {
-      const loops = { ...(next.track_loops ?? {}) };
-      const tracks = { ...(loops[elementId] ?? {}) };
-      tracks[prop] = loopMode;
-      loops[elementId] = tracks;
-      next.track_loops = loops;
+      (layer.track_loops ??= {})[prop] = loopMode;
     }
   }
   return {
@@ -1317,8 +1402,12 @@ const shiftTrack: ToolDispatch<ShiftTrackArgs> = (project, args) => {
   if (typeof delta !== "number" || !Number.isFinite(delta)) {
     return { project, result: { ok: false, error: "delta must be a finite number" } };
   }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
   const next = cloneProject(project);
-  const tracks = next.animations[elementId];
+  const layer = findLayerByElementId(next, elementId);
+  const tracks = layer?.animations;
   const kfs = tracks?.[property as TrackProperty];
   if (!kfs || kfs.length === 0) {
     return {
@@ -1345,7 +1434,8 @@ const removeKeyframe: ToolDispatch<RemoveKeyframeArgs> = (project, args) => {
     return { project, result: { ok: false, error: `invalid property: ${property}` } };
   }
   const next = cloneProject(project);
-  const kfs = next.animations[elementId]?.[property as TrackProperty] ?? [];
+  const layer = findLayerByElementId(next, elementId);
+  const kfs = layer?.animations?.[property as TrackProperty] ?? [];
   const idx = kfs.findIndex((k) => k.frame === Math.round(frame));
   if (idx < 0) {
     return {
@@ -1383,6 +1473,9 @@ const setTrackLoop: ToolDispatch<SetTrackLoopArgs> = (project, args) => {
       result: { ok: false, error: `invalid property: ${property}` },
     };
   }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
   if (!VALID_LOOP_MODES.includes(mode as LoopModeArg)) {
     return {
       project,
@@ -1393,29 +1486,24 @@ const setTrackLoop: ToolDispatch<SetTrackLoopArgs> = (project, args) => {
     };
   }
   const next = cloneProject(project);
+  const layer = findLayerByElementId(next, elementId);
+  if (!layer) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+  }
   // hold is the default — clear the override so the project stays compact.
   if (mode === "hold") {
-    if (next.track_loops?.[elementId]) {
-      const tracks = { ...next.track_loops[elementId] };
+    if (layer.track_loops?.[property as TrackProperty]) {
+      const tracks = { ...layer.track_loops };
       delete tracks[property as TrackProperty];
-      if (Object.keys(tracks).length === 0) {
-        const allLoops = { ...next.track_loops };
-        delete allLoops[elementId];
-        next.track_loops = allLoops;
-      } else {
-        next.track_loops = { ...next.track_loops, [elementId]: tracks };
-      }
+      layer.track_loops =
+        Object.keys(tracks).length === 0 ? undefined : tracks;
     }
     return {
       project: next,
       result: { ok: true, data: { elementId, property, mode: "hold" } },
     };
   }
-  const loops = { ...(next.track_loops ?? {}) };
-  const tracks = { ...(loops[elementId] ?? {}) };
-  tracks[property as TrackProperty] = mode as LoopModeArg;
-  loops[elementId] = tracks;
-  next.track_loops = loops;
+  (layer.track_loops ??= {})[property as TrackProperty] = mode as LoopModeArg;
   return {
     project: next,
     result: { ok: true, data: { elementId, property, mode } },
@@ -1443,6 +1531,12 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   if (!filename) {
     return { project, result: { ok: false, error: "filename is required" } };
   }
+  if (!Number.isFinite(x)) {
+    return { project, result: { ok: false, error: `invalid x: ${x}` } };
+  }
+  if (!Number.isFinite(y)) {
+    return { project, result: { ok: false, error: `invalid y: ${y}` } };
+  }
   if (!Number.isFinite(width) || width <= 0) {
     return { project, result: { ok: false, error: `invalid width: ${width}` } };
   }
@@ -1464,6 +1558,7 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
     fill: null,
   };
   next.image_layers = [...next.image_layers, layer];
+  next.layer_order = [...next.layer_order, `image.${id}`];
   return {
     project: next,
     result: { ok: true, data: { id, elementId: `image.${id}` } },
@@ -1492,6 +1587,12 @@ const addVideoLayer: ToolDispatch<AddVideoLayerArgs> = (project, args) => {
   if (!clip) {
     return { project, result: { ok: false, error: "clip is required" } };
   }
+  if (!Number.isFinite(x)) {
+    return { project, result: { ok: false, error: `invalid x: ${x}` } };
+  }
+  if (!Number.isFinite(y)) {
+    return { project, result: { ok: false, error: `invalid y: ${y}` } };
+  }
   if (!Number.isFinite(width) || width <= 0) {
     return { project, result: { ok: false, error: `invalid width: ${width}` } };
   }
@@ -1517,6 +1618,7 @@ const addVideoLayer: ToolDispatch<AddVideoLayerArgs> = (project, args) => {
     fill: null,
   };
   next.video_layers = [...next.video_layers, layer];
+  next.layer_order = [...next.layer_order, `video.${id}`];
   return {
     project: next,
     result: { ok: true, data: { id, elementId: `video.${id}` } },
@@ -1538,8 +1640,6 @@ type AddShapeArgs = {
 
 const DEFAULT_SHAPE_W = 320;
 const DEFAULT_SHAPE_H = 180;
-const COMPOSITION_W = 1080;
-const COMPOSITION_H = 1920;
 
 // Every shape in the registry is valid. Derive from SHAPE_IDS so this stays in
 // lockstep with src/shapes.ts and the MCP enum (which also derives from it).
@@ -1562,6 +1662,18 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
       result: { ok: false, error: `invalid color (expected #rrggbb): ${color}` },
     };
   }
+  if (x !== undefined && !Number.isFinite(x)) {
+    return { project, result: { ok: false, error: `invalid x: ${x}` } };
+  }
+  if (y !== undefined && !Number.isFinite(y)) {
+    return { project, result: { ok: false, error: `invalid y: ${y}` } };
+  }
+  if (width !== undefined && (!Number.isFinite(width) || width <= 0)) {
+    return { project, result: { ok: false, error: `invalid width: ${width}` } };
+  }
+  if (height !== undefined && (!Number.isFinite(height) || height <= 0)) {
+    return { project, result: { ok: false, error: `invalid height: ${height}` } };
+  }
   const next = cloneProject(project);
   const id = generateLayerId(next, "shapes");
   const w = width ?? DEFAULT_SHAPE_W;
@@ -1571,8 +1683,8 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
     kind: kind as ShapeKind,
     // (x, y) is the CENTRE of the shape's bounding box — default to canvas
     // centre when the caller omits a position.
-    x: x ?? COMPOSITION_W / 2,
-    y: y ?? COMPOSITION_H / 2,
+    x: x ?? next.canvas_width / 2,
+    y: y ?? next.canvas_height / 2,
     width: w,
     height: h,
     fill: { type: "solid", color: color ?? "#ffffff", opacity: 1 },
@@ -1581,6 +1693,7 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
     pivotY: 0.5,
   };
   next.shapes = [...next.shapes, shape];
+  next.layer_order = [...next.layer_order, `shapes.${id}`];
   return {
     project: next,
     result: { ok: true, data: { id, elementId: `shapes.${id}` } },
@@ -1664,6 +1777,7 @@ const addCurve: ToolDispatch<AddCurveArgs> = (project, args) => {
     arrow_head: head,
   };
   next.shapes = [...next.shapes, shape];
+  next.layer_order = [...next.layer_order, `shapes.${id}`];
   return {
     project: next,
     result: { ok: true, data: { id, elementId: `shapes.${id}` } },
@@ -1689,6 +1803,11 @@ type DuplicateLayerArgs = {
   d_scale?: number;
 };
 
+// d_scale^i overflows to Infinity for ds > 1 across enough copies; clamping the
+// resulting dimensions keeps them finite so they never serialize to JSON null
+// and brick the project on reload.
+const MAX_LAYER_DIMENSION = 100_000;
+
 // Generic clone-with-offset over any leaf list (all share id/x/y/w/h/rotation).
 // Mutates `list` and `next.styles` in place; returns the new element ids.
 const duplicateInList = <
@@ -1704,7 +1823,7 @@ const duplicateInList = <
   list: T[],
   next: Project,
   baseId: string,
-  prefix: string,
+  kind: LayerKind,
   count: number,
   dx: number,
   dy: number,
@@ -1713,33 +1832,22 @@ const duplicateInList = <
 ): string[] | null => {
   const src = list.find((l) => l.id === baseId);
   if (!src) return null;
-  const used = new Set(list.map((l) => l.id));
+  const prefix = `${kind}.`;
   const newIds: string[] = [];
   for (let i = 1; i <= count; i += 1) {
-    let id = `${baseId}-${i}`;
-    let bump = 1;
-    while (used.has(id)) {
-      id = `${baseId}-${i}-${bump}`;
-      bump += 1;
-    }
-    used.add(id);
+    const id = generateLayerId(next, kind);
     const scale = Math.pow(ds, i);
     const copy: T = {
-      ...src,
+      ...structuredClone(src),
       id,
       x: src.x + dx * i,
       y: src.y + dy * i,
-      width: Math.max(1, src.width * scale),
-      height: Math.max(1, src.height * scale),
+      width: Math.min(MAX_LAYER_DIMENSION, Math.max(1, src.width * scale)),
+      height: Math.min(MAX_LAYER_DIMENSION, Math.max(1, src.height * scale)),
       rotation: (src.rotation ?? 0) + dr * i,
     };
     list.push(copy);
     const newElementId = `${prefix}${id}`;
-    const srcStyle = next.styles?.[`${prefix}${baseId}`];
-    if (srcStyle) {
-      next.styles = next.styles ?? {};
-      next.styles[newElementId] = { ...srcStyle };
-    }
     newIds.push(newElementId);
   }
   return newIds;
@@ -1755,17 +1863,27 @@ const duplicateLayer: ToolDispatch<DuplicateLayerArgs> = (project, args) => {
   const dy = args.dy ?? 0;
   const dr = args.d_rotation ?? 0;
   const ds = args.d_scale ?? 1;
+  for (const [k, v] of [
+    ["dx", dx],
+    ["dy", dy],
+    ["d_rotation", dr],
+    ["d_scale", ds],
+  ] as const) {
+    if (!Number.isFinite(v)) {
+      return { project, result: { ok: false, error: `${k} must be a finite number` } };
+    }
+  }
   const next = cloneProject(project);
 
   let ids: string[] | null = null;
   if (elementId.startsWith("shapes.")) {
-    ids = duplicateInList(next.shapes, next, elementId.slice(7), "shapes.", count, dx, dy, dr, ds);
+    ids = duplicateInList(next.shapes, next, elementId.slice(7), "shapes", count, dx, dy, dr, ds);
   } else if (elementId.startsWith("image.")) {
-    ids = duplicateInList(next.image_layers, next, elementId.slice(6), "image.", count, dx, dy, dr, ds);
+    ids = duplicateInList(next.image_layers, next, elementId.slice(6), "image", count, dx, dy, dr, ds);
   } else if (elementId.startsWith("text.")) {
-    ids = duplicateInList(next.text_layers, next, elementId.slice(5), "text.", count, dx, dy, dr, ds);
+    ids = duplicateInList(next.text_layers, next, elementId.slice(5), "text", count, dx, dy, dr, ds);
   } else if (elementId.startsWith("video.")) {
-    ids = duplicateInList(next.video_layers, next, elementId.slice(6), "video.", count, dx, dy, dr, ds);
+    ids = duplicateInList(next.video_layers, next, elementId.slice(6), "video", count, dx, dy, dr, ds);
   } else {
     return {
       project,
@@ -1786,13 +1904,6 @@ const duplicateLayer: ToolDispatch<DuplicateLayerArgs> = (project, args) => {
 // ---------------------------------------------------------------------------
 
 type RemoveLayerArgs = { elementId: string };
-
-const detachFromTree = (project: Project, elementId: string): void => {
-  project.layer_order = project.layer_order.filter((x) => x !== elementId);
-  for (const g of project.groups) {
-    g.children = g.children.filter((x) => x !== elementId);
-  }
-};
 
 const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
   const { elementId } = args;
@@ -1816,9 +1927,7 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
       return { project, result: { ok: false, error: `shape not found: ${id}` } };
     }
     next.shapes.splice(idx, 1);
-    delete next.animations[elementId];
-    delete next.styles[elementId];
-    detachFromTree(next, elementId);
+    purgeElementId(next, elementId);
     return { project: next, result: { ok: true } };
   }
   if (elementId.startsWith("image.")) {
@@ -1838,9 +1947,7 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
       };
     }
     next.image_layers.splice(idx, 1);
-    delete next.animations[elementId];
-    delete next.styles[elementId];
-    detachFromTree(next, elementId);
+    purgeElementId(next, elementId);
     return { project: next, result: { ok: true } };
   }
   if (elementId.startsWith("video.")) {
@@ -1850,9 +1957,7 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
       return { project, result: { ok: false, error: `video layer not found: ${id}` } };
     }
     next.video_layers.splice(idx, 1);
-    delete next.animations[elementId];
-    delete next.styles[elementId];
-    detachFromTree(next, elementId);
+    purgeElementId(next, elementId);
     return { project: next, result: { ok: true } };
   }
   if (elementId.startsWith("text.")) {
@@ -1862,9 +1967,7 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
       return { project, result: { ok: false, error: `text layer not found: ${id}` } };
     }
     next.text_layers.splice(idx, 1);
-    delete next.animations[elementId];
-    delete next.styles[elementId];
-    detachFromTree(next, elementId);
+    purgeElementId(next, elementId);
     return { project: next, result: { ok: true } };
   }
   return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
@@ -2051,6 +2154,17 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
     };
   }
   for (const [name, v] of [
+    ["borderWidth", borderWidth],
+    ["borderRadius", borderRadius],
+  ] as const) {
+    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) {
+      return {
+        project,
+        result: { ok: false, error: `${name} must be a non-negative number` },
+      };
+    }
+  }
+  for (const [name, v] of [
     ["anchorX", anchorX],
     ["anchorY", anchorY],
     ["tintStrength", tintStrength],
@@ -2171,7 +2285,11 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
     }
   }
   const next = cloneProject(project);
-  const existing = next.styles[elementId] ?? {};
+  const layer = findLayerByElementId(next, elementId);
+  if (!layer) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+  }
+  const existing = layer.style ?? {};
   const merged: LayerStyle = {
     ...existing,
     ...(borderRadius !== undefined ? { borderRadius } : {}),
@@ -2222,9 +2340,9 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
     clean.blend_mode = merged.blend_mode;
   }
   if (Object.keys(clean).length === 0) {
-    delete next.styles[elementId];
+    layer.style = undefined;
   } else {
-    next.styles[elementId] = clean;
+    layer.style = clean;
   }
   return { project: next, result: { ok: true } };
 };
@@ -2472,10 +2590,11 @@ const addColorKeyframe: ToolDispatch<AddColorKeyframeArgs> = (project, args) => 
     };
   }
   const next = cloneProject(project);
-  if (!next.color_tracks[elementId]) {
-    next.color_tracks[elementId] = {} as ElementColorTracks;
+  const layer = findLayerByElementId(next, elementId);
+  if (!layer) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
   }
-  const tracks = next.color_tracks[elementId];
+  const tracks = (layer.color_tracks ??= {} as ElementColorTracks);
   if (!tracks.fill) tracks.fill = [];
   const kfs = tracks.fill as ColorKeyframe[];
   const targetFrame = Math.round(frame);
@@ -2537,7 +2656,8 @@ const removeColorKeyframe: ToolDispatch<RemoveColorKeyframeArgs> = (
   if (!Number.isFinite(frame) || frame < 0) {
     return { project, result: { ok: false, error: `invalid frame: ${frame}` } };
   }
-  const tracks = project.color_tracks?.[elementId];
+  const srcLayer = findLayerByElementId(project, elementId);
+  const tracks = srcLayer?.color_tracks;
   const kfs = tracks?.fill;
   const targetFrame = Math.round(frame);
   if (!kfs || kfs.length === 0) {
@@ -2548,47 +2668,19 @@ const removeColorKeyframe: ToolDispatch<RemoveColorKeyframeArgs> = (
     return { project, result: { ok: true, data: { removed: false } } };
   }
   const next = cloneProject(project);
-  const nextKfs = next.color_tracks[elementId].fill as ColorKeyframe[];
+  const layer = findLayerByElementId(next, elementId);
+  if (!layer?.color_tracks?.fill) {
+    return { project, result: { ok: true, data: { removed: false } } };
+  }
+  const nextKfs = layer.color_tracks.fill as ColorKeyframe[];
   nextKfs.splice(idx, 1);
   if (nextKfs.length === 0) {
-    delete next.color_tracks[elementId].fill;
-    if (Object.keys(next.color_tracks[elementId]).length === 0) {
-      delete next.color_tracks[elementId];
+    delete layer.color_tracks.fill;
+    if (Object.keys(layer.color_tracks).length === 0) {
+      layer.color_tracks = undefined;
     }
   }
   return { project: next, result: { ok: true, data: { removed: true } } };
-};
-
-// ---------------------------------------------------------------------------
-// set_duration
-// ---------------------------------------------------------------------------
-
-type SetDurationArgs = { seconds: number };
-
-const MIN_DURATION_SECONDS = 1;
-const MAX_DURATION_SECONDS = 600;
-
-const setDuration: ToolDispatch<SetDurationArgs> = (project, args) => {
-  const { seconds } = args;
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return { project, result: { ok: false, error: `invalid seconds: ${seconds}` } };
-  }
-  const clamped = Math.max(
-    MIN_DURATION_SECONDS,
-    Math.min(MAX_DURATION_SECONDS, seconds),
-  );
-  if (project.duration_seconds === clamped) {
-    return {
-      project,
-      result: { ok: true, data: { duration_seconds: clamped } },
-    };
-  }
-  const next = cloneProject(project);
-  next.duration_seconds = clamped;
-  return {
-    project: next,
-    result: { ok: true, data: { duration_seconds: clamped } },
-  };
 };
 
 // ---------------------------------------------------------------------------
@@ -2615,6 +2707,9 @@ const fadeLayer: ToolDispatch<FadeLayerArgs> = (project, args) => {
   }
   if (fromFrame < 0 || toFrame < 0) {
     return { project, result: { ok: false, error: "frames must be non-negative" } };
+  }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
   }
   const next = cloneProject(project);
   upsertKeyframe(next, elementId, "opacity", Math.round(fromFrame), fromOpacity);
@@ -2650,6 +2745,9 @@ const setLayerVisible: ToolDispatch<SetLayerVisibleArgs> = (project, args) => {
       project,
       result: { ok: false, error: `visible must be a boolean (got ${typeof visible})` },
     };
+  }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
   }
   const next = cloneProject(project);
   upsertKeyframe(next, elementId, "opacity", 0, visible ? 1 : 0);
@@ -2756,6 +2854,9 @@ const applyPreset: ToolDispatch<ApplyPresetArgs> = (project, args) => {
       },
     };
   }
+  if (!isValidColorTarget(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
   const sf = startFrame === undefined ? 0 : Math.round(startFrame);
   const tuples = PRESET_TUPLES[preset as AnimationPreset];
   const next = cloneProject(project);
@@ -2807,6 +2908,12 @@ const applyPresetStagger: ToolDispatch<ApplyPresetStaggerArgs> = (project, args)
         result: { ok: false, error: `elementIds[${i}] must be a non-empty string` },
       };
     }
+    if (!isValidColorTarget(project, ids[i] as string)) {
+      return {
+        project,
+        result: { ok: false, error: `unknown elementId: ${ids[i]}` },
+      };
+    }
   }
   const preset = args.preset;
   if (typeof preset !== "string" || !preset) {
@@ -2834,27 +2941,25 @@ const applyPresetStagger: ToolDispatch<ApplyPresetStaggerArgs> = (project, args)
   if (!Number.isFinite(stagger)) {
     return { project, result: { ok: false, error: "stagger must be a finite number" } };
   }
-  let cur = project;
+  const tuples = PRESET_TUPLES[preset as AnimationPreset];
+  const next = cloneProject(project);
   for (let i = 0; i < ids.length; i++) {
+    const elementId = ids[i] as string;
     const sf = Math.max(0, Math.round(startFrame + i * stagger));
-    const { project: nextP, result } = applyPreset(cur, {
-      elementId: ids[i] as string,
-      preset,
-      startFrame: sf,
-    });
-    if (!result.ok) {
-      return {
-        project,
-        result: {
-          ok: false,
-          error: `applying preset to ${ids[i]}: ${result.error ?? "unknown"}`,
-        },
-      };
+    const base = baseForElement(next, elementId);
+    for (const t of tuples) {
+      const frame = Math.max(0, Math.round(sf + t.frame));
+      const value =
+        t.property === "x"
+          ? base.x + t.value
+          : t.property === "y"
+            ? base.y + t.value
+            : t.value;
+      upsertKeyframe(next, elementId, t.property, frame, value, t.easing ?? "easeInOut");
     }
-    cur = nextP;
   }
   return {
-    project: cur,
+    project: next,
     result: {
       ok: true,
       data: { count: ids.length, preset, startFrame, stagger },
@@ -2909,10 +3014,10 @@ const groupLayers: ToolDispatch<GroupLayersArgs> = (project, args) => {
   }
   const pivotX = centers.length
     ? centers.reduce((a, c) => a + c.x, 0) / centers.length
-    : COMP_W / 2;
+    : project.canvas_width / 2;
   const pivotY = centers.length
     ? centers.reduce((a, c) => a + c.y, 0) / centers.length
-    : COMP_H / 2;
+    : project.canvas_height / 2;
 
   const next = cloneProject(project);
   const newId = generateLayerId(next, "group");
@@ -2999,8 +3104,7 @@ const ungroupLayers: ToolDispatch<UngroupLayersArgs> = (project, args) => {
     }
   }
   next.groups.splice(groupIdx, 1);
-  delete next.animations[groupElementId];
-  delete next.styles[groupElementId];
+  purgeElementId(next, groupElementId);
 
   return {
     project: next,
@@ -3678,6 +3782,9 @@ const listFonts: ToolDispatch<ListFontsArgs> = (project, args) => {
 type SetMatteSourceArgs = {
   elementId: string;
   matte_source_id: string | null;
+  // Optional. When omitted, the host's existing invert flag is preserved;
+  // clearing the mask (matte_source_id null) always clears it.
+  matte_inverted?: boolean;
 };
 
 const isLeafElementId = (id: string): boolean =>
@@ -3739,47 +3846,81 @@ const setMatteSource: ToolDispatch<SetMatteSourceArgs> = (project, args) => {
         result: { ok: false, error: "matte_source_id cannot reference the host layer" },
       };
     }
+    if (!isValidColorTarget(project, matte_source_id)) {
+      return {
+        project,
+        result: { ok: false, error: `unknown matte_source_id: ${matte_source_id}` },
+      };
+    }
   }
   const next = cloneProject(project);
   const value =
     matte_source_id === null || matte_source_id === undefined
       ? null
       : matte_source_id;
+  // Invert flag: clearing the mask clears invert; an explicit boolean wins;
+  // otherwise preserve the host's current value.
+  const nextInverted = (prev: boolean | undefined): boolean | undefined =>
+    value === null
+      ? undefined
+      : typeof args.matte_inverted === "boolean"
+        ? args.matte_inverted
+        : prev;
   if (elementId.startsWith("image.")) {
     const id = elementId.slice("image.".length);
     const idx = next.image_layers.findIndex((l) => l.id === id);
     if (idx < 0) {
       return { project, result: { ok: false, error: `unknown layer: ${elementId}` } };
     }
-    next.image_layers[idx] = { ...next.image_layers[idx], matte_source_id: value };
+    next.image_layers[idx] = {
+      ...next.image_layers[idx],
+      matte_source_id: value,
+      matte_inverted: nextInverted(next.image_layers[idx].matte_inverted),
+    };
   } else if (elementId.startsWith("video.")) {
     const id = elementId.slice("video.".length);
     const idx = next.video_layers.findIndex((v) => v.id === id);
     if (idx < 0) {
       return { project, result: { ok: false, error: `unknown layer: ${elementId}` } };
     }
-    next.video_layers[idx] = { ...next.video_layers[idx], matte_source_id: value };
+    next.video_layers[idx] = {
+      ...next.video_layers[idx],
+      matte_source_id: value,
+      matte_inverted: nextInverted(next.video_layers[idx].matte_inverted),
+    };
   } else if (elementId.startsWith("shapes.")) {
     const id = elementId.slice("shapes.".length);
     const idx = next.shapes.findIndex((s) => s.id === id);
     if (idx < 0) {
       return { project, result: { ok: false, error: `unknown shape: ${elementId}` } };
     }
-    next.shapes[idx] = { ...next.shapes[idx], matte_source_id: value };
+    next.shapes[idx] = {
+      ...next.shapes[idx],
+      matte_source_id: value,
+      matte_inverted: nextInverted(next.shapes[idx].matte_inverted),
+    };
   } else if (elementId.startsWith("text.")) {
     const id = elementId.slice("text.".length);
     const idx = next.text_layers.findIndex((t) => t.id === id);
     if (idx < 0) {
       return { project, result: { ok: false, error: `unknown text layer: ${elementId}` } };
     }
-    next.text_layers[idx] = { ...next.text_layers[idx], matte_source_id: value };
+    next.text_layers[idx] = {
+      ...next.text_layers[idx],
+      matte_source_id: value,
+      matte_inverted: nextInverted(next.text_layers[idx].matte_inverted),
+    };
   } else if (elementId.startsWith("group.")) {
     const id = elementId.slice("group.".length);
     const idx = next.groups.findIndex((g) => g.id === id);
     if (idx < 0) {
       return { project, result: { ok: false, error: `unknown group: ${elementId}` } };
     }
-    next.groups[idx] = { ...next.groups[idx], matte_source_id: value };
+    next.groups[idx] = {
+      ...next.groups[idx],
+      matte_source_id: value,
+      matte_inverted: nextInverted(next.groups[idx].matte_inverted),
+    };
   }
   return { project: next, result: { ok: true, data: { elementId, matte_source_id: value } } };
 };
@@ -3976,8 +4117,8 @@ const applyTextStyleProps = (
   }
   if (args.text_autofit !== undefined) {
     const v = args.text_autofit;
-    if (v === "shrink" || v === "wrap") layer.text_autofit = v;
-    else return 'text_autofit must be "shrink" or "wrap"';
+    if (v === "fit" || v === "shrink" || v === "wrap") layer.text_autofit = v;
+    else return 'text_autofit must be "fit", "shrink", or "wrap"';
   }
   if (args.text_valign !== undefined) {
     const v = args.text_valign;
@@ -4228,26 +4369,10 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
   const next = cloneProject(project);
   const id = generateLayerId(next, "text");
 
-  // Derive a default text_size from the existing text layers (median of their
-  // explicit text_size values); fall back to ~10% of the canvas height.
-  let resolvedTextSize: number | undefined;
-  if (typeof text_size === "number") {
-    resolvedTextSize = text_size;
-  } else {
-    const sizes = next.text_layers
-      .map((t) => t.text_size)
-      .filter((s): s is number => typeof s === "number" && s > 0)
-      .sort((a, b) => a - b);
-    if (sizes.length > 0) {
-      const mid = Math.floor(sizes.length / 2);
-      resolvedTextSize =
-        sizes.length % 2 === 1
-          ? sizes[mid]
-          : (sizes[mid - 1] + sizes[mid]) / 2;
-    } else {
-      resolvedTextSize = Math.round(next.canvas_height * 0.1);
-    }
-  }
+  // Default text_size: shared with the editor's addTextLayer so editor- and
+  // agent-created text get the SAME explicit size (see resolveDefaultTextSize).
+  const resolvedTextSize =
+    typeof text_size === "number" ? text_size : resolveDefaultTextSize(next);
 
   const layer: TextLayer = {
     id,
@@ -4263,6 +4388,9 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
       typeof font_family === "string" ? font_family.trim() : DEFAULT_TEXT_FONT,
     ...(resolvedTextSize !== undefined ? { text_size: resolvedTextSize } : {}),
     ...(typeof text_color === "string" ? { text_color } : {}),
+    // Fixed size by default — the text_size you set is the size that renders.
+    // An explicit `text_autofit` arg overrides this via applyTextStyleProps.
+    text_autofit: "wrap",
     fill: null,
   };
   const styleErr = applyTextStyleProps(layer, args as Record<string, unknown>);
@@ -4627,7 +4755,16 @@ const setCanvasSize: ToolDispatch<SetCanvasSizeArgs> = (project, args) => {
     g.pivotY *= sy;
   }
   // Scale every spatial track keyframe; scale/rotation/opacity stay put.
-  for (const tracks of Object.values(next.animations)) {
+  const allLayers: AnyLayer[] = [
+    ...next.image_layers,
+    ...next.video_layers,
+    ...next.shapes,
+    ...next.text_layers,
+    ...next.groups,
+  ];
+  for (const layer of allLayers) {
+    const tracks = layer.animations;
+    if (!tracks) continue;
     for (const prop of ["x", "y", "width", "height"] as const) {
       const kfs = tracks[prop];
       if (!kfs) continue;
@@ -4768,7 +4905,6 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   ungroup_layers: ungroupLayers as ToolDispatch<never>,
   set_group_parent: setGroupParent as ToolDispatch<never>,
   rename_group: renameGroup as ToolDispatch<never>,
-  set_duration: setDuration as ToolDispatch<never>,
   add_audio_overlay: addAudioOverlay as ToolDispatch<never>,
   remove_audio_overlay: removeAudioOverlay as ToolDispatch<never>,
   update_audio_overlay: updateAudioOverlay as ToolDispatch<never>,
@@ -5413,24 +5549,6 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
-      name: "set_duration",
-      description:
-        "Set the project's first-class composition duration in seconds. This drives the timeline length and the export length — not the source mp4. Clamped to [1, 600] seconds.",
-      parameters: {
-        type: "object",
-        properties: {
-          seconds: {
-            type: "number",
-            description: "Composition duration in seconds. Clamped to [1, 600].",
-          },
-        },
-        required: ["seconds"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "fade_layer",
       description:
         "Fade a layer's opacity between two frames in one call.",
@@ -5821,7 +5939,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_layer_text",
       description:
-        "Edit an existing text layer (text.<id>). Patches its text content, font, size, colour, and full type styling — pass only the fields you want to change. Does NOT create layers and does NOT touch image layers; use add_text_layer to make a new one. `font_family` is a Google Fonts family name (e.g. \"Anton\", \"Bebas Neue\"). `text_size` is the font size in px (omit to keep the current size). `text_color` is #rrggbb. Styling: font_weight (100-900, e.g. 800 for a black/heavy logo look), font_style (italic), text_transform (uppercase/lowercase), letter_spacing (px, may be negative for tight tracking), line_height (multiplier), text_align, text_autofit (\"shrink\"=auto-shrink to fit, \"wrap\"=fixed size + word-wrap), text_valign (top/middle/bottom block alignment), an outline via stroke_width + stroke_color, and a text_shadow. To make text MASK another layer (video/image-filled letterforms) use set_matte_source with this layer's id as the matte source. Only `elementId` is required.",
+        "Edit an existing text layer (text.<id>). Patches its text content, font, size, colour, and full type styling — pass only the fields you want to change. Does NOT create layers and does NOT touch image layers; use add_text_layer to make a new one. `font_family` is a Google Fonts family name (e.g. \"Anton\", \"Bebas Neue\"). `text_size` is the font size in px (omit to keep the current size). `text_color` is #rrggbb. Styling: font_weight (100-900, e.g. 800 for a black/heavy logo look), font_style (italic), text_transform (uppercase/lowercase), letter_spacing (px, may be negative for tight tracking), line_height (multiplier), text_align, text_autofit (\"wrap\" default = fixed size + word-wrap, the size you set is what renders; \"fit\"=auto-size to fill the box, grows and shrinks; \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom block alignment), an outline via stroke_width + stroke_color, and a text_shadow. To make text MASK another layer (video/image-filled letterforms) use set_matte_source with this layer's id as the matte source. Only `elementId` is required.",
       parameters: {
         type: "object",
         properties: {
@@ -5874,9 +5992,9 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           text_autofit: {
             type: "string",
-            enum: ["shrink", "wrap"],
+            enum: ["fit", "shrink", "wrap"],
             description:
-              "How text fits its box. \"shrink\" (default): word-wrap then auto-shrink the font from text_size until the block fits — a longer line renders smaller. \"wrap\": hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never shrink — every line keeps the same height. Captions use \"wrap\".",
+              "How text fits its box. \"wrap\" (default): hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never resize — the size you set is the size rendered. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
           },
           text_valign: {
             type: "string",
@@ -5912,7 +6030,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_text_layer",
       description:
-        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width 900, height 320, font_family \"Anton\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"shrink\"=auto-shrink to fit / \"wrap\"=fixed size + word-wrap), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
+        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width 900, height 320, font_family \"Anton\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"wrap\" default = fixed size + word-wrap / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
       parameters: {
         type: "object",
         properties: {
@@ -5966,9 +6084,9 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           text_autofit: {
             type: "string",
-            enum: ["shrink", "wrap"],
+            enum: ["fit", "shrink", "wrap"],
             description:
-              "How text fits its box. \"shrink\" (default): word-wrap then auto-shrink the font from text_size until the block fits — a longer line renders smaller. \"wrap\": hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never shrink — every line keeps the same height. Captions use \"wrap\".",
+              "How text fits its box. \"wrap\" (default): hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never resize — the size you set is the size rendered. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
           },
           text_valign: {
             type: "string",
@@ -6190,6 +6308,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: ["string", "null"],
             description:
               "Element id of the layer whose alpha drives the mask, or null to clear.",
+          },
+          matte_inverted: {
+            type: "boolean",
+            description:
+              "Optional. Invert the mask (knock-out): the host shows everywhere EXCEPT where the source is opaque — a punch-through / spotlight. Honored on leaf hosts; ignored on group hosts. Omitted = preserve current; clearing the mask resets it.",
           },
         },
         required: ["elementId", "matte_source_id"],
