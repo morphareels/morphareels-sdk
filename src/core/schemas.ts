@@ -296,8 +296,12 @@ export const textLayerSchema = z
     // shrink — to the largest size whose wrapped block fills the box, so
     // resizing the box resizes the text. "shrink" (legacy): word-wrap, then
     // auto-shrink the font from text_size until the block fits — never grows.
-    // Captions use "wrap" to stop size bounce.
-    text_autofit: z.enum(["fit", "shrink", "wrap"]).default("wrap"),
+    // Captions use "wrap" to stop size bounce. "hug": the inverse of "fit" —
+    // hold text_size FIXED and DERIVE the box (width + height) from the
+    // measured text plus style.padding, so the box shrink-wraps the content
+    // and grows/shrinks live as the text changes. width/height become derived
+    // (and ignored) in this mode; animate size via the scale track instead.
+    text_autofit: z.enum(["fit", "shrink", "wrap", "hug"]).default("wrap"),
     // Text fill colour as #rrggbb. Defaults to white when omitted.
     text_color: z.string().optional(),
     // Optional backdrop fill painted in the layer's local rect behind the text.
@@ -717,6 +721,12 @@ export const layerStyleSchema = z
     borderWidth: z.number().nonnegative().optional(),
     borderColor: hexColor.optional(),
     boxShadow: z.string().optional(),
+    // Uniform inset (canvas-stage px) between the box edge and the text.
+    // Honoured by TEXT layers only — it sets the breathing room around the
+    // glyphs for the background box and, in "hug" autofit, the amount the
+    // derived box extends past the measured text. Other layer kinds ignore it.
+    // When unset, text falls back to the legacy 4% / 0.92 inset.
+    padding: z.number().nonnegative().optional(),
     fit: fitModeSchema.optional(),
     // Object-position for cover/contain fit modes. 0..1 along each axis;
     // (0.5, 0.5) = centre (default when unset). For cover, this picks which
@@ -1474,6 +1484,10 @@ export const projectSchema = z.preprocess(
       // back to project_id when missing or empty so the dropdown is never
       // blank for older projects that pre-date this field.
       name: z.string().optional(),
+      // The organization this project belongs to, or null/absent when it's a
+      // personal project. Opaque org UUID; the org membership index decides who
+      // can see it.
+      org_id: z.string().nullable().optional(),
       schema_version: z.literal(SCHEMA_VERSION),
       image_layers: z.array(imageLayerSchema).default([]),
       video_layers: z.array(videoLayerSchema).default([]),

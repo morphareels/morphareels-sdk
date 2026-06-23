@@ -48,4 +48,6 @@ export type {
   MorphaClient,
   MorphaClientOptions,
   ToolCallResult,
+  ToolResultEnvelope,
+  CacheReadResult,
 } from "./client.ts";

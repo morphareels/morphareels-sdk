@@ -88,17 +88,118 @@ const cloneProject = (p: Project): Project =>
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
 
-// Accept either the `"#rrggbb"` shorthand (promoted to a solid Fill at full
-// opacity) or a Fill-shaped object (validated through `fillSchema`). Returns
-// the parsed Fill, or null if neither shape matched.
+// Surfaced verbatim in the tool error when a fill can't be coerced, so the
+// agent learns the canonical Fill rather than seeing a default silently applied.
+const FILL_SHAPE_HINT =
+  '"#rrggbb", or a Fill object: {type:"solid",color} / ' +
+  '{type:"linear",stops:[{pos:0..1,color}],angle?} / ' +
+  '{type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / ' +
+  '{type:"mask",layer_id,color}. Gradient stop position key is `pos` (0..1); ' +
+  "`offset` is also accepted.";
+
+// Accept the `"#rrggbb"` shorthand (promoted to a solid Fill at full opacity),
+// a canonical Fill object (validated through `fillSchema`), or a loosely-shaped
+// gradient an LLM is likely to emit (coerced into a canonical gradient Fill).
+// Returns the parsed Fill, or null if no shape matched.
 const coerceFill = (input: unknown): Fill | null => {
   if (typeof input === "string") {
     if (!HEX.test(input)) return null;
     return { type: "solid", color: input, opacity: 1 };
   }
   if (!input || typeof input !== "object") return null;
-  const parsed = fillSchema.safeParse(input);
+  const direct = fillSchema.safeParse(input);
+  if (direct.success) return direct.data;
+  return coerceGradientFill(input as Record<string, unknown>);
+};
+
+// Synonyms an LLM reaches for in place of the canonical "linear" / "radial".
+const GRADIENT_TYPE_ALIASES: Record<string, "linear" | "radial"> = {
+  linear: "linear",
+  "linear-gradient": "linear",
+  lineargradient: "linear",
+  gradient: "linear",
+  radial: "radial",
+  "radial-gradient": "radial",
+  radialgradient: "radial",
+};
+
+// Coerce a loosely-shaped gradient ({type:"linear-gradient", colors:[...]},
+// stops keyed by offset/position, 0..100 offsets) into a canonical
+// linear/radial Fill, then validate through `fillSchema`. null when the object
+// isn't gradient-shaped or a stop colour isn't "#rrggbb".
+const coerceGradientFill = (input: Record<string, unknown>): Fill | null => {
+  const rawType =
+    typeof input.type === "string" ? input.type.toLowerCase() : "";
+  const kind = GRADIENT_TYPE_ALIASES[rawType];
+  const rawStops = input.stops ?? input.colors;
+  if (!kind && rawStops === undefined) return null;
+  const stops = normalizeGradientStops(rawStops);
+  if (!stops) return null;
+  if ((kind ?? "linear") === "radial") {
+    return parseFillCandidate({
+      type: "radial",
+      stops,
+      ...(input.cx !== undefined ? { cx: input.cx } : {}),
+      ...(input.cy !== undefined ? { cy: input.cy } : {}),
+      ...(input.radius !== undefined ? { radius: input.radius } : {}),
+    });
+  }
+  const angle = input.angle ?? input.degrees ?? input.deg;
+  return parseFillCandidate({
+    type: "linear",
+    stops,
+    ...(angle !== undefined ? { angle } : {}),
+  });
+};
+
+const parseFillCandidate = (candidate: unknown): Fill | null => {
+  const parsed = fillSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
+};
+
+type CoercedStop = { pos: number; color: string; opacity?: number };
+
+// Normalize a stops/colors array into canonical {pos,color,opacity?} stops:
+// bare "#rrggbb" strings, or objects keyed by color/colour + pos/offset/
+// position/stop. Offsets >1 are read as 0..100 percentages; missing offsets are
+// distributed evenly across the run. null if any stop is unusable.
+const normalizeGradientStops = (raw: unknown): CoercedStop[] | null => {
+  if (!Array.isArray(raw) || raw.length < 2) return null;
+  const evenPos = (i: number) => i / (raw.length - 1);
+  const out: CoercedStop[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (typeof entry === "string") {
+      if (!HEX.test(entry)) return null;
+      out.push({ pos: evenPos(i), color: entry });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") return null;
+    const o = entry as Record<string, unknown>;
+    const color = o.color ?? o.colour;
+    if (typeof color !== "string" || !HEX.test(color)) return null;
+    const pos = normalizeStopOffset(
+      o.pos ?? o.offset ?? o.position ?? o.stop,
+      evenPos(i),
+    );
+    if (pos === null) return null;
+    const stop: CoercedStop = { pos, color };
+    const alpha = o.opacity ?? o.alpha;
+    if (typeof alpha === "number") stop.opacity = alpha;
+    out.push(stop);
+  }
+  return out;
+};
+
+const normalizeStopOffset = (
+  raw: unknown,
+  fallback: number,
+): number | null => {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const pos = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, pos));
 };
 
 // Static x/y for the leaf-layer behind an elementId. Groups have no static
@@ -2324,6 +2425,9 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
   if (merged.borderRadius != null) clean.borderRadius = merged.borderRadius;
   if (merged.borderWidth != null) clean.borderWidth = merged.borderWidth;
   if (merged.borderColor) clean.borderColor = merged.borderColor;
+  // Preserve text-box padding (set via set_text_background) — set_style must
+  // not nuke it when patching an unrelated style field.
+  if (merged.padding != null) clean.padding = merged.padding;
   if (merged.boxShadow) clean.boxShadow = merged.boxShadow;
   if (merged.fit) clean.fit = merged.fit;
   if (merged.anchorX != null) clean.anchorX = merged.anchorX;
@@ -2344,7 +2448,25 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
   } else {
     layer.style = clean;
   }
-  return { project: next, result: { ok: true } };
+  // SVGs carry no intrinsic pixel size, so fit:"contain"/"cover" (which scale the
+  // source to its own intrinsic box) collapse them to nothing — an invisible
+  // layer. Warn rather than silently render blank; "stretch" (the default) is
+  // the right fit for a vector that should fill its frame.
+  const filename = (layer as { filename?: unknown }).filename;
+  const svgFitWarning =
+    (fit === "contain" || fit === "cover") &&
+    typeof filename === "string" &&
+    filename.toLowerCase().endsWith(".svg")
+      ? `fit:"${fit}" on an SVG ("${filename}") scales it by its (absent) intrinsic ` +
+        `size and can render it invisibly — use fit:"stretch" for a vector that ` +
+        `should fill its frame.`
+      : null;
+  return {
+    project: next,
+    result: svgFitWarning
+      ? { ok: true, data: { warning: svgFitWarning } }
+      : { ok: true },
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -2420,7 +2542,7 @@ const setLayerFill: ToolDispatch<SetLayerFillArgs> = (project, args) => {
   if (!coerced) {
     return {
       project,
-      result: { ok: false, error: "invalid fill (expected #rrggbb or Fill object)" },
+      result: { ok: false, error: `invalid fill (expected ${FILL_SHAPE_HINT})` },
     };
   }
   const next = cloneProject(project);
@@ -2462,6 +2584,110 @@ const setLayerFill: ToolDispatch<SetLayerFillArgs> = (project, args) => {
   } else {
     return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
   }
+  return { project: next, result: { ok: true } };
+};
+
+// ---------------------------------------------------------------------------
+// set_text_background
+// ---------------------------------------------------------------------------
+
+type SetTextBackgroundArgs = {
+  elementId: string;
+  fill?: unknown;
+  padding?: number;
+  cornerRadius?: number;
+  strokeWidth?: number;
+  strokeColor?: string;
+};
+
+// Declarative "rounded box behind text": sets the text layer's backdrop fill
+// plus the box's padding / corner radius / stroke in ONE call. Pair with
+// text_autofit "hug" so the box shrink-wraps the text. Text layers only.
+const setTextBackground: ToolDispatch<SetTextBackgroundArgs> = (
+  project,
+  args,
+) => {
+  const { elementId, fill, padding, cornerRadius, strokeWidth, strokeColor } =
+    args;
+  if (
+    !elementId ||
+    typeof elementId !== "string" ||
+    !elementId.startsWith("text.")
+  ) {
+    return {
+      project,
+      result: { ok: false, error: "elementId must be a text.<id>" },
+    };
+  }
+  for (const [v, name] of [
+    [padding, "padding"],
+    [cornerRadius, "cornerRadius"],
+    [strokeWidth, "strokeWidth"],
+  ] as const) {
+    if (
+      v !== undefined &&
+      (typeof v !== "number" || !Number.isFinite(v) || v < 0)
+    ) {
+      return {
+        project,
+        result: { ok: false, error: `${name} must be a number >= 0` },
+      };
+    }
+  }
+  if (strokeColor !== undefined && !HEX.test(strokeColor)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `invalid strokeColor (expected #rrggbb): ${strokeColor}`,
+      },
+    };
+  }
+  let coercedFill: Fill | null | undefined = undefined;
+  if (fill !== undefined) {
+    if (fill === null) {
+      coercedFill = null;
+    } else {
+      const c = coerceFill(fill);
+      if (!c) {
+        return {
+          project,
+          result: {
+            ok: false,
+            error: `invalid fill (expected ${FILL_SHAPE_HINT})`,
+          },
+        };
+      }
+      coercedFill = c;
+    }
+  }
+  const next = cloneProject(project);
+  const id = elementId.slice("text.".length);
+  const idx = next.text_layers.findIndex((t) => t.id === id);
+  if (idx < 0) {
+    return {
+      project,
+      result: { ok: false, error: `unknown text layer: ${elementId}` },
+    };
+  }
+  const layer = next.text_layers[idx];
+  if (coercedFill !== undefined) layer.fill = coercedFill;
+  // Merge the box style onto any existing style; zeros / empties drop out so
+  // "no padding / border" stays unrepresentable rather than stored as 0.
+  const merged: LayerStyle = { ...(layer.style ?? {}) };
+  if (padding !== undefined) merged.padding = padding;
+  if (cornerRadius !== undefined) merged.borderRadius = cornerRadius;
+  if (strokeWidth !== undefined) merged.borderWidth = strokeWidth;
+  if (strokeColor !== undefined) merged.borderColor = strokeColor;
+  if (!(merged.padding != null && merged.padding > 0)) delete merged.padding;
+  if (!(merged.borderRadius != null && merged.borderRadius > 0)) {
+    delete merged.borderRadius;
+  }
+  if (!(merged.borderWidth != null && merged.borderWidth > 0)) {
+    delete merged.borderWidth;
+  }
+  if (!merged.borderColor) delete merged.borderColor;
+  layer.style = Object.keys(merged).length === 0 ? undefined : merged;
   return { project: next, result: { ok: true } };
 };
 
@@ -2586,7 +2812,7 @@ const addColorKeyframe: ToolDispatch<AddColorKeyframeArgs> = (project, args) => 
   if (!coerced) {
     return {
       project,
-      result: { ok: false, error: "invalid fill value (expected #rrggbb or Fill object)" },
+      result: { ok: false, error: `invalid fill value (expected ${FILL_SHAPE_HINT})` },
     };
   }
   const next = cloneProject(project);
@@ -4117,8 +4343,21 @@ const applyTextStyleProps = (
   }
   if (args.text_autofit !== undefined) {
     const v = args.text_autofit;
-    if (v === "fit" || v === "shrink" || v === "wrap") layer.text_autofit = v;
-    else return 'text_autofit must be "fit", "shrink", or "wrap"';
+    if (v === "fit" || v === "shrink" || v === "wrap" || v === "hug") {
+      layer.text_autofit = v;
+      // "hug" derives the box from the text at a FIXED size — seed text_size
+      // from the current box so the layer doesn't collapse to the renderer's
+      // default. An explicit text_size in the same call still wins.
+      if (
+        v === "hug" &&
+        (layer.text_size == null || layer.text_size <= 0) &&
+        args.text_size === undefined
+      ) {
+        layer.text_size = Math.max(8, Math.round(layer.height * 0.5));
+      }
+    } else {
+      return 'text_autofit must be "fit", "shrink", "wrap", or "hug"';
+    }
   }
   if (args.text_valign !== undefined) {
     const v = args.text_valign;
@@ -4388,9 +4627,17 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
       typeof font_family === "string" ? font_family.trim() : DEFAULT_TEXT_FONT,
     ...(resolvedTextSize !== undefined ? { text_size: resolvedTextSize } : {}),
     ...(typeof text_color === "string" ? { text_color } : {}),
-    // Fixed size by default — the text_size you set is the size that renders.
-    // An explicit `text_autofit` arg overrides this via applyTextStyleProps.
-    text_autofit: "wrap",
+    // Hug by default — the box is DERIVED from the measured text (honouring its
+    // literal "\n" breaks) at the fixed text_size, so it shrink-wraps the exact
+    // content and can NEVER re-wrap differently between the editor preview and
+    // the export. That divergence is the failure mode fixed-width "wrap" text
+    // hits whenever the two paths resolve different font metrics (e.g. a weight
+    // the editor faux-synthesizes but the export loads as a real cut). Callers
+    // bake their own line breaks; an explicit `text_autofit` arg overrides this
+    // via applyTextStyleProps. (The editor's manual "add text" button keeps
+    // "wrap": it creates an empty layer to type into, and an empty hug box
+    // would collapse to nothing.)
+    text_autofit: "hug",
     fill: null,
   };
   const styleErr = applyTextStyleProps(layer, args as Record<string, unknown>);
@@ -4894,6 +5141,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   reorder_layer: reorderLayer as ToolDispatch<never>,
   set_style: setStyle as ToolDispatch<never>,
   set_layer_fill: setLayerFill as ToolDispatch<never>,
+  set_text_background: setTextBackground as ToolDispatch<never>,
   set_group_box: setGroupBox as ToolDispatch<never>,
   add_color_keyframe: addColorKeyframe as ToolDispatch<never>,
   remove_color_keyframe: removeColorKeyframe as ToolDispatch<never>,
@@ -5466,6 +5714,42 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "set_text_background",
+      description:
+        "Add or update the rounded background box behind a TEXT layer (text.<id>) in one call — sets the backdrop fill plus the box's padding, corner radius, and optional stroke. Pass only the fields you want to change. Pair with text_autofit \"hug\" (via set_layer_text) so the box shrink-wraps the text instead of using the layer's fixed frame — ideal for caption / sticker chips. Pass fill null to remove the box. Text layers only; for shapes/images/video use set_layer_fill.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: { type: "string", description: "text.<id>." },
+          fill: {
+            description:
+              "Box fill: '#rrggbb' (promoted to solid), a Fill object (solid | linear | radial | mask), or null to clear the box. Omit to leave the current fill.",
+          },
+          padding: {
+            type: "number",
+            description:
+              "Uniform inset (canvas px) between the box edge and the text. 0 / omitted ⇒ no explicit padding.",
+          },
+          cornerRadius: {
+            type: "number",
+            description: "Corner radius of the box in px. 0 ⇒ square corners.",
+          },
+          strokeWidth: {
+            type: "number",
+            description: "Box outline width in px. 0 / omitted ⇒ no outline.",
+          },
+          strokeColor: {
+            type: "string",
+            description: "Box outline colour as #rrggbb.",
+          },
+        },
+        required: ["elementId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "set_group_box",
       description:
         "Set a group's backdrop rect size. The rect is centred on (pivotX, pivotY) in group-local space and transforms with the group. Either dimension at 0 hides the backdrop entirely.",
@@ -5992,9 +6276,9 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           text_autofit: {
             type: "string",
-            enum: ["fit", "shrink", "wrap"],
+            enum: ["fit", "shrink", "wrap", "hug"],
             description:
-              "How text fits its box. \"wrap\" (default): hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never resize — the size you set is the size rendered. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
+              "How text fits its box. \"hug\" (default for new layers): hold text_size FIXED and DERIVE the box from the measured text plus padding, honouring the literal newlines you pass — the box shrink-wraps the exact content and grows/shrinks live as the text changes, so it can never re-wrap differently between the editor preview and the export (bake your own \"\\n\" breaks; pair with set_text_background for a rounded caption box). \"wrap\": hold text_size FIXED in a fixed-size box and only word-wrap (hard-breaking a single over-wide word), never resize. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
           },
           text_valign: {
             type: "string",
@@ -6030,7 +6314,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_text_layer",
       description:
-        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width 900, height 320, font_family \"Anton\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"wrap\" default = fixed size + word-wrap / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
+        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width 900, height 320, font_family \"Anton\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"hug\" default = box shrink-wraps the text at the fixed text_size, honouring literal newlines, so it can't re-wrap between preview and export — bake your own \"\\n\" line breaks / \"wrap\"=fixed size + word-wrap to the box / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
       parameters: {
         type: "object",
         properties: {
@@ -6084,9 +6368,9 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           text_autofit: {
             type: "string",
-            enum: ["fit", "shrink", "wrap"],
+            enum: ["fit", "shrink", "wrap", "hug"],
             description:
-              "How text fits its box. \"wrap\" (default): hold text_size FIXED and only word-wrap (hard-breaking a single over-wide word), never resize — the size you set is the size rendered. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
+              "How text fits its box. \"hug\" (default for new layers): hold text_size FIXED and DERIVE the box from the measured text plus padding, honouring the literal newlines you pass — the box shrink-wraps the exact content and grows/shrinks live as the text changes, so it can never re-wrap differently between the editor preview and the export (bake your own \"\\n\" breaks; pair with set_text_background for a rounded caption box). \"wrap\": hold text_size FIXED in a fixed-size box and only word-wrap (hard-breaking a single over-wide word), never resize. \"fit\": ignore text_size and auto-size the font BOTH ways (grow and shrink) to the largest size whose wrapped block fills the box — resizing the box resizes the text. \"shrink\" (legacy): word-wrap then auto-shrink the font from text_size until the block fits; never grows.",
           },
           text_valign: {
             type: "string",

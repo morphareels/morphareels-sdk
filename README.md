@@ -1,6 +1,6 @@
 # morphareels-sdk
 
-**The agentic video editor SDK — build, caption, and render short-form video in code.** Compose layers/captions/keyframes programmatically, then render a frame to PNG or export MP4 by driving a real browser. **No ffmpeg.** The client SDK for [Morpha Studio](https://morphareels.ai).
+**The agentic video editor SDK — build, caption, and render short-form video in code.** Compose layers/captions/keyframes programmatically, then render a frame to PNG or export MP4 by driving a real browser. **No ffmpeg.** The official client SDK for [Morpha](https://morphareels.ai) — and the recommended, full-featured way to drive it from code.
 
 ```bash
 npm i morphareels-sdk
@@ -10,22 +10,23 @@ Requires **Node ≥ 20**.
 
 ## Drive a hosted project — the MCP-equivalent client
 
-`createClient` is the recommended way to drive a hosted Morpha account from code — the programmatic equivalent of an MCP session. Every tool you can call over MCP, you call here.
+`createClient` is the recommended way to drive a hosted Morpha account from code — the programmatic equivalent of an MCP session over the **full** catalog. Every tool you can call over MCP you can call here: the pure mutation tools **plus** the workspace/lifecycle, version, upload, and vision tools (`list_projects`, `create_project`, `save_version`, `upload_clip`, `upload_image`, `find_public_image`, `detect_text_regions`, `safe_zones`, …). Most have a typed convenience method; anything else goes through generic `callTool`.
 
 ```ts
 import { createClient } from "morphareels-sdk";
 
 const morpha = createClient({ token: process.env.MORPHA_API_KEY }); // origin defaults to https://morphareels.ai
 
-const project = await morpha.getProject("my-project");
-const { result, editorUrl } = await morpha.callTool("my-project", "add_text_layer", {
-  text: "HELLO", x: 540, y: 600, font_family: "Anton",
-});
-const png = await morpha.renderFrame("my-project", 150); // a composited PNG, no ffmpeg
-const mp4 = await morpha.renderVideo("my-project");      // the full composition as MP4, no ffmpeg
+const [{ id }] = await morpha.listProjects();                 // typed workspace tool — no projectId
+await morpha.uploadImage(id, { url: "https://example.com/logo.png" }); // ingest, then reference by filename
+await morpha.callTool(id, "add_image_layer", { filename: "logo.png", x: 540, y: 600, width: 300, height: 300 });
+await morpha.saveVersion(id, { name: "add logo" });          // snapshot the change-set
+
+const png = await morpha.renderFrame(id, 150); // a composited PNG, no ffmpeg
+const mp4 = await morpha.renderVideo(id);      // the full composition as MP4, no ffmpeg
 ```
 
-`createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings`.
+`createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings` (a Standard or Pro subscription mints keys). Pure mutation tools return `{ result, project, editorUrl }`; workspace/upload/vision tools return `{ result }` (no `project`), and the typed methods unwrap `result.data` for you. Cache-backed vision/transcript reads can come back `not-ready` until the clip is opened once in the editor.
 
 ## Make a video in code
 
@@ -88,4 +89,4 @@ Unlike code-as-video frameworks, this is a real **editor project model** (layers
 
 ## License
 
-MIT © [Morpha Studio](https://morphareels.ai)
+MIT © [Morpha](https://morphareels.ai)
