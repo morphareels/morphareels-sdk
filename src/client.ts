@@ -23,6 +23,28 @@ import {
   type RenderFrameOptions,
   type RenderVideoOptions,
 } from "./render.ts";
+import {
+  processClip as processClipHeadless,
+  processClips as processClipsHeadless,
+  type ProcessClipOutcome,
+} from "./process.ts";
+
+/** Where the bytes for `addVideo` come from: a public URL the worker fetches
+ *  (no duration needed — it's parsed from the header), or a LOCAL file path the
+ *  SDK streams via presign→PUT→finalize (which requires `durationSeconds`). */
+export type AddVideoSource =
+  | { url: string; filename?: string; durationSeconds?: number }
+  | { file: string; filename?: string; durationSeconds: number };
+
+/** Per-clip processing status from `clipProcessingStatus`. */
+export interface ClipProcessingStatus {
+  clips: Array<{
+    clip: string;
+    processed: boolean;
+    steps: Record<string, string>;
+  }>;
+  allProcessed: boolean;
+}
 
 export interface MorphaClientOptions {
   /** API origin. Default https://morphareels.ai */
@@ -150,17 +172,34 @@ export interface MorphaClient {
   ): Promise<{ deleted: boolean; versionId: string }>;
 
   // ── Ingest ────────────────────────────────────────────────────────────────
+  /** Add a video: upload it AND run the full processing pipeline (proxy, audio
+   *  split, transcription, OCR, object detection) in one call — the sole agent
+   *  upload path (the raw upload tools aren't exposed over MCP/HTTP). Returns the
+   *  stored `filename` (pass it to `add_video_layer`) plus the `processing`
+   *  outcome. A `{ url }` source is fetched server-side; a `{ file }` source is a
+   *  local path streamed from disk (needs `durationSeconds`). Processing drives a
+   *  real local Chrome (Playwright) — install it and have Chrome available. */
+  addVideo(
+    projectId: string,
+    source: AddVideoSource,
+    opts?: { channel?: string; timeoutMs?: number },
+  ): Promise<Record<string, unknown> & { filename: string; processing: ProcessClipOutcome }>;
+  /** Low-level: upload a clip from a public URL (worker-fetched). Does NOT
+   *  process — prefer `addVideo`. */
   uploadClip(
     projectId: string,
     opts: { url: string; filename?: string; durationSeconds?: number },
   ): Promise<Record<string, unknown>>;
+  /** Low-level: presign a direct-to-R2 PUT for a local clip. `durationSeconds`
+   *  is required (the editor always knows it before uploading). */
   uploadClipPresign(
     projectId: string,
-    opts: { filename: string },
+    opts: { filename: string; durationSeconds: number },
   ): Promise<{ uploadUrl: string; key: string; filename: string; contentType: string; expiresInSeconds: number }>;
+  /** Low-level: finalize a presigned upload. Does NOT process — prefer `addVideo`. */
   uploadClipFinalize(
     projectId: string,
-    opts: { filename: string; durationSeconds?: number },
+    opts: { filename: string; durationSeconds: number },
   ): Promise<Record<string, unknown>>;
   uploadImage(
     projectId: string,
@@ -200,6 +239,27 @@ export interface MorphaClient {
     opts: { clip: string; bandHeight?: number; occupancyThreshold?: number; minConfidence?: number },
   ): Promise<CacheReadResult>;
   transcribeClip(projectId: string, clip: string): Promise<CacheReadResult>;
+  /** Whether a clip — or every video clip in the project, if `clip` is omitted —
+   *  has been processed (proxy / audio split / transcription / OCR / objects).
+   *  Pure read; doesn't run anything. */
+  clipProcessingStatus(
+    projectId: string,
+    clip?: string,
+  ): Promise<ClipProcessingStatus>;
+
+  // ── Processing (real local browser, no ffmpeg, no server) ─────────────────
+  /** Run the full processing pipeline for one already-uploaded clip (drives
+   *  local Chrome). Use to backfill a clip that was added some other way. */
+  processClip(
+    projectId: string,
+    clip: string,
+    opts?: { channel?: string; timeoutMs?: number },
+  ): Promise<ProcessClipOutcome>;
+  /** Process every (unique) video clip in the project, reusing one browser. */
+  processProject(
+    projectId: string,
+    opts?: { clips?: string[]; channel?: string; timeoutMs?: number },
+  ): Promise<ProcessClipOutcome[]>;
 
   // ── Rendering (real local browser, no ffmpeg, no server) ──────────────────
   renderFrame(
@@ -331,6 +391,63 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return { status: result.status ?? "ready", data: result.data ?? null, note: result.note };
   };
 
+  // POST a raw worker route (the upload transport — NOT the tool catalog, which
+  // no longer exposes upload tools to agents). Throws on a non-ok response.
+  const postRaw = async (
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const res = await doFetch(`${origin}${path}`, {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json().catch(() => null)) as
+      | (Record<string, unknown> & { ok?: boolean; error?: string })
+      | null;
+    if (!res.ok || !json || json.ok === false) {
+      const msg = json && typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
+      throw new Error(`${path} failed: ${msg}`);
+    }
+    const { ok: _ok, ...data } = json;
+    return data;
+  };
+
+  // Upload a local file via presign → PUT → finalize. Shared by addVideo's
+  // `{ file }` branch.
+  const uploadLocalFile = async (
+    projectId: string,
+    filePath: string,
+    durationSeconds: number,
+    overrideName?: string,
+  ): Promise<Record<string, unknown>> => {
+    const [{ readFile }, { basename }] = await Promise.all([
+      import("node:fs/promises"),
+      import("node:path"),
+    ]);
+    const bytes = await readFile(filePath);
+    const filename = overrideName ?? basename(filePath);
+    const presign = (await postRaw("/api/upload-clip/init", {
+      projectId,
+      filename,
+      durationSeconds,
+      fileSize: bytes.byteLength,
+    })) as { uploadUrl: string; filename: string; contentType: string };
+    const put = await doFetch(presign.uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": presign.contentType },
+      body: bytes,
+    });
+    if (!put.ok) {
+      throw new Error(`addVideo: PUT to R2 failed: HTTP ${put.status}`);
+    }
+    return postRaw("/api/upload-clip/finalize", {
+      projectId,
+      filename: presign.filename,
+      durationSeconds,
+    });
+  };
+
   return {
     getProject,
     listTools,
@@ -415,21 +532,46 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         versionId: string;
       },
 
+    addVideo: async (projectId, source, opts = {}) => {
+      const uploaded =
+        "url" in source
+          ? await postRaw("/api/upload-clip/from-url", {
+              projectId,
+              url: source.url,
+              filename: source.filename,
+              durationSeconds: source.durationSeconds,
+            })
+          : await uploadLocalFile(
+              projectId,
+              source.file,
+              source.durationSeconds,
+              source.filename,
+            );
+      const filename = String(uploaded.filename ?? source.filename ?? "");
+      if (!filename) {
+        throw new Error("addVideo: upload did not return a filename");
+      }
+      const processing = await processClipHeadless({
+        origin,
+        token,
+        projectId,
+        clip: filename,
+        channel: opts.channel,
+        timeoutMs: opts.timeoutMs,
+      });
+      return { ...uploaded, filename, processing };
+    },
     uploadClip: async (projectId, opts) =>
-      (await serverData("upload_clip", projectId, { ...opts })) as Record<string, unknown>,
-    uploadClipPresign: async (projectId, opts) =>
-      (await serverData("upload_clip_presign", projectId, { ...opts })) as {
-        uploadUrl: string;
-        key: string;
-        filename: string;
-        contentType: string;
-        expiresInSeconds: number;
-      },
+      postRaw("/api/upload-clip/from-url", { projectId, ...opts }),
+    uploadClipPresign: async (projectId, opts) => {
+      const data = (await postRaw("/api/upload-clip/init", {
+        projectId,
+        ...opts,
+      })) as { uploadUrl: string; key: string; filename: string; contentType: string };
+      return { ...data, expiresInSeconds: 15 * 60 };
+    },
     uploadClipFinalize: async (projectId, opts) =>
-      (await serverData("upload_clip_finalize", projectId, { ...opts })) as Record<
-        string,
-        unknown
-      >,
+      postRaw("/api/upload-clip/finalize", { projectId, ...opts }),
     uploadImage: async (projectId, opts) =>
       (await serverData("upload_image", projectId, { ...opts })) as Record<string, unknown>,
     setCustomFont: async (projectId, opts) => {
@@ -457,6 +599,23 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     detectObjects: (projectId, clip) => cacheRead("detect_objects", projectId, { clip }),
     safeZones: (projectId, opts) => cacheRead("safe_zones", projectId, { ...opts }),
     transcribeClip: (projectId, clip) => cacheRead("transcribe_clip", projectId, { clip }),
+    clipProcessingStatus: async (projectId, clip) =>
+      (await serverData(
+        "clip_processing_status",
+        projectId,
+        clip ? { clip } : {},
+      )) as ClipProcessingStatus,
+
+    processClip: (projectId, clip, opts = {}) =>
+      processClipHeadless({ origin, token, projectId, clip, ...opts }),
+    processProject: async (projectId, opts = {}) => {
+      let clips = opts.clips;
+      if (!clips) {
+        const project = await getProject(projectId);
+        clips = [...new Set(project.video_layers.map((v) => v.clip))];
+      }
+      return processClipsHeadless({ origin, token, projectId, ...opts, clips });
+    },
 
     renderFrame: (projectId, frame = 0, opts = {}) =>
       renderFrame({ origin, token, ...opts, projectId, frame }),

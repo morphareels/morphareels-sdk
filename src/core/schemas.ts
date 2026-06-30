@@ -95,23 +95,6 @@ export const fillSchema = z.discriminatedUnion("type", [
   maskFillSchema,
 ]);
 
-// Per-character text span. Applied on top of the layer's base text styling.
-// `start` and `end` are UTF-16 code-unit offsets into the layer's `text`
-// field (matching JS string indexing); ranges may overlap and later spans
-// win for the property they set. Empty spans (start >= end) are ignored at
-// paint time. `color` is the foreground colour for the segment in
-// "#rrggbb" form; absent fields fall through to the layer's base style.
-export const textSpanSchema = z
-  .object({
-    start: z.number().int().nonnegative(),
-    end: z.number().int().nonnegative(),
-    bold: z.boolean().optional(),
-    italic: z.boolean().optional(),
-    color: hexColor.optional(),
-  })
-  .strict();
-export type TextSpan = z.infer<typeof textSpanSchema>;
-
 // Per-element data that formerly lived in four top-level maps keyed by element
 // id (project.animations / styles / color_tracks / track_loops). It now lives
 // ON each layer record so an element is self-contained: clones carry it intact
@@ -125,6 +108,11 @@ const perElementDataFields = {
   style: z.lazy(() => layerStyleSchema).optional(),
   color_tracks: z.lazy(() => elementColorTracksSchema).optional(),
   track_loops: z.lazy(() => trackLoopsSchema).optional(),
+  // When this element was inlined from an embedded morpha (see groupSchema's
+  // `source_morpha_id`), this is its ORIGINAL element id in that source project
+  // (e.g. "image.abc123"). Used to map host-side edits back onto the source on
+  // publish. Absent on layers authored directly in the host project.
+  source_layer_id: z.string().min(1).optional(),
 };
 
 // One per image layer on the project. (x, y) is the CENTRE of the layer's
@@ -145,6 +133,10 @@ export const imageLayerSchema = z
     // Optional for `is_background` (the canvas backdrop has no bitmap).
     // Worker / tool layer enforces non-empty for regular image layers.
     filename: z.string().min(1).optional(),
+    // When this layer was inlined from an embedded morpha, its `filename`
+    // resolves against THIS project's asset bucket instead of the host's.
+    // Absent ⇒ resolve against the host project_id (the normal case).
+    asset_project_id: z.string().min(1).optional(),
     // Optional friendly label shown in the Inspector + Timeline lane.
     // When unset/empty, callers fall back to the filename stem. Mirrors
     // groupSchema.name so renaming an image works the same way as a group.
@@ -181,15 +173,6 @@ export const imageLayerSchema = z
     // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
     // on leaf hosts (the canvas matte path); ignored on group hosts for now.
     matte_inverted: z.boolean().optional(),
-    text: z.string().optional(),
-    text_size: z.number().positive().optional(),
-    font_family: z.string().optional(),
-    text_color: hexColor.optional(),
-    line_height: z.number().positive().optional(),
-    letter_spacing: z.number().optional(),
-    text_align: z.enum(["left", "center", "right"]).optional(),
-    line_beat_frames: z.number().int().positive().optional(),
-    spans: z.array(textSpanSchema).optional(),
     // Optional Inspector colour-label tag.
     color_label: colorLabelSchema.optional(),
   })
@@ -205,6 +188,10 @@ export const videoLayerSchema = z
     ...perElementDataFields,
     id: z.string().min(1),
     clip: z.string().min(1),
+    // When this layer was inlined from an embedded morpha, its `clip`
+    // resolves against THIS project's clips bucket instead of the host's.
+    // Absent ⇒ resolve against the host project_id (the normal case).
+    asset_project_id: z.string().min(1).optional(),
     name: z.string().optional(),
     x: z.number(),
     y: z.number(),
@@ -887,9 +874,30 @@ export const groupSchema = z
     hidden: z.boolean().optional(),
     // Optional Inspector colour-label tag.
     color_label: colorLabelSchema.optional(),
+    // ── Embedded-morpha provenance ──────────────────────────────────────────
+    // When set, this group is an EMBEDDED MORPHA: its children are inlined,
+    // re-keyed copies of another project's ("a morpha") layers, pinned to one
+    // immutable version of that project. The group is otherwise an ordinary
+    // group (it composites its children natively), so the renderer/export need
+    // no special-casing — only the Inspector + tools read these fields.
+    //   source_morpha_id     — the embedded project's id (NEVER shown to users).
+    //   source_version_id     — the pinned version's opaque id.
+    //   source_version_label  — the user-facing version label (e.g. "v3").
+    //   source_morpha_name    — cached name of the source project for display
+    //                           (the only user-facing handle; ids stay hidden).
+    source_morpha_id: z.string().min(1).optional(),
+    source_version_id: z.string().min(1).optional(),
+    source_version_label: z.string().min(1).optional(),
+    source_morpha_name: z.string().optional(),
   })
   .strict();
 export type Group = z.infer<typeof groupSchema>;
+
+// True when this group is an embedded morpha (carries a pinned source project).
+// The single source of truth for "is this the band" across the Inspector,
+// tools, and publish-back logic.
+export const isMorphaGroup = (group: Group): boolean =>
+  typeof group.source_morpha_id === "string" && group.source_morpha_id.length > 0;
 
 // Schema version. Bumped when on-disk JSON gains a meaning that older
 // readers can't infer:
@@ -1235,12 +1243,34 @@ const migrateBackgroundToImageLayer = (raw: unknown): unknown => {
   return r;
 };
 
+// Text-only fields a legacy image_layer could carry back when an image could
+// double as a text layer. They are no longer part of the strict
+// imageLayerSchema, so any image that still has them must be migrated (moved to
+// a text layer when it actually held text, or stripped when it doesn't) before
+// strict validation runs.
+const LEGACY_IMAGE_TEXT_FIELDS = [
+  "text",
+  "text_size",
+  "font_family",
+  "text_color",
+  "line_height",
+  "letter_spacing",
+  "text_align",
+  "line_beat_frames",
+  "spans",
+] as const;
+
 // Older projects modelled a text layer as an image_layer carrying a `text`
-// field (the pre-text_layers design). Move each such layer into text_layers,
-// drop the deprecated `filename` / `line_beat_frames` fields, and rekey every
-// "image.<id>" reference to "text.<id>" across layer_order, animations,
-// styles, color_tracks, track_loops, and group children. Idempotent — a
-// project with no text-bearing image_layers passes through untouched.
+// field (the pre-text_layers design). Two jobs, both required now that the
+// image schema no longer accepts any text field:
+//   1. Each image with non-empty `text` MOVES into text_layers (rekeying every
+//      "image.<id>" reference to "text.<id>" across layer_order, animations,
+//      styles, color_tracks, track_loops, and group children).
+//   2. Any image KEPT as a bitmap that still carries stray text-only fields
+//      (an empty `text`, a leftover `font_family`, …) gets those fields
+//      STRIPPED — otherwise the strict imageLayerSchema rejects the project.
+// Idempotent — an image_layers array with no legacy text fields passes through
+// untouched.
 const migrateImageTextLayers = (raw: unknown): unknown => {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const p = raw as Record<string, unknown>;
@@ -1249,16 +1279,13 @@ const migrateImageTextLayers = (raw: unknown): unknown => {
   const rekey = new Map<string, string>();
   const movedTextLayers: Record<string, unknown>[] = [];
   const keptImages: unknown[] = [];
+  let strippedAny = false;
 
   for (const entry of p.image_layers) {
-    if (
-      entry &&
-      typeof entry === "object" &&
-      !Array.isArray(entry) &&
-      typeof (entry as Record<string, unknown>).text === "string" &&
-      ((entry as Record<string, unknown>).text as string).length > 0
-    ) {
-      const l = entry as Record<string, unknown>;
+    const isObj =
+      entry && typeof entry === "object" && !Array.isArray(entry);
+    const l = isObj ? (entry as Record<string, unknown>) : null;
+    if (l && typeof l.text === "string" && l.text.length > 0) {
       const id = String(l.id);
       rekey.set(`image.${id}`, `text.${id}`);
       const tl: Record<string, unknown> = {
@@ -1274,50 +1301,67 @@ const migrateImageTextLayers = (raw: unknown): unknown => {
       if (l.font_family !== undefined) tl.font_family = l.font_family;
       if (l.text_size !== undefined) tl.text_size = l.text_size;
       if (l.text_color !== undefined) tl.text_color = l.text_color;
+      if (l.line_height !== undefined) tl.line_height = l.line_height;
+      if (l.letter_spacing !== undefined) tl.letter_spacing = l.letter_spacing;
+      if (l.text_align !== undefined) tl.text_align = l.text_align;
       if (l.fill !== undefined) tl.fill = l.fill;
-      // `line_beat_frames` is intentionally dropped — the line-sequencing
-      // hack is gone; looping is the general track_loops mechanism.
+      // `line_beat_frames` (obsolete line-sequencing hack — looping is the
+      // general track_loops mechanism) and `spans` (text_layers carry no
+      // per-character spans) are intentionally dropped.
       movedTextLayers.push(tl);
+    } else if (l && LEGACY_IMAGE_TEXT_FIELDS.some((f) => f in l)) {
+      const stripped = { ...l };
+      for (const f of LEGACY_IMAGE_TEXT_FIELDS) delete stripped[f];
+      keptImages.push(stripped);
+      strippedAny = true;
     } else {
       keptImages.push(entry);
     }
   }
 
-  if (rekey.size === 0) return raw;
-
-  const remapId = (id: unknown): unknown =>
-    typeof id === "string" && rekey.has(id) ? rekey.get(id)! : id;
+  if (rekey.size === 0 && !strippedAny) return raw;
 
   const next: Record<string, unknown> = { ...p };
   next.image_layers = keptImages;
-  next.text_layers = [
-    ...(Array.isArray(p.text_layers) ? p.text_layers : []),
-    ...movedTextLayers,
-  ];
 
-  if (Array.isArray(p.layer_order)) {
-    next.layer_order = p.layer_order.map(remapId);
-  }
-  for (const field of ["animations", "styles", "color_tracks", "track_loops"]) {
-    const rec = p[field];
-    if (rec && typeof rec === "object" && !Array.isArray(rec)) {
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(rec as Record<string, unknown>)) {
-        out[rekey.has(k) ? rekey.get(k)! : k] = v;
-      }
-      next[field] = out;
+  if (rekey.size > 0) {
+    const remapId = (id: unknown): unknown =>
+      typeof id === "string" && rekey.has(id) ? rekey.get(id)! : id;
+
+    next.text_layers = [
+      ...(Array.isArray(p.text_layers) ? p.text_layers : []),
+      ...movedTextLayers,
+    ];
+
+    if (Array.isArray(p.layer_order)) {
+      next.layer_order = p.layer_order.map(remapId);
     }
-  }
-  if (Array.isArray(p.groups)) {
-    next.groups = p.groups.map((g) => {
-      if (g && typeof g === "object" && !Array.isArray(g)) {
-        const gr = g as Record<string, unknown>;
-        if (Array.isArray(gr.children)) {
-          return { ...gr, children: gr.children.map(remapId) };
+    for (const field of [
+      "animations",
+      "styles",
+      "color_tracks",
+      "track_loops",
+    ]) {
+      const rec = p[field];
+      if (rec && typeof rec === "object" && !Array.isArray(rec)) {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(rec as Record<string, unknown>)) {
+          out[rekey.has(k) ? rekey.get(k)! : k] = v;
         }
+        next[field] = out;
       }
-      return g;
-    });
+    }
+    if (Array.isArray(p.groups)) {
+      next.groups = p.groups.map((g) => {
+        if (g && typeof g === "object" && !Array.isArray(g)) {
+          const gr = g as Record<string, unknown>;
+          if (Array.isArray(gr.children)) {
+            return { ...gr, children: gr.children.map(remapId) };
+          }
+        }
+        return g;
+      });
+    }
   }
   return next;
 };

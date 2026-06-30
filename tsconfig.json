@@ -9,7 +9,13 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "declaration": true
+    "declaration": true,
+    "baseUrl": ".",
+    "paths": {
+      "zod": [
+        "./node_modules/zod"
+      ]
+    }
   },
   "include": [
     "src"

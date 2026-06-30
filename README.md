@@ -45,6 +45,22 @@ project = dispatch.add_caption_track(project, {
 projectSchema.parse(project); // it's a valid Morpha project, ready to save or render
 ```
 
+## Add a video clip (upload **and** process)
+
+Clip ingest is npm-only: `addVideo` uploads the clip **and** runs the full processing pipeline — proxy build, audio split, transcription, OCR, object detection — so the clip is editor-ready and the `transcribeClip` / `detectTextRegions` / `detectObjects` readers light up. (Processing runs in a real local Chrome, like `renderFrame` — install Playwright + Chrome.)
+
+```ts
+const morpha = createClient({ token: process.env.MORPHA_API_KEY });
+
+const { filename, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
+// processing.steps → { proxy, audio_split, transcript, text_regions, objects }
+await morpha.callTool(id, "add_video_layer", { clip: filename, x: 540, y: 960, width: 1080, height: 1920 });
+
+const t = await morpha.transcribeClip(id, filename); // now { status: "ready", data: { words, … } }
+```
+
+`addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). To (re)process clips added another way: `processClip(id, clip)` / `processProject(id)`. Check state any time with `clipProcessingStatus(id)`.
+
 ## Render a video frame to PNG (no ffmpeg)
 
 ```ts

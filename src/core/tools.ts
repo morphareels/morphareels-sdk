@@ -30,9 +30,10 @@ import {
   findLayerByElementId,
   findParentGroup,
   getGroupDescendants,
+  isMorphaGroup,
+  projectSchema,
   resolveDefaultTextSize,
   resolveLayerTree,
-  type AnyLayer,
   type AudioOverlay,
   type ColorKeyframe,
   type Easing,
@@ -600,6 +601,377 @@ export const normalizeProjectLayerIds = (
     }
   }
   return rekeys;
+};
+
+// ---------------------------------------------------------------------------
+// inlineMorpha — embed one project ("a morpha") inside another
+// ---------------------------------------------------------------------------
+
+export type InlineMorphaOptions = {
+  /** Source project id (the embedded morpha). Never shown to users. */
+  sourceMorphaId: string;
+  /** Pinned version's opaque id (from the versions API). */
+  versionId?: string;
+  /** User-facing version label, e.g. "v3". */
+  versionLabel?: string;
+  /** Source project name, cached on the band for display (the only handle a
+   *  user ever sees — ids stay hidden). */
+  sourceName?: string;
+};
+
+// Inline `source`'s layers into `host` as a new EMBEDDED-MORPHA group — a
+// version-pinned "band". Pure: returns a fresh host project, never mutating
+// either input. The band is an ordinary `group` (so the renderer/export
+// composite it natively, no new layer kind) carrying provenance fields.
+//
+// - The source's canvas backdrop (`is_background`) becomes the band group's
+//   editable/removable backdrop fill, so the morpha looks as it does
+//   standalone but the fill can be cleared for overlay use.
+// - Every other source layer is deep-cloned, re-keyed to host-unique ids
+//   (so two embeds of the same morpha never collide), stamped with
+//   `source_layer_id` (its ORIGINAL element id, for publish-back mapping) and,
+//   for media layers, `asset_project_id` (so its image/clip resolves from the
+//   source's R2 bucket), then nested under the band group in source z-order.
+export const inlineMorpha = (
+  host: Project,
+  source: Project,
+  opts: InlineMorphaOptions,
+): ToolOutcome => {
+  if (!opts.sourceMorphaId) {
+    return { project: host, result: { ok: false, error: "sourceMorphaId is required" } };
+  }
+  if (opts.sourceMorphaId === host.project_id) {
+    return { project: host, result: { ok: false, error: "a morpha can't embed itself" } };
+  }
+
+  const next = cloneProject(host);
+  const src = cloneProject(source);
+
+  // Source canvas backdrop → band group backdrop fill (editable, removable).
+  const srcBg = findBackgroundLayer(src);
+  const bgBareId = srcBg ? srcBg.id : null;
+  const bgElementId = srcBg ? `image.${srcBg.id}` : null;
+  const bgFill = srcBg ? srcBg.fill : null;
+
+  // Stamp provenance on every NON-background source layer BEFORE re-keying:
+  // source_layer_id (original eid) on all kinds; asset_project_id on media.
+  const stamp = (kind: LayerKind, layers: Array<{ id: string }>): void => {
+    for (const l of layers) {
+      const eid = `${kind}.${l.id}`;
+      if (eid === bgElementId) continue;
+      (l as { source_layer_id?: string }).source_layer_id = eid;
+      if (kind === "image" || kind === "video") {
+        (l as { asset_project_id?: string }).asset_project_id = opts.sourceMorphaId;
+      }
+    }
+  };
+  stamp("image", src.image_layers);
+  stamp("video", src.video_layers);
+  stamp("text", src.text_layers);
+  stamp("shapes", src.shapes);
+  stamp("group", src.groups);
+
+  // Re-key every source element to an id unique against BOTH the host and the
+  // source's own remaining ids (so a mint never lands on an unprocessed source
+  // id) and prior mints. rekeyElementId rewrites src's internal refs in place;
+  // source_layer_id rides along untouched.
+  const reserved: Record<LayerKind, Set<string>> = {
+    image: new Set([...next.image_layers, ...src.image_layers].map((l) => l.id)),
+    video: new Set([...next.video_layers, ...src.video_layers].map((l) => l.id)),
+    text: new Set([...next.text_layers, ...src.text_layers].map((l) => l.id)),
+    shapes: new Set([...next.shapes, ...src.shapes].map((l) => l.id)),
+    group: new Set([...next.groups, ...src.groups].map((l) => l.id)),
+  };
+  const mintId = (kind: LayerKind): string => {
+    for (let i = 0; i < 100; i += 1) {
+      const buf = new Uint8Array(3);
+      crypto.getRandomValues(buf);
+      const id = Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+      if (!reserved[kind].has(id)) {
+        reserved[kind].add(id);
+        return id;
+      }
+    }
+    throw new Error(`inlineMorpha: 100 id-mint collisions on ${kind}`);
+  };
+  const rekeyAll = (kind: LayerKind, layers: Array<{ id: string }>): void => {
+    const originals = layers
+      .map((l) => l.id)
+      .filter((id) => `${kind}.${id}` !== bgElementId);
+    for (const oldBare of originals) {
+      rekeyElementId(src, `${kind}.${oldBare}`, `${kind}.${mintId(kind)}`);
+    }
+  };
+  rekeyAll("image", src.image_layers);
+  rekeyAll("video", src.video_layers);
+  rekeyAll("text", src.text_layers);
+  rekeyAll("shapes", src.shapes);
+  rekeyAll("group", src.groups);
+
+  // rekeyElementId already rewrote src.layer_order to the new ids; the
+  // backdrop never appears there. That ordered list is the band's children.
+  const bandChildren = src.layer_order.filter((eid) => eid !== bgElementId);
+
+  // Merge the re-keyed source layer records into the host arrays (dropping the
+  // backdrop — it lives on the band group as a fill).
+  next.image_layers = [
+    ...next.image_layers,
+    ...src.image_layers.filter((l) => l.id !== bgBareId && !l.is_background),
+  ];
+  next.video_layers = [...next.video_layers, ...src.video_layers];
+  next.text_layers = [...next.text_layers, ...src.text_layers];
+  next.shapes = [...next.shapes, ...src.shapes];
+  next.groups = [...next.groups, ...src.groups];
+
+  // Create the band group at the host canvas centre, carrying the morpha
+  // provenance. Append only the band id to the host root order — its children
+  // live nested under it.
+  const bandId = mintId("group");
+  const bandElementId = `group.${bandId}`;
+  const displayName = opts.sourceName ?? src.name ?? "";
+  next.groups = [
+    ...next.groups,
+    {
+      id: bandId,
+      name: displayName,
+      pivotX: next.canvas_width / 2,
+      pivotY: next.canvas_height / 2,
+      children: bandChildren,
+      fill: bgFill,
+      box_width: bgFill ? src.canvas_width : 0,
+      box_height: bgFill ? src.canvas_height : 0,
+      source_morpha_id: opts.sourceMorphaId,
+      source_version_id: opts.versionId,
+      source_version_label: opts.versionLabel,
+      source_morpha_name: displayName.length > 0 ? displayName : undefined,
+    },
+  ];
+  next.layer_order = [...next.layer_order, bandElementId];
+
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        id: bandId,
+        elementId: bandElementId,
+        childCount: bandChildren.length,
+        name: displayName,
+      },
+    },
+  };
+};
+
+type AddMorphaLayerArgs = {
+  source_morpha_id: string;
+  // The fetched source Project JSON, injected by the caller (worker tool route
+  // / editor adapter) — the agent only supplies `source_morpha_id` (+ version).
+  source_project?: unknown;
+  version_id?: string;
+  version_label?: string;
+  source_name?: string;
+};
+
+// Pure tool: embed another project as a version-pinned band. The source
+// project JSON must be supplied in `source_project` (the worker route fetches
+// it from R2 at the pinned version and injects it; the editor adapter does the
+// same client-side). Delegates to `inlineMorpha`.
+const addMorphaLayer: ToolDispatch<AddMorphaLayerArgs> = (project, args) => {
+  if (!args || typeof args.source_morpha_id !== "string" || args.source_morpha_id.length === 0) {
+    return { project, result: { ok: false, error: "source_morpha_id is required" } };
+  }
+  if (args.source_project == null) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error:
+          "source_project is required (the fetched source project JSON for the pinned version)",
+      },
+    };
+  }
+  let source: Project;
+  try {
+    source = projectSchema.parse(args.source_project);
+  } catch (e) {
+    return {
+      project,
+      result: { ok: false, error: `source_project failed to parse: ${(e as Error).message}` },
+    };
+  }
+  return inlineMorpha(project, source, {
+    sourceMorphaId: args.source_morpha_id,
+    versionId: typeof args.version_id === "string" ? args.version_id : undefined,
+    versionLabel: typeof args.version_label === "string" ? args.version_label : undefined,
+    sourceName: typeof args.source_name === "string" ? args.source_name : undefined,
+  });
+};
+
+// Small collision-safe id minter against a running reserved set (per kind).
+const mintFreshId = (reserved: Set<string>): string => {
+  for (let i = 0; i < 100; i += 1) {
+    const buf = new Uint8Array(3);
+    crypto.getRandomValues(buf);
+    const id = Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (!reserved.has(id)) {
+      reserved.add(id);
+      return id;
+    }
+  }
+  throw new Error("mintFreshId: 100 collisions");
+};
+
+// Reconstruct the SOURCE project from an embedded band's (possibly edited)
+// children, so a host's local overrides can be published as a new version of
+// the source morpha. Each band descendant maps back to its original source id
+// via `source_layer_id`; host-added layers get fresh source ids; layers deleted
+// from the band simply don't appear. The band's GROUP-level transform stays
+// host-local (it's where the band sits in THIS video) and is not published; the
+// band's backdrop fill writes back onto the source's canvas background.
+export const rebuildSourceFromBand = (
+  currentSource: Project,
+  host: Project,
+  bandGroupId: string,
+): { project?: Project; error?: string } => {
+  const band = host.groups.find((g) => g.id === bandGroupId);
+  if (!band || !isMorphaGroup(band)) {
+    return { error: "not an embedded morpha band" };
+  }
+  const descendants = getGroupDescendants(host, bandGroupId);
+
+  const next = cloneProject(currentSource);
+  const bg = findBackgroundLayer(next);
+  const bgEid = bg ? `image.${bg.id}` : null;
+
+  // Replace the source's visual content with the band's — keep only the canvas
+  // backdrop (its fill updated from the band, if the band carries one).
+  next.image_layers = bg ? [bg] : [];
+  next.video_layers = [];
+  next.text_layers = [];
+  next.shapes = [];
+  next.groups = [];
+  if (bg && band.fill) bg.fill = structuredClone(band.fill);
+
+  const reserved: Record<LayerKind, Set<string>> = {
+    image: new Set(bg ? [bg.id] : []),
+    video: new Set(),
+    text: new Set(),
+    shapes: new Set(),
+    group: new Set(),
+  };
+
+  // host eid -> source eid for every descendant (prefer source_layer_id).
+  const remap = new Map<string, string>();
+  for (const eid of descendants) {
+    const kind = eid.slice(0, eid.indexOf(".")) as LayerKind;
+    const rec = findLayerByElementId(host, eid) as { source_layer_id?: string } | null;
+    const srcLid = rec?.source_layer_id;
+    let target: string;
+    if (srcLid && srcLid.startsWith(`${kind}.`)) {
+      const bare = srcLid.slice(srcLid.indexOf(".") + 1);
+      if (reserved[kind].has(bare)) target = `${kind}.${mintFreshId(reserved[kind])}`;
+      else {
+        reserved[kind].add(bare);
+        target = srcLid;
+      }
+    } else {
+      target = `${kind}.${mintFreshId(reserved[kind])}`;
+    }
+    remap.set(eid, target);
+  }
+  const mapEid = (eid: string): string => remap.get(eid) ?? eid;
+
+  for (const eid of descendants) {
+    const src = findLayerByElementId(host, eid);
+    if (!src) continue;
+    const kind = eid.slice(0, eid.indexOf(".")) as LayerKind;
+    const rec = structuredClone(src) as Record<string, unknown>;
+    const targetEid = mapEid(eid);
+    rec.id = targetEid.slice(targetEid.indexOf(".") + 1);
+    delete rec.source_layer_id;
+    delete rec.asset_project_id;
+    if (typeof rec.matte_source_id === "string") {
+      rec.matte_source_id = mapEid(rec.matte_source_id as string);
+    }
+    const fill = rec.fill as { type?: string; layer_id?: string } | null | undefined;
+    if (fill && fill.type === "mask" && typeof fill.layer_id === "string") {
+      fill.layer_id = mapEid(fill.layer_id);
+    }
+    if (kind === "group" && Array.isArray(rec.children)) {
+      rec.children = (rec.children as string[]).map(mapEid);
+    }
+    switch (kind) {
+      case "image": next.image_layers.push(rec as unknown as ImageLayer); break;
+      case "video": next.video_layers.push(rec as unknown as VideoLayer); break;
+      case "text": next.text_layers.push(rec as unknown as TextLayer); break;
+      case "shapes": next.shapes.push(rec as unknown as Shape); break;
+      case "group": next.groups.push(rec as unknown as Group); break;
+    }
+  }
+
+  // Source root order = the band's direct children (mapped), backdrop excluded.
+  next.layer_order = band.children.map(mapEid).filter((id) => id !== bgEid);
+
+  return { project: next };
+};
+
+// Replace an existing band's content with a fresh inline of the source's LATEST
+// state ("Update to Latest"), preserving the band's host placement (pivot,
+// transform tracks, name, colour label, z-order slot) and re-pinning it.
+export const replaceBand = (
+  host: Project,
+  bandGroupId: string,
+  freshSource: Project,
+  pin: InlineMorphaOptions,
+): ToolOutcome => {
+  const old = host.groups.find((g) => g.id === bandGroupId);
+  if (!old || !isMorphaGroup(old)) {
+    return { project: host, result: { ok: false, error: "not an embedded morpha band" } };
+  }
+  const oldEid = `group.${bandGroupId}`;
+  const oldIdx = host.layer_order.indexOf(oldEid);
+
+  // Strip the old band + every descendant.
+  const stripped = cloneProject(host);
+  const toRemove = new Set<string>([oldEid, ...getGroupDescendants(host, bandGroupId)]);
+  const removeBare: Record<LayerKind, Set<string>> = {
+    image: new Set(),
+    video: new Set(),
+    text: new Set(),
+    shapes: new Set(),
+    group: new Set(),
+  };
+  for (const eid of toRemove) {
+    removeBare[eid.slice(0, eid.indexOf(".")) as LayerKind].add(
+      eid.slice(eid.indexOf(".") + 1),
+    );
+  }
+  stripped.image_layers = stripped.image_layers.filter((l) => !removeBare.image.has(l.id));
+  stripped.video_layers = stripped.video_layers.filter((l) => !removeBare.video.has(l.id));
+  stripped.text_layers = stripped.text_layers.filter((l) => !removeBare.text.has(l.id));
+  stripped.shapes = stripped.shapes.filter((l) => !removeBare.shapes.has(l.id));
+  stripped.groups = stripped.groups.filter((g) => !removeBare.group.has(g.id));
+  stripped.layer_order = stripped.layer_order.filter((id) => !toRemove.has(id));
+
+  const { project: inlined, result } = inlineMorpha(stripped, freshSource, pin);
+  if (!result.ok) return { project: host, result };
+  const data = result.data as { id: string; elementId: string };
+
+  const newBand = inlined.groups.find((g) => g.id === data.id);
+  if (newBand) {
+    newBand.pivotX = old.pivotX;
+    newBand.pivotY = old.pivotY;
+    newBand.name = old.name;
+    if (old.animations) newBand.animations = structuredClone(old.animations);
+    if (old.style) newBand.style = structuredClone(old.style);
+    if (old.color_label) newBand.color_label = old.color_label;
+  }
+  // Restore the band's original z-order slot (inlineMorpha appended it at end).
+  inlined.layer_order = inlined.layer_order.filter((id) => id !== data.elementId);
+  const idx = oldIdx >= 0 ? Math.min(oldIdx, inlined.layer_order.length) : inlined.layer_order.length;
+  inlined.layer_order.splice(idx, 0, data.elementId);
+
+  return { project: inlined, result };
 };
 
 // ---------------------------------------------------------------------------
@@ -4948,10 +5320,84 @@ const setLoop: ToolDispatch<SetLoopArgs> = (project, args) => {
 // set_canvas_size
 // ---------------------------------------------------------------------------
 //
-// Resize the composition canvas. Every layer's base rect, group pivots, and
-// x/y/width/height animation keyframes scale by the width/height ratio so the
-// composition keeps its proportions in the new frame. Mirrors the editor's
-// CanvasSizePill behaviour.
+// Resize the composition canvas with a "fit + recenter" reflow: the whole
+// composition is scaled by a SINGLE uniform factor s = min(newW/oldW,
+// newH/oldH) — so nothing distorts (a circle stays a circle) — then recentred
+// so the old composition centre maps to the new canvas centre. On a
+// same-aspect resize the recentre term cancels and this reduces to a plain
+// uniform scale. Mirrors the editor's CanvasSizePill behaviour — both the
+// editor store and this tool call reflowComposition.
+
+// Reflow a composition into a new canvas size. Pure: clones, never mutates the
+// input. Leaf x/y are absolute positions (affine-mapped about the centre);
+// width/height scale uniformly. A group's pivot is an absolute point (mapped
+// like a position) but its x/y keyframes are TRANSLATION OFFSETS around that
+// pivot, so they only scale. scale/rotation/opacity tracks are left untouched.
+export const reflowComposition = (
+  project: Project,
+  newW: number,
+  newH: number,
+): Project => {
+  const oldW = project.canvas_width;
+  const oldH = project.canvas_height;
+  const next = cloneProject(project);
+  next.canvas_width = newW;
+  next.canvas_height = newH;
+  const s = Math.min(newW / oldW, newH / oldH);
+  const mapX = (v: number): number => (v - oldW / 2) * s + newW / 2;
+  const mapY = (v: number): number => (v - oldH / 2) * s + newH / 2;
+
+  const reflowLeaf = (r: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    animations?: ElementTracks;
+  }): void => {
+    r.x = mapX(r.x);
+    r.y = mapY(r.y);
+    r.width *= s;
+    r.height *= s;
+    const t = r.animations;
+    if (!t) return;
+    if (t.x) for (const kf of t.x) kf.value = mapX(kf.value);
+    if (t.y) for (const kf of t.y) kf.value = mapY(kf.value);
+    if (t.width) for (const kf of t.width) kf.value *= s;
+    if (t.height) for (const kf of t.height) kf.value *= s;
+  };
+  for (const l of next.image_layers) {
+    if (l.is_background) {
+      // The pinned backdrop always covers the canvas — the renderer ignores
+      // its stored rect, but keep it coherent with the new frame.
+      l.x = newW / 2;
+      l.y = newH / 2;
+      l.width = newW;
+      l.height = newH;
+      continue;
+    }
+    reflowLeaf(l);
+  }
+  next.video_layers.forEach(reflowLeaf);
+  next.shapes.forEach(reflowLeaf);
+  next.text_layers.forEach(reflowLeaf);
+
+  for (const g of next.groups) {
+    g.pivotX = mapX(g.pivotX);
+    g.pivotY = mapY(g.pivotY);
+    g.box_width *= s;
+    g.box_height *= s;
+    const t = g.animations;
+    if (!t) continue;
+    // x/y are offsets from the pivot — scale only, no recentre.
+    for (const prop of ["x", "y", "width", "height"] as const) {
+      const kfs = t[prop];
+      if (!kfs) continue;
+      for (const kf of kfs) kf.value *= s;
+    }
+  }
+
+  return next;
+};
 
 type SetCanvasSizeArgs = { width?: unknown; height?: unknown };
 
@@ -4977,48 +5423,7 @@ const setCanvasSize: ToolDispatch<SetCanvasSizeArgs> = (project, args) => {
       },
     };
   }
-  const sx = width / project.canvas_width;
-  const sy = height / project.canvas_height;
-  const next = cloneProject(project);
-  next.canvas_width = width;
-  next.canvas_height = height;
-  const scaleRect = (r: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }): void => {
-    r.x *= sx;
-    r.y *= sy;
-    r.width *= sx;
-    r.height *= sy;
-  };
-  next.image_layers.forEach(scaleRect);
-  next.video_layers.forEach(scaleRect);
-  next.shapes.forEach(scaleRect);
-  next.text_layers.forEach(scaleRect);
-  for (const g of next.groups) {
-    g.pivotX *= sx;
-    g.pivotY *= sy;
-  }
-  // Scale every spatial track keyframe; scale/rotation/opacity stay put.
-  const allLayers: AnyLayer[] = [
-    ...next.image_layers,
-    ...next.video_layers,
-    ...next.shapes,
-    ...next.text_layers,
-    ...next.groups,
-  ];
-  for (const layer of allLayers) {
-    const tracks = layer.animations;
-    if (!tracks) continue;
-    for (const prop of ["x", "y", "width", "height"] as const) {
-      const kfs = tracks[prop];
-      if (!kfs) continue;
-      const factor = prop === "x" || prop === "width" ? sx : sy;
-      for (const kf of kfs) kf.value *= factor;
-    }
-  }
+  const next = reflowComposition(project, width, height);
   return {
     project: next,
     result: { ok: true, data: { canvas_width: width, canvas_height: height } },
@@ -5065,6 +5470,46 @@ const setVideoClip: ToolDispatch<SetVideoClipArgs> = (project, args) => {
   }
   layer.clip = clip;
   return { project: next, result: { ok: true, data: { elementId, clip } } };
+};
+
+// ---------------------------------------------------------------------------
+// set_video_layer_muted
+// ---------------------------------------------------------------------------
+//
+// Silence (or unmute) a video layer's baked audio in preview AND export. The
+// audio-split processing step sets this true after demuxing the clip's audio
+// into a standalone overlay (NLE-style linked A/V), so the source audio doesn't
+// double with the new track.
+type SetVideoLayerMutedArgs = { elementId?: unknown; muted?: unknown };
+
+const setVideoLayerMuted: ToolDispatch<SetVideoLayerMutedArgs> = (project, args) => {
+  const { elementId, muted } = args;
+  if (typeof elementId !== "string" || !elementId.startsWith("video.")) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "elementId must be a video layer id (video.<id>)",
+      },
+    };
+  }
+  if (typeof muted !== "boolean") {
+    return {
+      project,
+      result: { ok: false, error: "muted must be a boolean (true to mute, false to unmute)" },
+    };
+  }
+  const id = elementId.slice("video.".length);
+  const next = cloneProject(project);
+  const layer = next.video_layers.find((l) => l.id === id);
+  if (!layer) {
+    return {
+      project,
+      result: { ok: false, error: `video layer not found: ${elementId}` },
+    };
+  }
+  layer.muted = muted;
+  return { project: next, result: { ok: true, data: { elementId, muted } } };
 };
 
 // ---------------------------------------------------------------------------
@@ -5153,6 +5598,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   ungroup_layers: ungroupLayers as ToolDispatch<never>,
   set_group_parent: setGroupParent as ToolDispatch<never>,
   rename_group: renameGroup as ToolDispatch<never>,
+  add_morpha_layer: addMorphaLayer as ToolDispatch<never>,
   add_audio_overlay: addAudioOverlay as ToolDispatch<never>,
   remove_audio_overlay: removeAudioOverlay as ToolDispatch<never>,
   update_audio_overlay: updateAudioOverlay as ToolDispatch<never>,
@@ -5170,6 +5616,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   set_canvas_size: setCanvasSize as ToolDispatch<never>,
   set_image_filename: setImageFilename as ToolDispatch<never>,
   set_video_clip: setVideoClip as ToolDispatch<never>,
+  set_video_layer_muted: setVideoLayerMuted as ToolDispatch<never>,
   set_matte_source: setMatteSource as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
@@ -5993,6 +6440,29 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "add_morpha_layer",
+      description:
+        "Embed another of the user's projects (\"a morpha\") inside this one as a version-pinned band. The source's layers are inlined into the host as a collapsible group, re-keyed to fresh ids, pinned to one immutable version of the source. Pass the source project's id as source_morpha_id (and optionally a version label); the server resolves and inlines the pinned version. Editing the band's inner layers is a local override until you publish it back as a new version of the source.",
+      parameters: {
+        type: "object",
+        properties: {
+          source_morpha_id: {
+            type: "string",
+            description: "The id of the project to embed. Must not be this project.",
+          },
+          version: {
+            type: "string",
+            description:
+              "Optional version label of the source to pin (e.g. \"v3\"). Omit to pin the source's latest saved version.",
+          },
+        },
+        required: ["source_morpha_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_audio_overlay",
       description:
         "Add an audio overlay (mp3/m4a/wav/ogg) scheduled at a frame-aligned start. The asset must already exist at users/<userId>/assets/<projectId>/<filename>. 30 fps; convert seconds with frames = round(s * 30). Plays in the editor preview and is mixed into the MP4 export.",
@@ -6512,7 +6982,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_canvas_size",
       description:
-        "Resize the composition canvas to width × height pixels. Every layer's position/size, group pivots, and x/y/width/height animation keyframes scale by the width/height ratio, so the composition keeps its proportions in the new frame. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
+        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
       parameters: {
         type: "object",
         properties: {
@@ -6636,6 +7106,25 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           frame: { type: "number", description: "Project-timeline frame number." },
         },
         required: ["elementId", "frame"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_video_layer_muted",
+      description:
+        "Mute or unmute a video layer's baked audio (silenced in both preview and export). The processing pipeline's audio-split step sets this true after demuxing the clip's audio into a standalone overlay track (NLE-style linked A/V), so the source audio doesn't double with the overlay. Pass muted:false to restore the baked audio.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: { type: "string", description: "Video layer id, video.<id>." },
+          muted: {
+            type: "boolean",
+            description: "true silences the layer's baked audio; false restores it.",
+          },
+        },
+        required: ["elementId", "muted"],
       },
     },
   },

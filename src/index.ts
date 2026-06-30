@@ -41,8 +41,19 @@ export type { CaptionLine, TranscriptWordLike } from "./core/captions.ts";
 export { renderFrame, renderVideo } from "./render.ts";
 export type { RenderFrameOptions, RenderVideoOptions } from "./render.ts";
 
+// ── Processing (real local browser) — proxy / audio split / transcription /
+// OCR / object detection for an uploaded clip. The agent-flow way to make a
+// clip's caches + artifacts exist without opening the editor.
+export { processClip, processClips } from "./process.ts";
+export type {
+  ProcessClipOptions,
+  ProcessClipsOptions,
+  ProcessClipOutcome,
+} from "./process.ts";
+
 // ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───
-// createClient({ token }) → getProject / listTools / callTool / renderFrame.
+// createClient({ token }) → getProject / listTools / callTool / addVideo /
+// processClip / renderFrame.
 export { createClient } from "./client.ts";
 export type {
   MorphaClient,
@@ -50,4 +61,6 @@ export type {
   ToolCallResult,
   ToolResultEnvelope,
   CacheReadResult,
+  AddVideoSource,
+  ClipProcessingStatus,
 } from "./client.ts";
