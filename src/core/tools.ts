@@ -6151,7 +6151,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           fill: {
             description:
-              "Either '#rrggbb' (promoted to solid), a Fill object (solid | linear | radial | mask), or null (image/video/group only — clears the backdrop).",
+              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/group only) clears the backdrop.',
           },
         },
         required: ["elementId", "fill"],
@@ -6170,7 +6170,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           elementId: { type: "string", description: "text.<id>." },
           fill: {
             description:
-              "Box fill: '#rrggbb' (promoted to solid), a Fill object (solid | linear | radial | mask), or null to clear the box. Omit to leave the current fill.",
+              "Box fill: '#rrggbb' (promoted to solid) or a Fill object: {type:\"solid\",color} / {type:\"linear\",stops:[{pos:0..1,color}],angle?} / {type:\"radial\",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:\"mask\",layer_id,color}. null clears the box; omit to leave the current fill.",
           },
           padding: {
             type: "number",
@@ -6242,7 +6242,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           value: {
             description:
-              "Either '#rrggbb' (promoted to solid) or a Fill object (solid | linear | radial | mask).",
+              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?}. Adjacent keyframes crossfade the gradient stop-by-stop.',
           },
           easing: {
             type: "string",

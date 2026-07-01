@@ -106,21 +106,51 @@ export interface MorphaClient {
   ): Promise<ToolCallResult>;
 
   // ── Workspace & lifecycle ─────────────────────────────────────────────────
-  /** Every project in the workspace as `{ id, name, editorUrl }`. */
-  listProjects(): Promise<Array<{ id: string; name: string | null; editorUrl: string }>>;
+  /** Projects as `{ id, name, editorUrl }`. With no argument, the caller's OWN
+   *  personal projects (those not in a workspace). Pass `{ workspaceId }` (from
+   *  `listWorkspaces`) to list that workspace's projects instead — including
+   *  teammates', each with the owner's `ownerEmail`. */
+  listProjects(opts?: {
+    workspaceId?: string;
+  }): Promise<
+    Array<{ id: string; name: string | null; editorUrl: string; ownerEmail?: string | null }>
+  >;
+  /** The workspaces (shared team spaces) the account belongs to. `role` is the
+   *  caller's role; only owner/admin/editor can add projects. Use `id` as the
+   *  `workspaceId` argument to `createProject` / `moveProjectToWorkspace` /
+   *  `listProjects`; show the user the `name`. Empty when the account has no
+   *  email (membership is email-based). */
+  listWorkspaces(): Promise<
+    Array<{ id: string; name: string; role: string; memberCount: number }>
+  >;
   /** A deep link that opens a project in the editor. */
   openProject(projectId: string): Promise<{ name: string | null; editorUrl: string }>;
-  /** Create a new project (optionally cloning `fromProjectId`). The id is an
-   *  opaque v4 UUID minted server-side and returned as `projectId` — you never
-   *  choose it; refer to the project by its `name`. */
+  /** Create a new project (optionally cloning `fromProjectId`, or placing it in
+   *  a workspace via `workspaceId`). The id is an opaque v4 UUID minted
+   *  server-side and returned as `projectId` — you never choose it; refer to the
+   *  project by its `name`. */
   createProject(opts?: {
     fromProjectId?: string;
     name?: string;
+    workspaceId?: string;
   }): Promise<{
     projectId: string;
     fromProjectId: string | null;
+    workspaceId: string | null;
     assetsCopied: number;
     clipsCopied: number;
+    editorUrl: string;
+  }>;
+  /** Move a project into a workspace (`workspaceId` from `listWorkspaces`), or
+   *  back to the caller's personal space (`workspaceId: null`). Needs an
+   *  edit-capable role in the target workspace and write access to the project. */
+  moveProjectToWorkspace(
+    projectId: string,
+    workspaceId: string | null,
+  ): Promise<{
+    projectId: string;
+    workspaceId: string | null;
+    name: string | null;
     editorUrl: string;
   }>;
   /** Duplicate `sourceProjectId` into a brand-new project (fresh opaque id). */
@@ -453,11 +483,31 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     listTools,
     callTool,
 
-    listProjects: async () => {
-      const data = (await serverData("list_projects", undefined)) as {
-        projects: Array<{ id: string; name: string | null; editorUrl: string }>;
+    listProjects: async (opts = {}) => {
+      const data = (await serverData(
+        "list_projects",
+        undefined,
+        opts.workspaceId ? { workspaceId: opts.workspaceId } : {},
+      )) as {
+        projects: Array<{
+          id: string;
+          name: string | null;
+          editorUrl: string;
+          ownerEmail?: string | null;
+        }>;
       };
       return data.projects;
+    },
+    listWorkspaces: async () => {
+      const data = (await serverData("list_workspaces", undefined)) as {
+        workspaces: Array<{
+          id: string;
+          name: string;
+          role: string;
+          memberCount: number;
+        }>;
+      };
+      return data.workspaces;
     },
     openProject: async (projectId) =>
       (await serverData("open_project", projectId)) as {
@@ -468,11 +518,22 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       (await serverData("create_project", undefined, {
         fromProjectId: opts.fromProjectId,
         name: opts.name,
+        workspaceId: opts.workspaceId,
       })) as {
         projectId: string;
         fromProjectId: string | null;
+        workspaceId: string | null;
         assetsCopied: number;
         clipsCopied: number;
+        editorUrl: string;
+      },
+    moveProjectToWorkspace: async (projectId, workspaceId) =>
+      (await serverData("move_project_to_workspace", projectId, {
+        workspaceId,
+      })) as {
+        projectId: string;
+        workspaceId: string | null;
+        name: string | null;
         editorUrl: string;
       },
     duplicateProject: async (sourceProjectId, opts = {}) =>

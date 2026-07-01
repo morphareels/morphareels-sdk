@@ -501,6 +501,39 @@ export const sourceFrameFor = (
   return last + (idx - (table.length - 1)) * tailRate;
 };
 
+// Inverse of `sourceFrameFor` for a moment in the clip's SOURCE timeline given
+// in seconds (e.g. a transcript word's `start`): the PROJECT-timeline frame
+// where that moment plays, honouring the layer's trim (`source_in_frame`) and
+// placement (`timeline_start_frame`). Constant-rate — `speed_keyframes` are
+// intentionally ignored here (transcript navigation targets talking-head clips
+// that don't ramp; ramped-clip captions are a follow-up).
+export const projectFrameForSourceSeconds = (
+  layer: VideoLayer,
+  seconds: number,
+  fps = 30,
+): number => {
+  const sourceIn = layer.source_in_frame ?? 0;
+  const tStart = layer.timeline_start_frame ?? 0;
+  return Math.round(tStart + (seconds * fps - sourceIn));
+};
+
+// Whether a SOURCE-seconds moment falls inside the layer's trimmed window — i.e.
+// it is actually visible on the project timeline. Words outside the window are
+// in the transcript but trimmed off the clip, so the transcript surface shows
+// them dimmed and non-seeking.
+export const sourceSecondsInWindow = (
+  layer: VideoLayer,
+  seconds: number,
+  fps = 30,
+): boolean => {
+  const sourceIn = layer.source_in_frame ?? 0;
+  const sourceOut = layer.source_out_frame ?? null;
+  const f = seconds * fps;
+  if (f < sourceIn - 0.5) return false;
+  if (sourceOut != null && f > sourceOut + 0.5) return false;
+  return true;
+};
+
 // Shape primitives. The set is the data-driven shape registry in
 // `./shapes.ts` — `SHAPE_IDS` is the readonly tuple of every registry id, so
 // adding a shape there widens this enum automatically. `rect` is the historic
@@ -817,6 +850,12 @@ export const stylesSchema = z.record(z.string(), layerStyleSchema);
 // when omitted the overlay plays the source asset's full natural length.
 // Filename references an asset in the project's R2 prefix (same bucket
 // images live in). 30 fps; convert seconds with frames = round(s * 30).
+//
+// `filename` is ALWAYS the original audio. When the AI denoiser cleaned the
+// clip on import it stores the cleaned MP3 as a second asset in
+// `denoisedFilename`; `useDenoised` picks which one plays (absent/true ⇒
+// cleaned). Both are resolved through `activeOverlayFilename` — the single
+// source of truth so preview, export, and the timeline waveform never drift.
 export const audioOverlaySchema = z
   .object({
     id: z.string().min(1),
@@ -828,10 +867,18 @@ export const audioOverlaySchema = z
     endFrame: z.number().int().nonnegative().optional(),
     muted: z.boolean().optional(),
     soloed: z.boolean().optional(),
+    denoisedFilename: z.string().min(1).optional(),
+    useDenoised: z.boolean().optional(),
   })
   .strict();
 
 export type AudioOverlay = z.infer<typeof audioOverlaySchema>;
+
+// The audio asset an overlay plays right now: the cleaned track when one
+// exists and the user hasn't flipped it back (absent/true ⇒ cleaned), else
+// the original. Legacy overlays (no `denoisedFilename`) resolve to `filename`.
+export const activeOverlayFilename = (o: AudioOverlay): string =>
+  o.denoisedFilename && o.useDenoised !== false ? o.denoisedFilename : o.filename;
 
 // A layer group. Holds an ordered list of children — each child is the
 // element id of an image layer ("image.<id>"), shape ("shapes.<id>"), or
