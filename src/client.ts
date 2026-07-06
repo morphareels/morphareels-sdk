@@ -27,11 +27,13 @@ import {
   processClip as processClipHeadless,
   processClips as processClipsHeadless,
   type ProcessClipOutcome,
+  type ProcessStep,
 } from "./process.ts";
 
 /** Where the bytes for `addVideo` come from: a public URL the worker fetches
  *  (no duration needed — it's parsed from the header), or a LOCAL file path the
- *  SDK streams via presign→PUT→finalize (which requires `durationSeconds`). */
+ *  SDK uploads (small files via presign→PUT→finalize, large files via chunked
+ *  multipart; requires `durationSeconds`). */
 export type AddVideoSource =
   | { url: string; filename?: string; durationSeconds?: number }
   | { file: string; filename?: string; durationSeconds: number };
@@ -212,7 +214,7 @@ export interface MorphaClient {
   addVideo(
     projectId: string,
     source: AddVideoSource,
-    opts?: { channel?: string; timeoutMs?: number },
+    opts?: { channel?: string; timeoutMs?: number; steps?: ProcessStep[] },
   ): Promise<Record<string, unknown> & { filename: string; processing: ProcessClipOutcome }>;
   /** Low-level: upload a clip from a public URL (worker-fetched). Does NOT
    *  process — prefer `addVideo`. */
@@ -283,12 +285,12 @@ export interface MorphaClient {
   processClip(
     projectId: string,
     clip: string,
-    opts?: { channel?: string; timeoutMs?: number },
+    opts?: { channel?: string; timeoutMs?: number; steps?: ProcessStep[] },
   ): Promise<ProcessClipOutcome>;
   /** Process every (unique) video clip in the project, reusing one browser. */
   processProject(
     projectId: string,
-    opts?: { clips?: string[]; channel?: string; timeoutMs?: number },
+    opts?: { clips?: string[]; channel?: string; timeoutMs?: number; steps?: ProcessStep[] },
   ): Promise<ProcessClipOutcome[]>;
 
   // ── Rendering (real local browser, no ffmpeg, no server) ──────────────────
@@ -309,6 +311,55 @@ const safeText = async (res: Response): Promise<string> => {
   } catch {
     return "";
   }
+};
+
+// ── Local-clip upload transport ──────────────────────────────────────────────
+// Mirrors the editor's own uploadClipSmart (editor/src/api.ts): 10 MiB parts,
+// multipart for anything larger. A single multi-minute PUT trips undici's
+// default ~300s headersTimeout (the reported UND_ERR_HEADERS_TIMEOUT); bounded
+// parts never hold one request open that long.
+const MULTIPART_CHUNK_BYTES = 10 * 1024 * 1024;
+const MULTIPART_CONCURRENCY = 4;
+const MULTIPART_RETRIES = 3;
+
+// Best-effort no-timeout undici dispatcher for the upload PUTs only. Node's
+// global fetch is undici, whose default headersTimeout/bodyTimeout (~300s)
+// aborts a slow upload before R2's response headers arrive. We disable them on
+// the upload path (belt-and-suspenders alongside multipart, which also covers
+// slow-link parts). Resolved lazily + cached; returns undefined when `undici`
+// isn't importable — the report's confirmed `setGlobalDispatcher(new Agent({
+// headersTimeout: 0, bodyTimeout: 0 }))` workaround, folded into the SDK so
+// callers don't need it.
+let uploadDispatcherPromise: Promise<unknown> | undefined;
+const getUploadDispatcher = (): Promise<unknown> => {
+  if (!uploadDispatcherPromise) {
+    // Non-literal specifier: `undici` is an OPTIONAL runtime dependency (Node's
+    // own fetch backend), not an SDK dependency, so we must NOT let TS/esbuild
+    // try to resolve or bundle it at build time. Widening to `string` makes the
+    // dynamic import resolve at runtime only — present in most Node apps, absent
+    // is fine (we fall back to no dispatcher).
+    const undiciSpecifier: string = "undici";
+    uploadDispatcherPromise = import(undiciSpecifier)
+      .then((u: { Agent?: new (o: unknown) => unknown }) => {
+        const Agent = u.Agent;
+        return Agent
+          ? new Agent({
+              headersTimeout: 0,
+              bodyTimeout: 0,
+              connect: { timeout: 60_000 },
+            })
+          : undefined;
+      })
+      .catch(() => undefined);
+  }
+  return uploadDispatcherPromise;
+};
+
+// R2 returns bare ETags; some S3-compatible impls quote them. Strip quotes so
+// the multipart /complete call gets a clean value either way.
+const unquoteEtag = (raw: string): string => {
+  const v = raw.trim();
+  return v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
 };
 
 /**
@@ -334,6 +385,9 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       "No fetch available — pass options.fetch (Node <18) or run on Node >=18.",
     );
   }
+  // The no-timeout upload dispatcher only applies to Node's global fetch (undici);
+  // a custom options.fetch owns its own transport, so we don't attach it there.
+  const usingDefaultFetch = options.fetch === undefined;
 
   const headers = (extra?: Record<string, string>): Record<string, string> => {
     const h: Record<string, string> = { Accept: "application/json", ...extra };
@@ -443,8 +497,112 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return data;
   };
 
-  // Upload a local file via presign → PUT → finalize. Shared by addVideo's
-  // `{ file }` branch.
+  // PUT bytes at a presigned R2 URL and return the response (for its ETag).
+  // Retries transient failures; attaches the no-timeout dispatcher when on the
+  // default global fetch so a slow upload doesn't hit undici's headersTimeout.
+  const putToR2 = async (
+    uploadUrl: string,
+    body: Uint8Array,
+    contentType?: string,
+    retries = MULTIPART_RETRIES,
+  ): Promise<Response> => {
+    const dispatcher = usingDefaultFetch ? await getUploadDispatcher() : undefined;
+    const init: RequestInit & { dispatcher?: unknown } = {
+      method: "PUT",
+      body: body as unknown as BodyInit,
+      ...(contentType ? { headers: { "Content-Type": contentType } } : {}),
+      ...(dispatcher ? { dispatcher } : {}),
+    };
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await doFetch(uploadUrl, init);
+        if (res.ok) return res;
+        lastErr = new Error(`R2 PUT failed: HTTP ${res.status}`);
+      } catch (e) {
+        lastErr = e instanceof Error ? e : new Error(String(e));
+      }
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+      }
+    }
+    throw lastErr ?? new Error("R2 PUT failed");
+  };
+
+  // Upload a large local clip via R2 multipart — many bounded part PUTs instead
+  // of one held-open request, so a big clip on a slow uplink can't trip undici's
+  // headersTimeout. Mirrors editor/src/api.ts `uploadClipMultipart`.
+  const uploadLocalFileMultipart = async (
+    projectId: string,
+    bytes: Uint8Array,
+    filename: string,
+    durationSeconds: number,
+  ): Promise<Record<string, unknown>> => {
+    const totalBytes = bytes.byteLength;
+    const init = (await postRaw("/api/upload-clip/multipart/init", {
+      projectId,
+      filename,
+      durationSeconds,
+      totalBytes,
+      partSize: MULTIPART_CHUNK_BYTES,
+    })) as {
+      uploadId: string;
+      filename: string;
+      partSize: number;
+      parts: Array<{ partNumber: number; uploadUrl: string }>;
+    };
+    const parts = init.parts;
+    const results: Array<{ partNumber: number; etag: string } | null> = new Array(
+      parts.length,
+    ).fill(null);
+
+    // A shared cursor feeds a small worker pool — each worker grabs the next
+    // part index and PUTs it, so at most MULTIPART_CONCURRENCY are in flight.
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const idx = nextIndex++;
+        if (idx >= parts.length) return;
+        const part = parts[idx];
+        const start = (part.partNumber - 1) * init.partSize;
+        const end = Math.min(part.partNumber * init.partSize, totalBytes);
+        const res = await putToR2(part.uploadUrl, bytes.subarray(start, end));
+        const raw = res.headers.get("ETag") ?? res.headers.get("etag");
+        if (!raw) throw new Error("R2 part PUT response missing ETag header");
+        results[idx] = { partNumber: part.partNumber, etag: unquoteEtag(raw) };
+      }
+    };
+
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(MULTIPART_CONCURRENCY, parts.length) }, () =>
+          worker(),
+        ),
+      );
+    } catch (err) {
+      // Release the parts already in R2 so a failed upload doesn't dangle.
+      await postRaw("/api/upload-clip/multipart/abort", {
+        projectId,
+        filename: init.filename,
+        uploadId: init.uploadId,
+      }).catch(() => {});
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+
+    const completedParts = results
+      .filter((r): r is { partNumber: number; etag: string } => r !== null)
+      .sort((a, b) => a.partNumber - b.partNumber);
+    return postRaw("/api/upload-clip/multipart/complete", {
+      projectId,
+      filename: init.filename,
+      uploadId: init.uploadId,
+      durationSeconds,
+      parts: completedParts,
+    });
+  };
+
+  // Upload a local file: single presign→PUT→finalize for small clips, chunked
+  // multipart for large ones. Shared by addVideo's `{ file }` branch.
   const uploadLocalFile = async (
     projectId: string,
     filePath: string,
@@ -457,20 +615,16 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     ]);
     const bytes = await readFile(filePath);
     const filename = overrideName ?? basename(filePath);
+    if (bytes.byteLength > MULTIPART_CHUNK_BYTES) {
+      return uploadLocalFileMultipart(projectId, bytes, filename, durationSeconds);
+    }
     const presign = (await postRaw("/api/upload-clip/init", {
       projectId,
       filename,
       durationSeconds,
       fileSize: bytes.byteLength,
     })) as { uploadUrl: string; filename: string; contentType: string };
-    const put = await doFetch(presign.uploadUrl, {
-      method: "PUT",
-      headers: { "Content-Type": presign.contentType },
-      body: bytes,
-    });
-    if (!put.ok) {
-      throw new Error(`addVideo: PUT to R2 failed: HTTP ${put.status}`);
-    }
+    await putToR2(presign.uploadUrl, bytes, presign.contentType);
     return postRaw("/api/upload-clip/finalize", {
       projectId,
       filename: presign.filename,
@@ -619,6 +773,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         clip: filename,
         channel: opts.channel,
         timeoutMs: opts.timeoutMs,
+        steps: opts.steps,
       });
       return { ...uploaded, filename, processing };
     },

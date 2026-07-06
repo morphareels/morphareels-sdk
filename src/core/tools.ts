@@ -762,6 +762,196 @@ export const inlineMorpha = (
   };
 };
 
+// ---------------------------------------------------------------------------
+// Group subtree copy / paste
+// ---------------------------------------------------------------------------
+//
+// A group is a subtree: the group record plus the transitive closure of its
+// `children` (leaves and nested groups), each layer carrying its own
+// animations / style / colour tracks. `collectSubtree` extracts that closure
+// into a self-contained bundle (the ⌘C payload); `pasteSubtree` re-keys every
+// id in the bundle to destination-unique ids and merges it in (the ⌘V action).
+// Together they are the group-aware counterpart to the leaf clipboard, and the
+// paste half is `inlineMorpha` without the embedded-morpha provenance.
+
+// A copied group + everything under it. `rootElementId` and every id inside the
+// arrays are still the SOURCE project's ids — `pasteSubtree` re-keys them.
+export interface SubtreeBundle {
+  rootElementId: string;
+  image_layers: ImageLayer[];
+  video_layers: VideoLayer[];
+  text_layers: TextLayer[];
+  shapes: Shape[];
+  groups: Group[];
+}
+
+// A pasted media descendant whose bytes live in another project's bucket. The
+// editor copies them into the destination after the paste lands, then drops the
+// asset_project_id. `elementId` is the id in the DESTINATION (already re-keyed).
+export interface PendingMedia {
+  elementId: string;
+  kind: "image" | "video";
+  filename: string;
+  sourceProjectId: string;
+}
+
+// Extract the group at `rootElementId` and its whole descendant closure into a
+// bundle. Returns null if the id isn't a present group. Deep-clones every
+// record so the bundle is detached from `project`.
+export const collectSubtree = (
+  project: Project,
+  rootElementId: string,
+): SubtreeBundle | null => {
+  if (!rootElementId.startsWith("group.")) return null;
+  const rootGroup = findLayerByElementId(project, rootElementId);
+  if (!rootGroup) return null;
+
+  const bundle: SubtreeBundle = {
+    rootElementId,
+    image_layers: [],
+    video_layers: [],
+    text_layers: [],
+    shapes: [],
+    groups: [],
+  };
+  const push = (elementId: string): void => {
+    const layer = findLayerByElementId(project, elementId);
+    if (!layer) return;
+    const clone = structuredClone(layer);
+    if (elementId.startsWith("image.")) bundle.image_layers.push(clone as ImageLayer);
+    else if (elementId.startsWith("video.")) bundle.video_layers.push(clone as VideoLayer);
+    else if (elementId.startsWith("text.")) bundle.text_layers.push(clone as TextLayer);
+    else if (elementId.startsWith("shapes.")) bundle.shapes.push(clone as Shape);
+    else if (elementId.startsWith("group.")) bundle.groups.push(clone as Group);
+  };
+
+  push(rootElementId);
+  for (const descendant of getGroupDescendants(project, rootGroup.id)) {
+    push(descendant);
+  }
+  return bundle;
+};
+
+// Add `delta` to a group's frame-0 x/y translation (groups have no static base
+// position, so a paste offset lives on the translation track). Mirrors the
+// store's group-nudge so a pasted group can be dragged clear of the original.
+const bumpGroupFrameZero = (
+  project: Project,
+  elementId: string,
+  property: TrackProperty,
+  delta: number,
+): void => {
+  const kfs = ensureTrack(project, elementId, property);
+  const idx = kfs.findIndex((k) => k.frame === 0);
+  if (idx >= 0) kfs[idx] = { ...kfs[idx], value: kfs[idx].value + delta };
+  else kfs.push({ frame: 0, value: delta, easing: "linear" });
+  sortByFrame(kfs);
+};
+
+// Paste a subtree bundle into `dest`. Re-keys every id in the bundle to ids
+// unique against dest (so same-project paste never collides and never renames a
+// dest layer), merges the records in, appends the new root group to the root
+// z-order, and nudges it by `offset` px. Media descendants whose bytes live in
+// another project are repointed at that bucket and returned as `pendingMedia`
+// for the caller to copy across. Pure: never mutates `dest` or `bundle`.
+export const pasteSubtree = (
+  dest: Project,
+  bundle: SubtreeBundle,
+  opts: { sourceProjectId: string; offset?: number },
+): { project: Project; rootElementId: string; pendingMedia: PendingMedia[] } => {
+  const next = cloneProject(dest);
+  const offset = opts.offset ?? 0;
+
+  // Re-key the bundle in isolation as a standalone project so a mint can't land
+  // on — or rename — an existing dest layer. rekeyElementId only reads the
+  // layer arrays + layer_order (loop / public_properties stay undefined here).
+  const sub = {
+    image_layers: bundle.image_layers.map((l) => structuredClone(l)),
+    video_layers: bundle.video_layers.map((l) => structuredClone(l)),
+    text_layers: bundle.text_layers.map((l) => structuredClone(l)),
+    shapes: bundle.shapes.map((l) => structuredClone(l)),
+    groups: bundle.groups.map((l) => structuredClone(l)),
+    layer_order: [bundle.rootElementId],
+  } as unknown as Project;
+
+  const reserved: Record<LayerKind, Set<string>> = {
+    image: new Set([...next.image_layers, ...sub.image_layers].map((l) => l.id)),
+    video: new Set([...next.video_layers, ...sub.video_layers].map((l) => l.id)),
+    text: new Set([...next.text_layers, ...sub.text_layers].map((l) => l.id)),
+    shapes: new Set([...next.shapes, ...sub.shapes].map((l) => l.id)),
+    group: new Set([...next.groups, ...sub.groups].map((l) => l.id)),
+  };
+  const mintId = (kind: LayerKind): string => {
+    for (let i = 0; i < 100; i += 1) {
+      const buf = new Uint8Array(3);
+      crypto.getRandomValues(buf);
+      const id = Array.from(buf)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      if (!reserved[kind].has(id)) {
+        reserved[kind].add(id);
+        return id;
+      }
+    }
+    throw new Error(`pasteSubtree: 100 id-mint collisions on ${kind}`);
+  };
+  const rekeyAll = (kind: LayerKind, layers: Array<{ id: string }>): void => {
+    const originals = layers.map((l) => l.id);
+    for (const oldBare of originals) {
+      rekeyElementId(sub, `${kind}.${oldBare}`, `${kind}.${mintId(kind)}`);
+    }
+  };
+  rekeyAll("image", sub.image_layers);
+  rekeyAll("video", sub.video_layers);
+  rekeyAll("text", sub.text_layers);
+  rekeyAll("shapes", sub.shapes);
+  rekeyAll("group", sub.groups);
+
+  // rekeyElementId rewrote sub.layer_order, so its sole entry is the new root.
+  const rootElementId = sub.layer_order[0];
+
+  // Media whose bytes live elsewhere: point at that bucket for instant render
+  // and queue a byte-copy. `asset_project_id` already set = inlined-morpha media
+  // that stays pointing at its own home.
+  const pendingMedia: PendingMedia[] = [];
+  const claimMedia = (
+    layer: {
+      id: string;
+      asset_project_id?: string;
+      filename?: string;
+      clip?: string;
+    },
+    kind: "image" | "video",
+  ): void => {
+    const filename = kind === "image" ? layer.filename : layer.clip;
+    const home = layer.asset_project_id ?? opts.sourceProjectId;
+    if (home !== next.project_id) {
+      layer.asset_project_id = home;
+      if (filename) {
+        pendingMedia.push({ elementId: `${kind}.${layer.id}`, kind, filename, sourceProjectId: home });
+      }
+    } else {
+      delete layer.asset_project_id;
+    }
+  };
+  sub.image_layers.forEach((l) => claimMedia(l, "image"));
+  sub.video_layers.forEach((l) => claimMedia(l, "video"));
+
+  next.image_layers = [...next.image_layers, ...sub.image_layers];
+  next.video_layers = [...next.video_layers, ...sub.video_layers];
+  next.text_layers = [...next.text_layers, ...sub.text_layers];
+  next.shapes = [...next.shapes, ...sub.shapes];
+  next.groups = [...next.groups, ...sub.groups];
+  next.layer_order = [...next.layer_order, rootElementId];
+
+  if (offset !== 0) {
+    bumpGroupFrameZero(next, rootElementId, "x", offset);
+    bumpGroupFrameZero(next, rootElementId, "y", offset);
+  }
+
+  return { project: next, rootElementId, pendingMedia };
+};
+
 type AddMorphaLayerArgs = {
   source_morpha_id: string;
   // The fetched source Project JSON, injected by the caller (worker tool route
@@ -2513,6 +2703,7 @@ type SetStyleArgs = {
   borderRadius?: number;
   borderWidth?: number;
   borderColor?: string;
+  borderAlign?: "inner" | "center" | "outer";
   boxShadow?: string | null;
   fit?: "stretch" | "cover" | "contain";
   anchorX?: number;
@@ -2549,12 +2740,19 @@ const FIT_VALUES: ReadonlyArray<"stretch" | "cover" | "contain"> = [
   "contain",
 ];
 
+const BORDER_ALIGN_VALUES: ReadonlyArray<"inner" | "center" | "outer"> = [
+  "inner",
+  "center",
+  "outer",
+];
+
 const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
   const {
     elementId,
     borderRadius,
     borderWidth,
     borderColor,
+    borderAlign,
     boxShadow,
     fit,
     anchorX,
@@ -2577,6 +2775,7 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
       borderRadius === undefined &&
       borderWidth === undefined &&
       borderColor === undefined &&
+      borderAlign === undefined &&
       boxShadow === undefined &&
       fit === undefined &&
       anchorX === undefined &&
@@ -2624,6 +2823,15 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
     return {
       project,
       result: { ok: false, error: `invalid fit: ${fit}` },
+    };
+  }
+  if (borderAlign !== undefined && !BORDER_ALIGN_VALUES.includes(borderAlign)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `invalid borderAlign (expected inner|center|outer): ${borderAlign}`,
+      },
     };
   }
   for (const [name, v] of [
@@ -2768,6 +2976,7 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
     ...(borderRadius !== undefined ? { borderRadius } : {}),
     ...(borderWidth !== undefined ? { borderWidth } : {}),
     ...(borderColor !== undefined ? { borderColor } : {}),
+    ...(borderAlign !== undefined ? { borderAlign } : {}),
     ...(boxShadowPatch !== undefined ? { boxShadow: boxShadowPatch } : {}),
     ...(fit !== undefined ? { fit } : {}),
     ...(anchorX !== undefined ? { anchorX } : {}),
@@ -2797,6 +3006,16 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
   if (merged.borderRadius != null) clean.borderRadius = merged.borderRadius;
   if (merged.borderWidth != null) clean.borderWidth = merged.borderWidth;
   if (merged.borderColor) clean.borderColor = merged.borderColor;
+  // Border alignment. Only kept alongside an actual border and when non-default,
+  // so "inner" and legacy projects (no field) stay compact + render identically.
+  if (
+    merged.borderWidth != null &&
+    merged.borderWidth > 0 &&
+    merged.borderAlign &&
+    merged.borderAlign !== "inner"
+  ) {
+    clean.borderAlign = merged.borderAlign;
+  }
   // Preserve text-box padding (set via set_text_background) — set_style must
   // not nuke it when patching an unrelated style field.
   if (merged.padding != null) clean.padding = merged.padding;
@@ -6027,7 +6246,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_style",
       description:
-        "Set style fields on a layer. Only the fields you pass are changed; omit a field to leave it untouched. Covers border/radius/shadow plus image-only fields: fit (stretch|cover|contain), anchorX/anchorY (0..1, where the source anchors when cropping/letterboxing under cover/contain), tintColor (#rrggbb) + tintStrength (0..1) for a colour overlay painted source-atop, and alphaMask (linear gradient — see below) for a multiplicative alpha fade across the layer.",
+        "Set style fields on a layer. Only the fields you pass are changed; omit a field to leave it untouched. Covers border/radius/shadow (including borderAlign — inner|center|outer border position) plus image-only fields: fit (stretch|cover|contain), anchorX/anchorY (0..1, where the source anchors when cropping/letterboxing under cover/contain), tintColor (#rrggbb) + tintStrength (0..1) for a colour overlay painted source-atop, and alphaMask (linear gradient — see below) for a multiplicative alpha fade across the layer.",
       parameters: {
         type: "object",
         properties: {
@@ -6035,6 +6254,12 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           borderRadius: { type: "number" },
           borderWidth: { type: "number" },
           borderColor: { type: "string", description: "#rrggbb." },
+          borderAlign: {
+            type: "string",
+            enum: ["inner", "center", "outer"],
+            description:
+              "Where the border sits relative to the layer's edge (design-tool \"border position\"). \"inner\" (default) draws the band INSIDE the box so it eats into the content; \"outer\" draws it entirely OUTSIDE so it frames the content without covering it; \"center\" straddles the edge 50/50. Rectangular boxes (image/video/text) only — shapes always stroke centred on their silhouette and ignore it.",
+          },
           boxShadow: {
             type: ["string", "null"],
             description:

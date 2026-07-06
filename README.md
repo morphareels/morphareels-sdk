@@ -54,12 +54,26 @@ const morpha = createClient({ token: process.env.MORPHA_API_KEY });
 
 const { filename, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
 // processing.steps → { proxy, audio_split, transcript, text_regions, objects }
+// processing.reasons → per-step failure reason when a step didn't succeed
 await morpha.callTool(id, "add_video_layer", { clip: filename, x: 540, y: 960, width: 1080, height: 1920 });
 
 const t = await morpha.transcribeClip(id, filename); // now { status: "ready", data: { words, … } }
 ```
 
-`addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). To (re)process clips added another way: `processClip(id, clip)` / `processProject(id)`. Check state any time with `clipProcessingStatus(id)`.
+`addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). Large local files upload in **chunked multipart**, so a big clip on a slow uplink won't time out.
+
+**Fast caption path** — the per-frame OCR + object-detection passes are the slow part and are irrelevant for talking-head captioning. Pass `steps` to run only what captions need:
+
+```ts
+const { filename, processing } = await morpha.addVideo(
+  id,
+  { file: "/abs/clip.mp4", durationSeconds: 61 },
+  { steps: ["transcript", "audio_split"] }, // skip proxy + OCR + object detection
+);
+// processing.steps.transcript === "ready" in seconds → captions ready
+```
+
+To (re)process clips added another way: `processClip(id, clip)` / `processProject(id)` (both accept the same `steps`). Check state any time with `clipProcessingStatus(id)`.
 
 ## Render a video frame to PNG (no ffmpeg)
 

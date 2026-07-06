@@ -740,6 +740,14 @@ export const layerStyleSchema = z
     borderRadius: z.number().nonnegative().optional(),
     borderWidth: z.number().nonnegative().optional(),
     borderColor: hexColor.optional(),
+    // Where the border sits relative to the layer's edge — a design-tool "border
+    // position". "inner" (default, and how every legacy project renders) draws
+    // the whole band INSIDE the box, so it eats into the content; "outer" draws
+    // it entirely OUTSIDE the box, framing the content without covering it;
+    // "center" straddles the edge 50/50. Honoured by rectangular boxes (image /
+    // video / text) in both preview and export. Shapes always stroke centred on
+    // their silhouette (SVG has no stroke-alignment), so they ignore this.
+    borderAlign: z.enum(["inner", "center", "outer"]).optional(),
     boxShadow: z.string().optional(),
     // Uniform inset (canvas-stage px) between the box edge and the text.
     // Honoured by TEXT layers only — it sets the breathing room around the

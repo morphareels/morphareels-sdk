@@ -8,6 +8,16 @@
 // uploads a clip MUST process it through this path or by opening the editor.
 // Requires `playwright` (optional peer dependency) and Google Chrome available.
 
+/** A processing step. `transcript` + `audio_split` are the audio-only steps the
+ *  caption flow needs; `proxy` / `text_regions` / `objects` decode video frames
+ *  (slow in headless Chrome). Pass a subset as `steps` to run only those. */
+export type ProcessStep =
+  | "proxy"
+  | "audio_split"
+  | "transcript"
+  | "text_regions"
+  | "objects";
+
 export interface ProcessClipOutcome {
   clip: string;
   /** false when the route reported a fatal error or timed out. Individual steps
@@ -15,6 +25,10 @@ export interface ProcessClipOutcome {
    *  no audio track) — inspect `steps`. */
   ok: boolean;
   steps?: Record<string, string>;
+  /** Per-step failure reason (from each pass's `error`), when the page recorded
+   *  one — lets a caller tell "no audio track" from "worker didn't initialize"
+   *  rather than reading a bare "unavailable". */
+  reasons?: Record<string, string>;
   error?: string;
 }
 
@@ -30,6 +44,10 @@ export interface ProcessClipOptions {
   /** Per-clip deadline. Default 300000 — proxy transcode + WASM-fallback Whisper
    *  in headless Chrome is much slower than a render; raise for long clips. */
   timeoutMs?: number;
+  /** Restrict processing to these steps (default: all). The fast caption path is
+   *  `["transcript", "audio_split"]` — it skips the slow/fragile video-frame
+   *  passes (proxy, OCR, object detection) so the run finishes in seconds. */
+  steps?: ProcessStep[];
 }
 
 export interface ProcessClipsOptions extends Omit<ProcessClipOptions, "clip"> {
@@ -73,7 +91,11 @@ const readManifest = async (
   token: string | undefined,
   projectId: string,
   clip: string,
-): Promise<{ updatedAt: number; steps?: Record<string, string> }> => {
+): Promise<{
+  updatedAt: number;
+  steps?: Record<string, string>;
+  reasons?: Record<string, string>;
+}> => {
   const res = await fetch(
     `${origin}/api/clips/${encodeURIComponent(projectId)}/${encodeURIComponent(clip)}/enrichment`,
     { headers: token ? { Authorization: `Bearer ${token}` } : {} },
@@ -82,25 +104,37 @@ const readManifest = async (
   const j = (await res.json().catch(() => null)) as {
     data?: {
       updatedAt?: number;
-      passes?: Record<string, { status?: string }>;
-      proxy?: { status?: string };
-      audio_split?: { status?: string };
+      passes?: Record<string, { status?: string; error?: string }>;
+      proxy?: { status?: string; error?: string };
+      audio_split?: { status?: string; error?: string };
     };
   } | null;
   const m = j?.data;
   if (!m) return { updatedAt: 0 };
+  const byStep: Record<string, { status?: string; error?: string } | undefined> = {
+    transcript: m.passes?.transcript,
+    text_regions: m.passes?.text_regions,
+    objects: m.passes?.objects,
+    proxy: m.proxy,
+    audio_split: m.audio_split,
+  };
   const steps = m.passes
     ? {
-        transcript: m.passes.transcript?.status ?? "pending",
-        text_regions: m.passes.text_regions?.status ?? "pending",
-        objects: m.passes.objects?.status ?? "pending",
-        proxy: m.proxy?.status ?? "pending",
-        audio_split: m.audio_split?.status ?? "pending",
+        transcript: byStep.transcript?.status ?? "pending",
+        text_regions: byStep.text_regions?.status ?? "pending",
+        objects: byStep.objects?.status ?? "pending",
+        proxy: byStep.proxy?.status ?? "pending",
+        audio_split: byStep.audio_split?.status ?? "pending",
       }
     : undefined;
+  const reasons: Record<string, string> = {};
+  for (const [step, state] of Object.entries(byStep)) {
+    if (state?.error) reasons[step] = state.error;
+  }
   return {
     updatedAt: typeof m.updatedAt === "number" ? m.updatedAt : 0,
     steps,
+    ...(Object.keys(reasons).length > 0 ? { reasons } : {}),
   };
 };
 
@@ -119,32 +153,38 @@ const runOne = async (
   projectId: string,
   clip: string,
   timeout: number,
+  steps?: ProcessStep[],
 ): Promise<ProcessClipOutcome> => {
   // Baseline so we detect THIS run's manifest rewrite, not a stale prior one.
   const baseline = (await readManifest(origin, token, projectId, clip)).updatedAt;
 
+  const stepsParam =
+    steps && steps.length > 0 ? `&steps=${encodeURIComponent(steps.join(","))}` : "";
   await page
     .goto(
-      `${origin}/process-clip?project=${encodeURIComponent(projectId)}&clip=${encodeURIComponent(clip)}`,
+      `${origin}/process-clip?project=${encodeURIComponent(projectId)}&clip=${encodeURIComponent(clip)}${stepsParam}`,
       { waitUntil: "commit", timeout: 60_000 },
     )
     .catch(() => {});
 
   const deadline = Date.now() + timeout;
-  let last: { updatedAt: number; steps?: Record<string, string> } = {
-    updatedAt: baseline,
-  };
+  let last: {
+    updatedAt: number;
+    steps?: Record<string, string>;
+    reasons?: Record<string, string>;
+  } = { updatedAt: baseline };
   while (Date.now() < deadline) {
     await sleep(5_000);
     last = await readManifest(origin, token, projectId, clip);
     if (last.updatedAt > baseline) {
-      return { clip, ok: true, steps: last.steps };
+      return { clip, ok: true, steps: last.steps, reasons: last.reasons };
     }
   }
   return {
     clip,
     ok: false,
     steps: last.steps,
+    reasons: last.reasons,
     error: `processing did not finish within ${Math.round(timeout / 1000)}s for clip ${clip} — raise timeoutMs`,
   };
 };
@@ -166,7 +206,15 @@ export const processClip = async (
       await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
     }
     const page = await ctx.newPage();
-    return await runOne(page, origin, opts.token, opts.projectId, opts.clip, timeout);
+    return await runOne(
+      page,
+      origin,
+      opts.token,
+      opts.projectId,
+      opts.clip,
+      timeout,
+      opts.steps,
+    );
   } finally {
     await browser.close();
   }
@@ -194,7 +242,9 @@ export const processClips = async (
     // Sequential: each clip saturates CPU/GPU (transcode + WASM models), so
     // running them in parallel pages would just thrash.
     for (const clip of opts.clips) {
-      out.push(await runOne(page, origin, opts.token, opts.projectId, clip, timeout));
+      out.push(
+        await runOne(page, origin, opts.token, opts.projectId, clip, timeout, opts.steps),
+      );
     }
     return out;
   } finally {
