@@ -50,6 +50,9 @@ export const blankProject = (opts: BlankProjectOpts): Project => {
     // no time-based content yet, so this seeds at the 1s floor and grows as
     // content is added. Editor + worker re-fit it on every change.
     duration_seconds: 1,
+    // A fresh project auto-fits its length to content until the user drags the
+    // timeline end handle (which flips this to true). See schemas.ts.
+    duration_authored: false,
     start_at: null,
     audio_overlays: [],
     markers: [],

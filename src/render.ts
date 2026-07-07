@@ -99,11 +99,14 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
       error?: string;
       videoLayersExpected?: number;
       videoLayersFailed?: number;
+      fontsFailed?: number;
+      degradedFonts?: Array<{ family?: string; weight?: number; italic?: boolean }>;
     } | null;
 
     if (status && status.ok === false) {
       const expected = status.videoLayersExpected ?? 0;
       const failed = status.videoLayersFailed ?? 0;
+      const fontsFailed = status.fontsFailed ?? 0;
       throw new Error(
         `Morpha render incomplete for project ${opts.projectId} frame ${frame}: ` +
           (status.error ?? "render reported not-ok") +
@@ -111,6 +114,11 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
             ? ` (${failed}/${expected} video layer(s) failed to decode within ${Math.round(
                 timeout / 1000,
               )}s — raise timeoutMs for very large clips)`
+            : "") +
+          (fontsFailed
+            ? ` (${fontsFailed} web font(s) failed to load within ${Math.round(
+                timeout / 1000,
+              )}s — the render page couldn't fetch the font; check the machine's network egress to the font CDN, or raise timeoutMs)`
             : ""),
       );
     }

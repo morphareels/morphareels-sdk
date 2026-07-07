@@ -1613,6 +1613,20 @@ export const projectSchema = z.preprocess(
       // fitted result; the default only applies to a field-less project until
       // the first re-fit. 30 fps; durationInFrames = ceil(duration_seconds * 30).
       duration_seconds: z.number().positive().default(1),
+      // Whether `duration_seconds` is USER-AUTHORED (an explicit composition
+      // length the user set by dragging the timeline end handle) rather than
+      // DERIVED from content. When false (the default, and the state of every
+      // legacy project), the editor's recomputeDuration and the worker
+      // write-back re-fit `duration_seconds` to the furthest content (auto-fit,
+      // which also seeds the length as content is added). When true, that
+      // re-fit becomes DISPLAY-ONLY — it never overwrites the authored length —
+      // so the composition is a fixed stage you can author into (needed for
+      // building from scratch, where content doesn't exist to derive a length
+      // from yet) and can be dragged shorter than its content (content past the
+      // end is kept, just not played/exported). "Fit to content" clears this
+      // back to false. Default false ⇒ existing projects behave exactly as
+      // before until the user drags the end.
+      duration_authored: z.boolean().default(false),
       // Poster timestamp in SECONDS the editor seeks to on first load instead
       // of frame 0 — so a freshly-opened project doesn't sit on a blank /
       // cold-open frame. The landing "Try" templates set this to a composed

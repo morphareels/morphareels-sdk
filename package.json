@@ -1,6 +1,6 @@
 {
   "name": "morphareels-sdk",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Agentic video editor client — build, caption & render short-form video in code. Frames + MP4 via headless Chrome, no ffmpeg. The Morpha SDK.",
   "keywords": [
     "video",
