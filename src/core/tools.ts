@@ -26,7 +26,12 @@ import {
   getFontEntry,
   type FontSource,
 } from "./font-sources.ts";
-import { blankPage } from "./carousel.ts";
+import {
+  blankPage,
+  commitPageToCarousel,
+  pageToProject,
+  projectToPage,
+} from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
   clampCurve,
@@ -6256,6 +6261,30 @@ const setCanvasSize: ToolDispatch<SetCanvasSizeArgs> = (project, args) => {
       },
     };
   }
+  // Carousel: the content lives in carousel.pages[] and the top level is
+  // empty, so a plain reflow of the record is a silent no-op. Every page
+  // shares the record's dims, so a resize is a WHOLE-carousel operation:
+  // reflow each page (project it at the old dims, scale, fold back) and stamp
+  // the record dims. Carousel-awareness lives in the tool itself rather than
+  // the dispatchOnProject wrapper so the raw `dispatch` path — the SDK's
+  // offline export and the editor controller's runTool — behaves correctly on
+  // a carousel record too.
+  if (project.mode === "carousel" && project.carousel) {
+    const next = cloneProject(project);
+    next.carousel!.pages = project.carousel.pages.map((page) => {
+      const projected = pageToProject(project, page);
+      return projectToPage(
+        page.id,
+        reflowComposition(projected, width, height),
+      );
+    });
+    next.canvas_width = width;
+    next.canvas_height = height;
+    return {
+      project: next,
+      result: { ok: true, data: { canvas_width: width, canvas_height: height } },
+    };
+  }
   const next = reflowComposition(project, width, height);
   return {
     project: next,
@@ -6576,7 +6605,13 @@ const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
       result: { ok: false, error: "carousel record missing after clone" },
     };
   }
-  const activeId = carousel.pages[carousel.active_index].id;
+  // active_index isn't schema-bounded by the page count — clamp so a legacy /
+  // hand-edited record can't make the cursor read off the end.
+  const clamped = Math.min(
+    Math.max(0, carousel.active_index),
+    carousel.pages.length - 1,
+  );
+  const activeId = carousel.pages[clamped].id;
   const [moved] = carousel.pages.splice(from_index, 1);
   carousel.pages.splice(to_index, 0, moved);
   carousel.active_index = carousel.pages.findIndex((p) => p.id === activeId);
@@ -6663,13 +6698,122 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   reorder_pages: reorderPages as ToolDispatch<never>,
 };
 
+// ---------------------------------------------------------------------------
+// Carousel-aware dispatch
+// ---------------------------------------------------------------------------
+//
+// A carousel project keeps ALL content in carousel.pages[] — the top-level
+// composition arrays are empty. Raw `dispatch[name]` on such a record makes
+// every content tool read/write the empty top level: describe_video reports an
+// empty project and add_shape writes an invisible layer. `dispatchOnProject`
+// is the entry point headless surfaces (HTTP /api/tool, MCP — both via the
+// worker's dispatchPureTool) route through instead: it targets the ACTIVE page
+// for content tools and the record for page management, and is byte-identical
+// to `dispatch` on a video-mode project.
+
+// The tools that operate on the carousel RECORD itself. add_page /
+// delete_page / reorder_pages manage the page list; set_canvas_size is itself
+// carousel-aware (reflows every page — see setCanvasSize).
+const CAROUSEL_RECORD_TOOLS = new Set([
+  "add_page",
+  "delete_page",
+  "reorder_pages",
+  "set_canvas_size",
+]);
+
+// active_index is schema-checked as a nonnegative int but NOT bounded by the
+// page count, so a legacy / hand-edited record can carry an out-of-range
+// cursor — clamp instead of throwing.
+const clampedActiveIndex = (project: Project): number => {
+  const carousel = project.carousel!;
+  return Math.min(
+    Math.max(0, carousel.active_index),
+    carousel.pages.length - 1,
+  );
+};
+
+export interface CarouselOverview {
+  page_count: number;
+  active_index: number;
+  pages: Array<{ index: number; name: string | null; has_video: boolean }>;
+  note: string;
+}
+
+// The agent-facing summary of a carousel's pages, attached to describe_video's
+// data both headless (dispatchOnProject) and in the editor panel. Pages are
+// addressed by INDEX — page ids are internal storage keys, never surfaced.
+export const carouselOverview = (project: Project): CarouselOverview => {
+  const carousel = project.carousel!;
+  return {
+    page_count: carousel.pages.length,
+    active_index: clampedActiveIndex(project),
+    pages: carousel.pages.map((p, index) => ({
+      index,
+      name: p.name ?? null,
+      has_video: p.video_layers.length > 0,
+    })),
+    note:
+      "This is a carousel. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use add_page / delete_page / reorder_pages to manage pages, and set_canvas_size to resize every page at once.",
+  };
+};
+
+// Route one tool call against a project, carousel-aware. Video-mode projects
+// pass straight through to `dispatch[name]` (byte-identical). On a carousel:
+// page-management tools (and the carousel-aware set_canvas_size) run on the
+// record; every other tool runs on a projection of the ACTIVE page
+// (pageToProject) and, when it mutates, folds back via commitPageToCarousel —
+// so collection / custom_fonts / embed_origins edits made on the projection
+// merge to the record's top level. describe_video additionally carries the
+// carouselOverview block so an agent learns the pages exist.
+export const dispatchOnProject = (
+  project: Project,
+  name: string,
+  args: Record<string, unknown>,
+): ToolOutcome => {
+  const fn = dispatch[name] as
+    | ToolDispatch<Record<string, unknown>>
+    | undefined;
+  if (!fn) {
+    return { project, result: { ok: false, error: `unknown tool: ${name}` } };
+  }
+  if (project.mode !== "carousel" || !project.carousel) {
+    return fn(project, args);
+  }
+  if (CAROUSEL_RECORD_TOOLS.has(name)) return fn(project, args);
+  // The schema requires ≥1 page, but this entry point also takes projects
+  // built in memory — guard rather than let pageToProject throw.
+  if (project.carousel.pages.length === 0) {
+    return { project, result: { ok: false, error: "carousel has no pages" } };
+  }
+  const page = project.carousel.pages[clampedActiveIndex(project)];
+  const projection = pageToProject(project, page);
+  const { project: edited, result } = fn(projection, args);
+  if (name === "describe_video" && result.ok) {
+    const data = result.data as Record<string, unknown>;
+    return {
+      project,
+      result: {
+        ok: true,
+        data: {
+          ...data,
+          // The projection's `name` is the PAGE name — surface the project's.
+          name: project.name ?? null,
+          carousel: carouselOverview(project),
+        },
+      },
+    };
+  }
+  if (!result.ok || edited === projection) return { project, result };
+  return { project: commitPageToCarousel(project, page.id, edited), result };
+};
+
 export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
       name: "describe_video",
       description:
-        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
+        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a carousel project the tree describes the ACTIVE page and the data carries a `carousel` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; add_page / delete_page / reorder_pages manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -8234,7 +8378,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_canvas_size",
       description:
-        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
+        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. On a carousel project this resizes the WHOLE carousel — every page shares the dims and reflows by the same factor. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
       parameters: {
         type: "object",
         properties: {

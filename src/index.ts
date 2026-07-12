@@ -6,8 +6,11 @@
 
 // ── Pure project core (no browser, no ffmpeg) ───────────────────────────────
 // Every Morpha tool as a pure (project, args) => { project, result } function,
-// plus the catalog metadata.
-export { dispatch, TOOL_DEFINITIONS } from "./core/tools.ts";
+// plus the catalog metadata. `dispatchOnProject` is the carousel-aware entry
+// point (the one the hosted HTTP/MCP surfaces route through): on a carousel
+// project it targets the active page for content tools and the record for page
+// management; on a video project it is byte-identical to `dispatch[name]`.
+export { dispatch, dispatchOnProject, TOOL_DEFINITIONS } from "./core/tools.ts";
 export type { ToolFunction, ToolResult, ToolDispatch } from "./core/tools.ts";
 
 // A blank, schema-valid project to start from.

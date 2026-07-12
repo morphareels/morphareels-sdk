@@ -1,5 +1,9 @@
 import { SCHEMA_VERSION, pageCompositionSchema, projectSchema } from "./schemas.ts";
 import type { PageComposition, Project } from "./schemas.ts";
+// Circular with ./tools.ts (which imports blankPage from here). Safe: each
+// module references the other's bindings only inside function bodies — never
+// during module evaluation — so ESM live bindings resolve them at call time.
+import { reflowComposition } from "./tools.ts";
 
 // Pure conversions between a carousel's inline `PageComposition` records and the
 // full `Project` the single-composition editor understands. A page is a FULL
@@ -94,6 +98,62 @@ export const projectToPage = (
   loop_start_frame: project.loop_start_frame,
   loop_end_frame: project.loop_end_frame,
 });
+
+// Fold an edited page projection back into its carousel record — the ONE
+// implementation of the commit logic, shared by the editor's carousel
+// controller (`commitActive`) and the headless dispatch wrapper
+// (`dispatchOnProject` in ./tools.ts). Pure: clones, never mutates `record`.
+// Three responsibilities:
+//   1. The page slot named by `pageId` takes `projectToPage(edited)`. An
+//      unknown `pageId` (the projected page was deleted) returns `record`
+//      unchanged — nothing to commit.
+//   2. The projection-carried project-level fields the user can mutate while
+//      a page is open — `collection`, `custom_fonts`, `embed_origins` — merge
+//      onto the RECORD's top level (`projectToPage` is a pure page-field
+//      whitelist, so page slots never grow project-level fields).
+//   3. Dims differing between `edited` and `record` mean the composition was
+//      RESIZED while this page was projected: the resize already reflowed the
+//      projection (its layers are captured by the fold in 1), but the record's
+//      dims and every OTHER page were untouched. Reflow each other page through
+//      the same `reflowComposition` the resize used — project it at the
+//      record's still-old dims, scale, fold back — and stamp the record's dims
+//      LAST so the branch is idempotent: the next commit sees matching dims and
+//      skips, so pages reflow exactly once per resize.
+export const commitPageToCarousel = (
+  record: Project,
+  pageId: string,
+  edited: Project,
+): Project => {
+  if (!record.carousel) return record;
+  const idx = record.carousel.pages.findIndex((p) => p.id === pageId);
+  if (idx === -1) return record;
+  const next = structuredClone(record) as Project;
+  const pages = next.carousel!.pages;
+  pages[idx] = projectToPage(pageId, edited);
+  next.collection = edited.collection;
+  next.custom_fonts = edited.custom_fonts;
+  next.embed_origins = edited.embed_origins;
+  if (
+    edited.canvas_width !== record.canvas_width ||
+    edited.canvas_height !== record.canvas_height
+  ) {
+    for (let i = 0; i < pages.length; i++) {
+      if (i === idx) continue;
+      // `record` still carries the old dims, so the projection lays out at the
+      // pre-resize size before reflowComposition scales it.
+      const projected = pageToProject(record, pages[i]);
+      const reflowed = reflowComposition(
+        projected,
+        edited.canvas_width,
+        edited.canvas_height,
+      );
+      pages[i] = projectToPage(pages[i].id, reflowed);
+    }
+    next.canvas_width = edited.canvas_width;
+    next.canvas_height = edited.canvas_height;
+  }
+  return next;
+};
 
 // A fresh empty page sized to the given canvas dims: one pinned `is_background`
 // image layer filling the canvas (mirrors `blankProject`'s backdrop) and empty
