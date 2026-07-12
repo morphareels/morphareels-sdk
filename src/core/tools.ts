@@ -23,14 +23,19 @@ import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 // every source the picker knows about is also discoverable via MCP.
 import {
   allFontEntries,
+  getFontEntry,
   type FontSource,
 } from "./font-sources.ts";
+import { blankPage } from "./carousel.ts";
+import { fitCurveBox } from "./curve-bbox.ts";
 import {
+  clampCurve,
   fillSchema,
   findLayerByElementId,
   findParentGroup,
   getGroupDescendants,
   isMorphaGroup,
+  materializeRootLayerOrder,
   projectSchema,
   resolveDefaultTextSize,
   resolveLayerTree,
@@ -45,13 +50,23 @@ import {
   type Keyframe,
   type LayerStyle,
   type LoopPass,
+  type PageComposition,
   type Project,
   type Shape,
   type ShapeKind,
+  type TextDecorations,
   type TextLayer,
   type TrackProperty,
   type VideoLayer,
 } from "./schemas.ts";
+import {
+  normalizeDecorations,
+  rebaseDecorations,
+} from "./text-decorations.ts";
+import {
+  computeContentDurationFrames,
+  computeContentDurationSeconds,
+} from "./content-duration.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -239,6 +254,9 @@ const VALID_PROPS: TrackProperty[] = [
   "scale",
   "rotation",
   "opacity",
+  // Text-only arc curve (degrees). Keyframe it to bend a title into a smile
+  // over time. Inert on non-text layers (only drawTextLayer reads it).
+  "curve",
 ];
 
 const VALID_EASINGS: Easing[] = [
@@ -617,6 +635,14 @@ export type InlineMorphaOptions = {
   /** Source project name, cached on the band for display (the only handle a
    *  user ever sees — ids stay hidden). */
   sourceName?: string;
+  /** Frame on the HOST timeline where the band is placed — its TIME ORIGIN. The
+   *  band gets a block starting here (spanning the source's content length), and
+   *  every descendant samples at `frame − blockStart`, so the embedded reel's
+   *  internal animation plays relative to where it's dropped (fixing "the intro
+   *  fires at 0:00 while the band is invisible"). Omit ⇒ the band is
+   *  always-present and its children play at absolute host frames (legacy). The
+   *  editor passes the current playhead; a headless caller may pass a frame. */
+  blockStart?: number;
 };
 
 // Inline `source`'s layers into `host` as a new EMBEDDED-MORPHA group — a
@@ -736,6 +762,10 @@ export const inlineMorpha = (
       name: displayName,
       pivotX: next.canvas_width / 2,
       pivotY: next.canvas_height / 2,
+      x: 0,
+      y: 0,
+      scale: 1,
+      rotation: 0,
       children: bandChildren,
       fill: bgFill,
       box_width: bgFill ? src.canvas_width : 0,
@@ -744,6 +774,18 @@ export const inlineMorpha = (
       source_version_id: opts.versionId,
       source_version_label: opts.versionLabel,
       source_morpha_name: displayName.length > 0 ? displayName : undefined,
+      // Place the band on the host timeline: its block start is the band's time
+      // origin (descendants sample at frame − start), and its duration is the
+      // source reel's content length so it plays as a clip. Omitted ⇒ blockless
+      // = always-present, children at absolute host frames (legacy behavior).
+      ...(opts.blockStart !== undefined
+        ? {
+            block: {
+              start: Math.max(0, Math.round(opts.blockStart)),
+              duration: Math.max(1, computeContentDurationFrames(source)),
+            },
+          }
+        : {}),
     },
   ];
   next.layer_order = [...next.layer_order, bandElementId];
@@ -937,12 +979,17 @@ export const pasteSubtree = (
   sub.image_layers.forEach((l) => claimMedia(l, "image"));
   sub.video_layers.forEach((l) => claimMedia(l, "video"));
 
+  // Materialize the dest's CURRENT root order before merging so the pasted
+  // root lands ON TOP: root ids missing from a partial layer_order render
+  // above the explicit list, so appending to it as-is would sink the paste
+  // under any layer still on the canonical fallback.
+  const rootOrder = materializeRootLayerOrder(next);
   next.image_layers = [...next.image_layers, ...sub.image_layers];
   next.video_layers = [...next.video_layers, ...sub.video_layers];
   next.text_layers = [...next.text_layers, ...sub.text_layers];
   next.shapes = [...next.shapes, ...sub.shapes];
   next.groups = [...next.groups, ...sub.groups];
-  next.layer_order = [...next.layer_order, rootElementId];
+  next.layer_order = [...rootOrder, rootElementId];
 
   if (offset !== 0) {
     bumpGroupFrameZero(next, rootElementId, "x", offset);
@@ -997,117 +1044,9 @@ const addMorphaLayer: ToolDispatch<AddMorphaLayerArgs> = (project, args) => {
   });
 };
 
-// Small collision-safe id minter against a running reserved set (per kind).
-const mintFreshId = (reserved: Set<string>): string => {
-  for (let i = 0; i < 100; i += 1) {
-    const buf = new Uint8Array(3);
-    crypto.getRandomValues(buf);
-    const id = Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
-    if (!reserved.has(id)) {
-      reserved.add(id);
-      return id;
-    }
-  }
-  throw new Error("mintFreshId: 100 collisions");
-};
-
-// Reconstruct the SOURCE project from an embedded band's (possibly edited)
-// children, so a host's local overrides can be published as a new version of
-// the source morpha. Each band descendant maps back to its original source id
-// via `source_layer_id`; host-added layers get fresh source ids; layers deleted
-// from the band simply don't appear. The band's GROUP-level transform stays
-// host-local (it's where the band sits in THIS video) and is not published; the
-// band's backdrop fill writes back onto the source's canvas background.
-export const rebuildSourceFromBand = (
-  currentSource: Project,
-  host: Project,
-  bandGroupId: string,
-): { project?: Project; error?: string } => {
-  const band = host.groups.find((g) => g.id === bandGroupId);
-  if (!band || !isMorphaGroup(band)) {
-    return { error: "not an embedded morpha band" };
-  }
-  const descendants = getGroupDescendants(host, bandGroupId);
-
-  const next = cloneProject(currentSource);
-  const bg = findBackgroundLayer(next);
-  const bgEid = bg ? `image.${bg.id}` : null;
-
-  // Replace the source's visual content with the band's — keep only the canvas
-  // backdrop (its fill updated from the band, if the band carries one).
-  next.image_layers = bg ? [bg] : [];
-  next.video_layers = [];
-  next.text_layers = [];
-  next.shapes = [];
-  next.groups = [];
-  if (bg && band.fill) bg.fill = structuredClone(band.fill);
-
-  const reserved: Record<LayerKind, Set<string>> = {
-    image: new Set(bg ? [bg.id] : []),
-    video: new Set(),
-    text: new Set(),
-    shapes: new Set(),
-    group: new Set(),
-  };
-
-  // host eid -> source eid for every descendant (prefer source_layer_id).
-  const remap = new Map<string, string>();
-  for (const eid of descendants) {
-    const kind = eid.slice(0, eid.indexOf(".")) as LayerKind;
-    const rec = findLayerByElementId(host, eid) as { source_layer_id?: string } | null;
-    const srcLid = rec?.source_layer_id;
-    let target: string;
-    if (srcLid && srcLid.startsWith(`${kind}.`)) {
-      const bare = srcLid.slice(srcLid.indexOf(".") + 1);
-      if (reserved[kind].has(bare)) target = `${kind}.${mintFreshId(reserved[kind])}`;
-      else {
-        reserved[kind].add(bare);
-        target = srcLid;
-      }
-    } else {
-      target = `${kind}.${mintFreshId(reserved[kind])}`;
-    }
-    remap.set(eid, target);
-  }
-  const mapEid = (eid: string): string => remap.get(eid) ?? eid;
-
-  for (const eid of descendants) {
-    const src = findLayerByElementId(host, eid);
-    if (!src) continue;
-    const kind = eid.slice(0, eid.indexOf(".")) as LayerKind;
-    const rec = structuredClone(src) as Record<string, unknown>;
-    const targetEid = mapEid(eid);
-    rec.id = targetEid.slice(targetEid.indexOf(".") + 1);
-    delete rec.source_layer_id;
-    delete rec.asset_project_id;
-    if (typeof rec.matte_source_id === "string") {
-      rec.matte_source_id = mapEid(rec.matte_source_id as string);
-    }
-    const fill = rec.fill as { type?: string; layer_id?: string } | null | undefined;
-    if (fill && fill.type === "mask" && typeof fill.layer_id === "string") {
-      fill.layer_id = mapEid(fill.layer_id);
-    }
-    if (kind === "group" && Array.isArray(rec.children)) {
-      rec.children = (rec.children as string[]).map(mapEid);
-    }
-    switch (kind) {
-      case "image": next.image_layers.push(rec as unknown as ImageLayer); break;
-      case "video": next.video_layers.push(rec as unknown as VideoLayer); break;
-      case "text": next.text_layers.push(rec as unknown as TextLayer); break;
-      case "shapes": next.shapes.push(rec as unknown as Shape); break;
-      case "group": next.groups.push(rec as unknown as Group); break;
-    }
-  }
-
-  // Source root order = the band's direct children (mapped), backdrop excluded.
-  next.layer_order = band.children.map(mapEid).filter((id) => id !== bgEid);
-
-  return { project: next };
-};
-
-// Replace an existing band's content with a fresh inline of the source's LATEST
-// state ("Update to Latest"), preserving the band's host placement (pivot,
-// transform tracks, name, colour label, z-order slot) and re-pinning it.
+// Replace an existing band's content with a fresh inline of a chosen source
+// snapshot (the version-picker re-pin), preserving the band's host placement
+// (pivot, transform tracks, name, colour label, z-order slot) and re-pinning it.
 export const replaceBand = (
   host: Project,
   bandGroupId: string,
@@ -1155,6 +1094,10 @@ export const replaceBand = (
     if (old.animations) newBand.animations = structuredClone(old.animations);
     if (old.style) newBand.style = structuredClone(old.style);
     if (old.color_label) newBand.color_label = old.color_label;
+    // Preserve the band's timeline placement (start = time origin, duration =
+    // window) across a re-pin, so re-pinning to another version keeps the band
+    // where the user dropped it — re-pin-safe by construction.
+    if (old.block) newBand.block = { ...old.block };
   }
   // Restore the band's original z-order slot (inlineMorpha appended it at end).
   inlined.layer_order = inlined.layer_order.filter((id) => id !== data.elementId);
@@ -1253,6 +1196,13 @@ type OverviewNode = {
   pivotX?: number;
   pivotY?: number;
   childCount?: number;
+  // Embedded-morpha provenance — present ONLY on a group that is an explicit
+  // embed (another project inlined as a version-pinned band), so an agent can
+  // tell an embed apart from a plain group. Absent on ordinary groups.
+  morpha?: true;
+  source_morpha_id?: string;
+  source_version_label?: string;
+  source_morpha_name?: string;
   animated?: string[];
   children?: OverviewNode[];
 };
@@ -1282,6 +1232,17 @@ const overviewNode = (
       pivotX: g.pivotX,
       pivotY: g.pivotY,
       childCount: g.children.length,
+      // Surface embed provenance so describe_video marks morpha bands explicitly
+      // (a plain group omits these). source_morpha_id stays for the agent to
+      // reference; ids are never shown to end users, but this is agent-facing.
+      ...(isMorphaGroup(g)
+        ? {
+            morpha: true as const,
+            source_morpha_id: g.source_morpha_id,
+            source_version_label: g.source_version_label,
+            source_morpha_name: g.source_morpha_name,
+          }
+        : {}),
       ...animField,
       children,
     };
@@ -1386,6 +1347,15 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
     canvas_width: project.canvas_width,
     canvas_height: project.canvas_height,
     duration_seconds: project.duration_seconds,
+    // Whether `duration_seconds` is an AUTHORED (pinned) length vs auto-fit to
+    // content. `content_duration_seconds` is the length auto-fit WOULD pick
+    // right now (the furthest keyframe / video window / audio end, 1s floor) —
+    // so the agent can see when an authored length differs from its content and
+    // decide between set_duration / fit_duration_to_content / cut_range.
+    duration_authored: project.duration_authored,
+    content_duration_seconds: computeContentDurationSeconds(project, {
+      floorSeconds: 1,
+    }),
     // Agent-facing summary of the canvas backdrop.
     background: bg
       ? { elementId: `image.${bg.id}`, name: bg.name, fill: bg.fill }
@@ -2410,32 +2380,34 @@ const addCurve: ToolDispatch<AddCurveArgs> = (project, args) => {
   const len = Math.hypot(dx, dy) || 1;
   const cxp = mx + (-dy / len) * bend;
   const cyp = my + (dx / len) * bend;
-  // Bbox bounds the three control points, padded for the stroke + arrowhead.
-  const pad = Math.max(sw * 2, 30);
-  const minX = Math.min(x1, x2, cxp) - pad;
-  const maxX = Math.max(x1, x2, cxp) + pad;
-  const minY = Math.min(y1, y2, cyp) - pad;
-  const maxY = Math.max(y1, y2, cyp) + pad;
-  const w = Math.max(1, maxX - minX);
-  const h = Math.max(1, maxY - minY);
-  const frac = (px: number, py: number) => ({
-    x: (px - minX) / w,
-    y: (py - minY) / h,
-  });
+  // Size the bbox to the curve's TRUE ink (a quadratic bezier only bulges
+  // halfway to its control point), not the raw control point — otherwise the
+  // box over-reserves the bend side and the arrow floats off into a corner of
+  // an oversized selection rect. `fitCurveBox` is the single source of truth
+  // for this geometry, shared with the editor's heal path so a created curve
+  // and a later-edited/legacy one agree. See src/curve-bbox.ts.
+  const fit = fitCurveBox(
+    [
+      { x: x1, y: y1 },
+      { x: cxp, y: cyp },
+      { x: x2, y: y2 },
+    ],
+    sw,
+  );
   const next = cloneProject(project);
   const id = generateLayerId(next, "shapes");
   const shape: Shape = {
     id,
     kind: "curve",
-    x: (minX + maxX) / 2,
-    y: (minY + maxY) / 2,
-    width: w,
-    height: h,
+    x: fit.x,
+    y: fit.y,
+    width: fit.width,
+    height: fit.height,
     fill: { type: "solid", color, opacity: 1 },
     rotation: 0,
     pivotX: 0.5,
     pivotY: 0.5,
-    points: [frac(x1, y1), frac(cxp, cyp), frac(x2, y2)],
+    points: fit.points,
     stroke_width: sw,
     arrow_head: head,
   };
@@ -3865,6 +3837,10 @@ const groupLayers: ToolDispatch<GroupLayersArgs> = (project, args) => {
       name: name ?? "",
       pivotX,
       pivotY,
+      x: 0,
+      y: 0,
+      scale: 1,
+      rotation: 0,
       children: orderedChildren,
       fill: null,
       box_width: 0,
@@ -4038,6 +4014,51 @@ const renameGroup: ToolDispatch<RenameGroupArgs> = (project, args) => {
   }
   next.groups[idx] = { ...next.groups[idx], name };
   return { project: next, result: { ok: true, data: { groupId, name } } };
+};
+
+// ---------------------------------------------------------------------------
+// add_to_collection / remove_from_collection
+// ---------------------------------------------------------------------------
+//
+// The Collection is a per-user library of reusable layers. `add_to_collection`
+// records an element id (ANY leaf or group) in THIS project's `collection`
+// list; that layer then appears in the user's Collection — and, if the project
+// is in a workspace, in every teammate's — where anyone can drop a
+// self-contained COPY of it into another project (list_collection /
+// add_from_collection). Copies are immutable: nothing links back.
+
+type CollectionArgs = { elementId: string };
+
+const addToCollection: ToolDispatch<CollectionArgs> = (project, args) => {
+  const { elementId } = args;
+  if (!elementId || typeof elementId !== "string") {
+    return { project, result: { ok: false, error: "elementId is required" } };
+  }
+  // Any leaf or group can be collected — the item is whatever that element is.
+  if (!findLayerByElementId(project, elementId)) {
+    return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
+  const current = project.collection ?? [];
+  if (current.includes(elementId)) {
+    return { project, result: { ok: true, data: { elementId, inCollection: true } } };
+  }
+  const next = cloneProject(project);
+  next.collection = [...current, elementId];
+  return { project: next, result: { ok: true, data: { elementId, inCollection: true } } };
+};
+
+const removeFromCollection: ToolDispatch<CollectionArgs> = (project, args) => {
+  const { elementId } = args;
+  if (!elementId || typeof elementId !== "string") {
+    return { project, result: { ok: false, error: "elementId is required" } };
+  }
+  const current = project.collection ?? [];
+  if (!current.includes(elementId)) {
+    return { project, result: { ok: true, data: { elementId, inCollection: false } } };
+  }
+  const next = cloneProject(project);
+  next.collection = current.filter((id) => id !== elementId);
+  return { project: next, result: { ok: true, data: { elementId, inCollection: false } } };
 };
 
 // ---------------------------------------------------------------------------
@@ -4377,6 +4398,485 @@ const setVideoLayerTrim: ToolDispatch<SetVideoLayerTrimArgs> = (
 };
 
 // ---------------------------------------------------------------------------
+// set_layer_block / move_band — timeline placement (blocks)
+// ---------------------------------------------------------------------------
+
+type SetLayerBlockArgs = {
+  elementId: string;
+  start: number;
+  duration: number;
+};
+
+// Set (or replace) a layer's timeline BLOCK — its [start, start+duration)
+// existence window. The layer is drawn only inside the window, and its
+// keyframes are sampled RELATIVE to `start`, so moving the block re-anchors its
+// animation. Works on any leaf or group (for a group, `start` is also the time
+// origin for its subtree when it's an embedded band). Frames are in the layer's
+// parent timeline (composition frames at root; band-local inside a band).
+const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
+  const { elementId, start, duration } = args;
+  if (!findLayerByElementId(project, elementId)) {
+    return {
+      project,
+      result: { ok: false, error: `layer not found: ${elementId}` },
+    };
+  }
+  if (!Number.isFinite(start) || start < 0) {
+    return { project, result: { ok: false, error: `invalid start: ${start}` } };
+  }
+  if (!Number.isFinite(duration) || duration < 1) {
+    return {
+      project,
+      result: { ok: false, error: `invalid duration (must be ≥ 1): ${duration}` },
+    };
+  }
+  const next = cloneProject(project);
+  const target = findLayerByElementId(next, elementId)!;
+  target.block = { start: Math.round(start), duration: Math.round(duration) };
+  return {
+    project: next,
+    result: { ok: true, data: { elementId, block: target.block } },
+  };
+};
+
+type MoveBandArgs = {
+  bandId: string;
+  start: number;
+};
+
+// Set an embedded morpha band's TIME ORIGIN (its block.start) — where the band
+// sits on the host timeline. The band's descendants play relative to `start`,
+// so the embedded reel's intro fires when the band appears instead of at 0:00.
+// Keeps the band's existing window length; if the band had no block yet, spans
+// from `start` to the composition end.
+const moveBand: ToolDispatch<MoveBandArgs> = (project, args) => {
+  const { bandId, start } = args;
+  const bare = bandId.startsWith("group.")
+    ? bandId.slice("group.".length)
+    : bandId;
+  const band = project.groups.find((g) => g.id === bare);
+  if (!band || !isMorphaGroup(band)) {
+    return {
+      project,
+      result: { ok: false, error: `not an embedded morpha band: ${bandId}` },
+    };
+  }
+  if (!Number.isFinite(start) || start < 0) {
+    return { project, result: { ok: false, error: `invalid start: ${start}` } };
+  }
+  const next = cloneProject(project);
+  const target = next.groups.find((g) => g.id === bare)!;
+  const roundedStart = Math.round(start);
+  const duration = target.block
+    ? target.block.duration
+    : Math.max(1, computeContentDurationFrames(next) - roundedStart);
+  target.block = { start: roundedStart, duration };
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { elementId: `group.${bare}`, block: target.block },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Composition length — set_duration / fit_duration_to_content / cut_range
+// ---------------------------------------------------------------------------
+//
+// `project.duration_seconds` is normally DERIVED: the editor + worker auto-fit
+// it to the furthest content (see src/content-duration.ts). `duration_authored`
+// pins an explicit length instead. These three pure tools are the headless
+// equivalents of the editor affordances — the timeline end-handle drag
+// (setAuthoredDurationFrames), "fit to content" (fitDurationToContent), and a
+// ripple-delete — so an agent can shorten / fix / cut a comp without the editor.
+
+const DURATION_FPS = 30;
+const MAX_DURATION_SECONDS = 600;
+
+// Clamp the loop region into a composition that is `endFrame` frames long.
+// `endFrame` is a frame COUNT (>= 1). Mutates the (already-cloned) project in
+// place so the clamp lives in exactly one spot across the three tools. Mirrors
+// the loop-clamp in store.ts setAuthoredDurationFrames / fitDurationToContent.
+const clampLoopRegionToLength = (project: Project, endFrame: number): void => {
+  if (project.loop_start_frame > endFrame - 1) {
+    project.loop_start_frame = Math.max(0, endFrame - 1);
+  }
+  if (project.loop_end_frame !== null && project.loop_end_frame > endFrame) {
+    project.loop_end_frame = endFrame;
+  }
+};
+
+type SetDurationArgs = { seconds?: unknown };
+
+const setDuration: ToolDispatch<SetDurationArgs> = (project, args) => {
+  const { seconds } = args;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `seconds must be a finite number > 0: ${seconds}`,
+      },
+    };
+  }
+  const clamped = Math.max(1, Math.min(MAX_DURATION_SECONDS, seconds));
+  const next = cloneProject(project);
+  next.duration_authored = true;
+  next.duration_seconds = clamped;
+  const endFrame = Math.max(1, Math.round(clamped * DURATION_FPS));
+  clampLoopRegionToLength(next, endFrame);
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { duration_seconds: clamped, duration_authored: true },
+    },
+  };
+};
+
+const fitDurationToContent: ToolDispatch<Record<string, never>> = (project) => {
+  const next = cloneProject(project);
+  next.duration_authored = false;
+  const fitted = Math.max(
+    1,
+    Math.min(
+      MAX_DURATION_SECONDS,
+      computeContentDurationSeconds(next, { floorSeconds: 1 }),
+    ),
+  );
+  next.duration_seconds = fitted;
+  const endFrame = Math.max(1, Math.round(fitted * DURATION_FPS));
+  clampLoopRegionToLength(next, endFrame);
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { duration_seconds: fitted, duration_authored: false },
+    },
+  };
+};
+
+type CutRangeArgs = { startFrame?: unknown; endFrame?: unknown };
+
+const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
+  const FPS = DURATION_FPS;
+  const rawStart = args.startFrame;
+  const rawEnd = args.endFrame;
+  if (typeof rawStart !== "number" || !Number.isFinite(rawStart)) {
+    return { project, result: { ok: false, error: `invalid startFrame: ${rawStart}` } };
+  }
+  if (typeof rawEnd !== "number" || !Number.isFinite(rawEnd)) {
+    return { project, result: { ok: false, error: `invalid endFrame: ${rawEnd}` } };
+  }
+  const start = Math.round(rawStart);
+  let end = Math.round(rawEnd);
+  if (start < 0) {
+    return { project, result: { ok: false, error: `startFrame must be >= 0: ${start}` } };
+  }
+  if (end <= start) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `endFrame (${end}) must be greater than startFrame (${start})`,
+      },
+    };
+  }
+  const oldDurationSeconds = project.duration_seconds;
+  const durFrames = Math.ceil(oldDurationSeconds * FPS);
+  end = Math.min(end, durFrames);
+  if (end <= start || start >= durFrames) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "cut range is empty or outside the composition",
+      },
+    };
+  }
+  const delta = end - start;
+
+  // Ripple-delete map for a project-timeline frame: content before the cut
+  // stays, content inside the cut collapses to `start`, content after shifts
+  // earlier by `delta`.
+  const phi = (f: number): number => (f < start ? f : f < end ? start : f - delta);
+
+  // Timeline window [ws, we) a video layer occupies. we = Infinity for a
+  // null (natural-end) out-point — its real length is unmeasurable headless.
+  const videoWs = (l: VideoLayer): number => l.timeline_start_frame;
+  const videoWe = (l: VideoLayer): number =>
+    l.source_out_frame === null
+      ? Infinity
+      : l.timeline_start_frame + (l.source_out_frame - l.source_in_frame);
+
+  // Refusal check FIRST (before any mutation): a ripple-cut across a
+  // speed-ramped video layer would misalign its remapped time, so refuse it.
+  for (const layer of project.video_layers) {
+    if ((layer.speed_keyframes?.length ?? 0) === 0) continue;
+    const ws = videoWs(layer);
+    const we = videoWe(layer);
+    const ovStart = Math.max(start, ws);
+    const ovEnd = Math.min(end, we);
+    if (ovStart < ovEnd) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error: `cannot ripple-cut across a speed-ramped video layer video.${layer.id}; remove its speed keyframes or cut outside its span`,
+        },
+      };
+    }
+  }
+
+  const next = cloneProject(project);
+
+  // Point-event keyframes: drop the ones inside the cut, shift the survivors
+  // through phi. Generic over numeric Keyframe[] and colour ColorKeyframe[].
+  const shiftKeyframes = <T extends { frame: number }>(arr: T[]): T[] =>
+    arr
+      .filter((kf) => !(kf.frame >= start && kf.frame < end))
+      .map((kf) => ({ ...kf, frame: phi(kf.frame) }));
+  // The two halves of an interior split partition the SAME track by side of the
+  // cut: the left keeps the pre-cut keyframes verbatim (phi is the identity
+  // below `start`), the right keeps the post-cut keyframes shifted by -delta.
+  const leftKeyframes = <T extends { frame: number }>(arr: T[]): T[] =>
+    arr.filter((kf) => kf.frame < start);
+  const rightKeyframes = <T extends { frame: number }>(arr: T[]): T[] =>
+    arr.filter((kf) => kf.frame >= end).map((kf) => ({ ...kf, frame: kf.frame - delta }));
+
+  // Rebuild a tracks map (animations / color_tracks) through `pick`, dropping
+  // any property whose array empties out. Returns a fresh partial record.
+  const pickTracks = <K extends string, V extends { frame: number }>(
+    tracks: Partial<Record<K, V[]>>,
+    pick: (arr: V[]) => V[],
+  ): Partial<Record<K, V[]>> => {
+    const out: Partial<Record<K, V[]>> = {};
+    for (const key of Object.keys(tracks) as K[]) {
+      const arr = tracks[key];
+      if (!arr) continue;
+      const kept = pick(arr);
+      if (kept.length > 0) out[key] = kept;
+    }
+    return out;
+  };
+
+  // Apply a keyframe-array transform to a leaf/group's own animations +
+  // color_tracks in place, deleting a map that fully empties out.
+  const remapLayerTracks = (
+    layer: { animations?: ElementTracks; color_tracks?: ElementColorTracks },
+    pick: <T extends { frame: number }>(arr: T[]) => T[],
+  ): void => {
+    if (layer.animations) {
+      const anims = pickTracks(layer.animations, pick);
+      if (Object.keys(anims).length > 0) layer.animations = anims;
+      else delete layer.animations;
+    }
+    if (layer.color_tracks) {
+      const cts = pickTracks(layer.color_tracks, pick);
+      if (Object.keys(cts).length > 0) layer.color_tracks = cts;
+      else delete layer.color_tracks;
+    }
+  };
+
+  const remapSpeedKeyframes = (
+    layer: VideoLayer,
+    pick: <T extends { frame: number }>(arr: T[]) => T[],
+  ): void => {
+    if (!layer.speed_keyframes || layer.speed_keyframes.length === 0) return;
+    const kept = pick(layer.speed_keyframes);
+    if (kept.length > 0) layer.speed_keyframes = kept;
+    else delete layer.speed_keyframes;
+  };
+
+  // 1. Non-video layers: numeric + colour keyframe tracks.
+  for (const layer of [
+    ...next.image_layers,
+    ...next.text_layers,
+    ...next.shapes,
+    ...next.groups,
+  ]) {
+    remapLayerTracks(layer, shiftKeyframes);
+  }
+
+  // 2. Markers: drop inside, shift survivors.
+  next.markers = next.markers
+    .filter((m) => !(m.frame >= start && m.frame < end))
+    .map((m) => ({ ...m, frame: phi(m.frame) }));
+
+  // 3. Video layers — source-aware. A layer overlapping the cut is trimmed,
+  // fully covered → deleted, or (interior cut) SPLIT into two. Iterate a
+  // snapshot; `layer` references live in next.video_layers, so in-place edits
+  // land, and split right-halves are appended immediately (so generateLayerId
+  // sees them and keeps ids unique across several splits).
+  const deletedVideoIds: string[] = [];
+  const splitInserts: Array<{ after: string; elementId: string }> = [];
+  let splitCount = 0;
+  const pruneIfEmptyVideo = (layer: VideoLayer): void => {
+    // Only prune a video that is PROVABLY empty (finite window collapsed). A
+    // null out-point is a natural-end half whose real length is unknown here —
+    // never prune it.
+    if (
+      layer.source_out_frame !== null &&
+      layer.source_in_frame >= layer.source_out_frame
+    ) {
+      deletedVideoIds.push(`video.${layer.id}`);
+    }
+  };
+  for (const layer of [...next.video_layers]) {
+    const ws = videoWs(layer);
+    const finiteEnd = layer.source_out_frame !== null;
+    const we = videoWe(layer);
+    const ovStart = Math.max(start, ws);
+    const ovEnd = Math.min(end, we);
+
+    if (end <= ws) {
+      // Entirely after the cut → shift earlier.
+      layer.timeline_start_frame = ws - delta;
+      remapLayerTracks(layer, shiftKeyframes);
+      remapSpeedKeyframes(layer, shiftKeyframes);
+      continue;
+    }
+    if (finiteEnd && start >= we) {
+      // Entirely before the cut → untouched (its frames are all < start).
+      remapLayerTracks(layer, shiftKeyframes);
+      remapSpeedKeyframes(layer, shiftKeyframes);
+      continue;
+    }
+    // Overlap (ovStart < ovEnd). Speed-ramped overlaps were refused above.
+    if (ovStart === ws && finiteEnd && ovEnd === we) {
+      // Whole window inside the cut → delete the layer.
+      deletedVideoIds.push(`video.${layer.id}`);
+      continue;
+    }
+    if (ovStart > ws && finiteEnd && ovEnd === we) {
+      // Tail-trim: keep [ws, ovStart).
+      layer.source_out_frame = layer.source_in_frame + (ovStart - ws);
+      remapLayerTracks(layer, shiftKeyframes);
+      remapSpeedKeyframes(layer, shiftKeyframes);
+      pruneIfEmptyVideo(layer);
+      continue;
+    }
+    if (ovStart === ws && ovEnd < we) {
+      // Head-trim: drop the front; content from ovEnd now plays at ovEnd-delta.
+      layer.source_in_frame = layer.source_in_frame + (ovEnd - ws);
+      layer.timeline_start_frame = ovEnd - delta;
+      remapLayerTracks(layer, shiftKeyframes);
+      remapSpeedKeyframes(layer, shiftKeyframes);
+      pruneIfEmptyVideo(layer);
+      continue;
+    }
+    // Interior split: ws < start, end < we. Left keeps [ws, ovStart); right
+    // plays [ovEnd, we) at ovEnd-delta.
+    const rightId = generateLayerId(next, "video");
+    const right: VideoLayer = {
+      ...structuredClone(layer),
+      id: rightId,
+      source_in_frame: layer.source_in_frame + (ovEnd - ws),
+      timeline_start_frame: ovEnd - delta,
+      // source_out_frame inherited (may be null → keeps the natural end).
+    };
+    remapLayerTracks(right, rightKeyframes);
+    remapSpeedKeyframes(right, rightKeyframes);
+    // Left: tail-trim + keep only the pre-cut tracks.
+    layer.source_out_frame = layer.source_in_frame + (ovStart - ws);
+    remapLayerTracks(layer, leftKeyframes);
+    remapSpeedKeyframes(layer, leftKeyframes);
+    next.video_layers.push(right);
+    splitInserts.push({ after: `video.${layer.id}`, elementId: `video.${rightId}` });
+    splitCount += 1;
+    // Both halves are provably non-empty for an interior cut, but guard anyway.
+    pruneIfEmptyVideo(right);
+    pruneIfEmptyVideo(layer);
+  }
+
+  // Place each split's right half adjacent to its left in layer_order and, if
+  // the source layer was nested, in the parent group's children.
+  for (const ins of splitInserts) {
+    const loIdx = next.layer_order.indexOf(ins.after);
+    if (loIdx >= 0) next.layer_order.splice(loIdx + 1, 0, ins.elementId);
+    else next.layer_order.push(ins.elementId);
+    for (const g of next.groups) {
+      const cIdx = g.children.indexOf(ins.after);
+      if (cIdx >= 0) {
+        g.children.splice(cIdx + 1, 0, ins.elementId);
+        break;
+      }
+    }
+  }
+
+  // Splice out deleted / pruned video layers and purge their dangling refs.
+  for (const eid of deletedVideoIds) {
+    const bare = eid.slice("video.".length);
+    next.video_layers = next.video_layers.filter((v) => v.id !== bare);
+    purgeElementId(next, eid);
+  }
+
+  // 4. Audio overlays. Interval events: drop those fully inside the cut, else
+  // clamp both ends through phi (interior audio is truncated at the seam — an
+  // overlay has no source-in to bridge the removed span). Drop a clamp that
+  // leaves an empty interval.
+  next.audio_overlays = next.audio_overlays
+    .filter(
+      (o) =>
+        !(start <= o.startFrame && o.endFrame !== undefined && o.endFrame <= end),
+    )
+    .map((o) => {
+      const shifted: AudioOverlay = { ...o, startFrame: phi(o.startFrame) };
+      if (o.endFrame !== undefined) shifted.endFrame = phi(o.endFrame);
+      return shifted;
+    })
+    .filter((o) => o.endFrame === undefined || o.endFrame > o.startFrame);
+
+  // 5. Loop region. Shift both edges through phi; if they collapse (equal or
+  // inverted, which also covers the loop_end min-1 floor) reset to "whole comp".
+  next.loop_start_frame = phi(next.loop_start_frame);
+  next.loop_end_frame =
+    next.loop_end_frame === null ? null : phi(next.loop_end_frame);
+  if (
+    next.loop_end_frame !== null &&
+    next.loop_end_frame <= next.loop_start_frame
+  ) {
+    next.loop_start_frame = 0;
+    next.loop_end_frame = null;
+  }
+
+  // 6. Duration bake. Authored: subtract only the overlap of the cut with the
+  // currently-visible region (content past an authored end isn't played, so
+  // cutting it must not shrink the stage). Auto-fit: subtract the whole delta
+  // (recompute on next editor open refines it against real media lengths).
+  const oldDurFrames = Math.round(oldDurationSeconds * FPS);
+  if (next.duration_authored) {
+    const visibleOverlap = Math.max(
+      0,
+      Math.min(end, oldDurFrames) - Math.min(start, oldDurFrames),
+    );
+    next.duration_seconds = Math.max(1, oldDurationSeconds - visibleOverlap / FPS);
+  } else {
+    next.duration_seconds = Math.max(1, oldDurationSeconds - delta / FPS);
+  }
+  const newDurationSeconds = next.duration_seconds;
+
+  // 7. Poster timestamp (seconds): shift through phi in frame space, clamp in.
+  if (next.start_at !== null) {
+    const shifted = phi(Math.round(next.start_at * FPS)) / FPS;
+    next.start_at = Math.max(0, Math.min(newDurationSeconds, shifted));
+  }
+
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        duration_seconds: next.duration_seconds,
+        delta_frames: delta,
+        split_layers: splitCount,
+      },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
 // set_embed_origins / add_embed_origin / remove_embed_origin
 // ---------------------------------------------------------------------------
 //
@@ -4428,18 +4928,22 @@ const setEmbedOrigins: ToolDispatch<SetEmbedOriginsArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
-// set_custom_font — register a custom (non-Google) typeface on the project
+// set_custom_font — register a typeface Morpha does not ship
 // ---------------------------------------------------------------------------
 //
 // Adds (or replaces) an entry in project.custom_fonts so text layers can use it
-// by `family` via their font_family, exactly like a Google family. `src` is
-// EITHER a full URL (https://…, data:…) OR an uploaded asset filename in the
-// project's asset bucket (uploaded via /api/upload-asset). Like add_image_layer
-// this does NOT verify an uploaded filename exists. Dedupes by family+weight+
-// style, replacing a matching face. The editor/embed font loader (fonts.ts)
-// decodes each via the FontFace API before the first render. NOTE: a pasted URL
-// only loads if that host sends permissive CORS headers; uploading the font
-// (served same-origin) is the robust path.
+// by `family` via their font_family, exactly like a built-in family. Families
+// already in the built-in catalogues (Google/Bunny/Fontshare/Fontsource/
+// Velvetyne) are REJECTED: they load through the catalogue path by name alone,
+// and a custom_fonts duplicate would shadow that reliable loader with a
+// second source of truth. `src` is EITHER a full URL (https://…, data:…) OR an
+// uploaded asset filename in the project's asset bucket (uploaded via
+// /api/upload-asset). Like add_image_layer this does NOT verify an uploaded
+// filename exists. Dedupes by family+weight+style, replacing a matching face.
+// The editor/embed font loader (fonts.ts) decodes each via the FontFace API
+// before the first render. NOTE: a pasted URL only loads if that host sends
+// permissive CORS headers; uploading the font (served same-origin) is the
+// robust path.
 
 type SetCustomFontArgs = {
   family?: unknown;
@@ -4460,6 +4964,20 @@ const setCustomFont: ToolDispatch<SetCustomFontArgs> = (project, args) => {
       result: {
         ok: false,
         error: "src is required (a font URL or an uploaded asset filename)",
+      },
+    };
+  }
+  const builtin = getFontEntry(family);
+  if (builtin) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error:
+          `"${family}" is a built-in ${builtin.source} family — reference it ` +
+          `directly via font_family (add_text_layer / set_layer_text); ` +
+          `set_custom_font is only for typefaces Morpha does not ship. ` +
+          `Use list_fonts to browse built-in families.`,
       },
     };
   }
@@ -4889,6 +5407,46 @@ const DEFAULT_TEXT_FONT = "Hanken Grotesk";
 // Validate + assign the optional text-style props shared by set_layer_text and
 // add_text_layer. Mutates `layer`; returns an error message on the first bad
 // field, else null.
+// Validate a `decorations` tool arg into a normalized TextDecorations (or
+// undefined to clear). Returns an error string on a malformed shape. Offsets are
+// character indices [start, end) into the layer's `text`.
+const parseDecorationsArg = (
+  v: unknown,
+): TextDecorations | undefined | string => {
+  if (v === null) return undefined; // explicit clear
+  if (typeof v !== "object") {
+    return "decorations must be an object { underline?, strikethrough? } or null";
+  }
+  const obj = v as Record<string, unknown>;
+  const out: TextDecorations = {};
+  for (const kind of ["underline", "strikethrough"] as const) {
+    const list = obj[kind];
+    if (list === undefined) continue;
+    if (!Array.isArray(list)) {
+      return `decorations.${kind} must be an array of { start, end } ranges`;
+    }
+    const ranges: { start: number; end: number }[] = [];
+    for (const r of list) {
+      const rr = r as Record<string, unknown>;
+      if (
+        typeof r !== "object" ||
+        r === null ||
+        typeof rr.start !== "number" ||
+        typeof rr.end !== "number" ||
+        !Number.isFinite(rr.start) ||
+        !Number.isFinite(rr.end)
+      ) {
+        return `decorations.${kind} ranges must be { start: number, end: number }`;
+      }
+      ranges.push({ start: rr.start, end: rr.end });
+    }
+    out[kind] = ranges;
+  }
+  // normalizeDecorations sorts/merges/drops invalid ranges and returns undefined
+  // when nothing is left, so a clear round-trips to no field.
+  return normalizeDecorations(out);
+};
+
 const applyTextStyleProps = (
   layer: TextLayer,
   args: Record<string, unknown>,
@@ -4919,6 +5477,15 @@ const applyTextStyleProps = (
       return "letter_spacing must be a number";
     }
     layer.letter_spacing = v;
+  }
+  if (args.curve !== undefined) {
+    const v = args.curve;
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      return "curve must be a number (degrees; 0 = straight)";
+    }
+    // Clamp to the legible range; store the bounded value so downstream reads
+    // (renderer, Inspector) never see an out-of-range curve.
+    layer.curve = clampCurve(v);
   }
   if (args.line_height !== undefined) {
     const v = args.line_height;
@@ -4994,6 +5561,12 @@ const applyTextStyleProps = (
       return "text_shadow must be an object or null";
     }
   }
+  if (args.decorations !== undefined) {
+    const parsed = parseDecorationsArg(args.decorations);
+    if (typeof parsed === "string") return parsed;
+    if (parsed) layer.decorations = parsed;
+    else delete layer.decorations;
+  }
   return null;
 };
 
@@ -5007,11 +5580,13 @@ type SetLayerTextArgs = {
   font_style?: unknown;
   text_transform?: unknown;
   letter_spacing?: unknown;
+  curve?: unknown;
   line_height?: unknown;
   text_align?: unknown;
   stroke_width?: unknown;
   stroke_color?: unknown;
   text_shadow?: unknown;
+  decorations?: unknown;
 };
 
 const setLayerText: ToolDispatch<SetLayerTextArgs> = (project, args) => {
@@ -5043,6 +5618,18 @@ const setLayerText: ToolDispatch<SetLayerTextArgs> = (project, args) => {
         project,
         result: { ok: false, error: "text must be a string" },
       };
+    }
+    // Rebase existing decoration offsets across the text edit, UNLESS the caller
+    // also supplies a fresh `decorations` set (applied authoritatively below,
+    // indexing into the new text).
+    if (
+      layer.decorations &&
+      args.decorations === undefined &&
+      text !== layer.text
+    ) {
+      const rebased = rebaseDecorations(layer.text, text, layer.decorations);
+      if (rebased) layer.decorations = rebased;
+      else delete layer.decorations;
     }
     layer.text = text;
   }
@@ -5096,10 +5683,12 @@ const setLayerText: ToolDispatch<SetLayerTextArgs> = (project, args) => {
         font_style: layer.font_style ?? null,
         text_transform: layer.text_transform ?? null,
         letter_spacing: layer.letter_spacing ?? null,
+        curve: layer.curve ?? 0,
         line_height: layer.line_height ?? null,
         text_align: layer.text_align ?? null,
         stroke_width: layer.stroke_width ?? null,
         stroke_color: layer.stroke_color ?? null,
+        decorations: layer.decorations ?? null,
       },
     },
   };
@@ -5127,11 +5716,13 @@ type AddTextLayerArgs = {
   font_style?: unknown;
   text_transform?: unknown;
   letter_spacing?: unknown;
+  curve?: unknown;
   line_height?: unknown;
   text_align?: unknown;
   stroke_width?: unknown;
   stroke_color?: unknown;
   text_shadow?: unknown;
+  decorations?: unknown;
 };
 
 const DEFAULT_TEXT_W = 900;
@@ -5212,6 +5803,9 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
     width: typeof width === "number" ? width : DEFAULT_TEXT_W,
     height: typeof height === "number" ? height : DEFAULT_TEXT_H,
     rotation: 0,
+    // Straight by default; an explicit `curve` arg is applied via
+    // applyTextStyleProps below (mirrors how `rotation` seeds 0 here).
+    curve: 0,
     pivotX: 0.5,
     pivotY: 0.5,
     font_family:
@@ -5383,6 +5977,15 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
     const tl = proj.text_layers.find((t) => t.id === id);
     if (tl) tl.name = name;
   };
+  const setBlock = (
+    proj: Project,
+    elementId: string,
+    block: { start: number; duration: number },
+  ) => {
+    const id = elementId.slice("text.".length);
+    const tl = proj.text_layers.find((t) => t.id === id);
+    if (tl) tl.block = block;
+  };
 
   if (mode === "static") {
     const out = addTextLayer(cur, {
@@ -5394,32 +5997,43 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
     const elementId = (out.result.data as { elementId: string }).elementId;
     setName(cur, elementId, CAPTION_LAYER_NAME);
     created.push(elementId);
-    return {
-      project: cur,
-      result: { ok: true, data: { elementIds: created, count: 1, mode } },
-    };
+  } else {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const out = addTextLayer(cur, { ...baseTextArgs, text: line.text });
+      if (!out.result.ok) return out;
+      cur = out.project;
+      const elementId = (out.result.data as { elementId: string }).elementId;
+      setName(cur, elementId, `${CAPTION_LAYER_NAME} ${i + 1}`);
+      created.push(elementId);
+      // The caption line's on-timeline window is a BLOCK: it exists only during
+      // [startFrame, endFrame). No opacity envelope — the block IS the
+      // visibility, so a 40-line track is 40 blocks, not 120 hold keyframes.
+      setBlock(cur, elementId, {
+        start: line.startFrame,
+        duration: Math.max(1, line.endFrame - line.startFrame),
+      });
+    }
   }
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const out = addTextLayer(cur, { ...baseTextArgs, text: line.text });
-    if (!out.result.ok) return out;
-    cur = out.project;
-    const elementId = (out.result.data as { elementId: string }).elementId;
-    setName(cur, elementId, `${CAPTION_LAYER_NAME} ${i + 1}`);
-    created.push(elementId);
-    // Hold-eased opacity: hidden until startFrame, on through the window, off
-    // after. (hold easing holds the boundary value past each keyframe.)
-    if (line.startFrame > 0) {
-      upsertKeyframe(cur, elementId, "opacity", 0, 0, "hold");
-    }
-    upsertKeyframe(cur, elementId, "opacity", line.startFrame, 1, "hold");
-    upsertKeyframe(cur, elementId, "opacity", line.endFrame, 0, "hold");
+  // Always wrap the caption layers in a "captions" group so a track never
+  // clutters the layers list — the user collapses one group instead of wading
+  // through every line. The layers were all just created at root, so they share
+  // a parent (the group_layers same-parent invariant holds). buildCaptionsForClip
+  // consumes the returned groupElementId rather than grouping a second time.
+  let groupElementId: string | undefined;
+  const grouped = groupLayers(cur, { elementIds: created, name: "captions" });
+  if (grouped.result.ok) {
+    cur = grouped.project;
+    groupElementId = (grouped.result.data as { elementId: string }).elementId;
   }
 
   return {
     project: cur,
-    result: { ok: true, data: { elementIds: created, count: created.length, mode } },
+    result: {
+      ok: true,
+      data: { elementIds: created, count: created.length, mode, groupElementId },
+    },
   };
 };
 
@@ -5782,6 +6396,204 @@ const setImageFilename: ToolDispatch<SetImageFilenameArgs> = (project, args) => 
 };
 
 // ---------------------------------------------------------------------------
+// add_page
+// ---------------------------------------------------------------------------
+//
+// Append a page to a carousel. With duplicate_index, deep-clones that page
+// (minting a fresh id); otherwise appends a blank page sized to the locked
+// aspect. Sets active_index to the new page and returns its index.
+
+type AddPageArgs = { name?: unknown; duplicate_index?: unknown };
+
+const addPage: ToolDispatch<AddPageArgs> = (project, args) => {
+  if (project.mode !== "carousel" || !project.carousel) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "add_page requires a carousel morpha",
+      },
+    };
+  }
+  const { name, duplicate_index } = args;
+  if (name !== undefined && typeof name !== "string") {
+    return {
+      project,
+      result: { ok: false, error: "name must be a string" },
+    };
+  }
+  const pages = project.carousel.pages;
+  let page: PageComposition;
+  if (duplicate_index !== undefined) {
+    if (
+      typeof duplicate_index !== "number" ||
+      !Number.isInteger(duplicate_index) ||
+      duplicate_index < 0 ||
+      duplicate_index >= pages.length
+    ) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error: `duplicate_index must be an integer in [0, ${pages.length - 1}]`,
+        },
+      };
+    }
+    page = structuredClone(pages[duplicate_index]) as PageComposition;
+    page.id = crypto.randomUUID();
+    if (name !== undefined) page.name = name;
+  } else {
+    page = blankPage(project.canvas_width, project.canvas_height, name);
+  }
+  const next = cloneProject(project);
+  const carousel = next.carousel;
+  if (!carousel) {
+    return {
+      project,
+      result: { ok: false, error: "carousel record missing after clone" },
+    };
+  }
+  carousel.pages.push(page);
+  const index = carousel.pages.length - 1;
+  carousel.active_index = index;
+  return {
+    project: next,
+    result: { ok: true, data: { index, page_count: carousel.pages.length } },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// delete_page
+// ---------------------------------------------------------------------------
+//
+// Remove a page from a carousel. Refuses to drop below 1 page. The active
+// page is tracked by id across the splice — deleting a page before it must
+// not silently retarget active_index at a different page. Only when the
+// active page itself is deleted does active_index fall to the page that slid
+// into its position (or the new last page).
+
+type DeletePageArgs = { index?: unknown };
+
+const deletePage: ToolDispatch<DeletePageArgs> = (project, args) => {
+  if (project.mode !== "carousel" || !project.carousel) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "delete_page requires a carousel morpha",
+      },
+    };
+  }
+  const { index } = args;
+  const pages = project.carousel.pages;
+  if (
+    typeof index !== "number" ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= pages.length
+  ) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `index must be an integer in [0, ${pages.length - 1}]`,
+      },
+    };
+  }
+  if (pages.length <= 1) {
+    return {
+      project,
+      result: { ok: false, error: "a carousel must keep at least 1 page" },
+    };
+  }
+  const next = cloneProject(project);
+  const carousel = next.carousel;
+  if (!carousel) {
+    return {
+      project,
+      result: { ok: false, error: "carousel record missing after clone" },
+    };
+  }
+  const activePageId = carousel.pages[carousel.active_index]?.id;
+  carousel.pages.splice(index, 1);
+  const survivingIndex = carousel.pages.findIndex(
+    (p) => p.id === activePageId,
+  );
+  carousel.active_index =
+    survivingIndex >= 0
+      ? survivingIndex
+      : Math.min(index, carousel.pages.length - 1);
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        index,
+        active_index: carousel.active_index,
+        page_count: carousel.pages.length,
+      },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// reorder_pages
+// ---------------------------------------------------------------------------
+//
+// Move a page from one position to another. active_index is rewritten so it
+// keeps pointing at the same page it did before the move.
+
+type ReorderPagesArgs = { from_index?: unknown; to_index?: unknown };
+
+const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
+  if (project.mode !== "carousel" || !project.carousel) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "reorder_pages requires a carousel morpha",
+      },
+    };
+  }
+  const { from_index, to_index } = args;
+  const pages = project.carousel.pages;
+  const validIndex = (n: unknown): n is number =>
+    typeof n === "number" && Number.isInteger(n) && n >= 0 && n < pages.length;
+  if (!validIndex(from_index) || !validIndex(to_index)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `from_index and to_index must be integers in [0, ${pages.length - 1}]`,
+      },
+    };
+  }
+  const next = cloneProject(project);
+  const carousel = next.carousel;
+  if (!carousel) {
+    return {
+      project,
+      result: { ok: false, error: "carousel record missing after clone" },
+    };
+  }
+  const activeId = carousel.pages[carousel.active_index].id;
+  const [moved] = carousel.pages.splice(from_index, 1);
+  carousel.pages.splice(to_index, 0, moved);
+  carousel.active_index = carousel.pages.findIndex((p) => p.id === activeId);
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        from_index,
+        to_index,
+        active_index: carousel.active_index,
+      },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
 // Catalog + dispatch table
 // ---------------------------------------------------------------------------
 
@@ -5817,11 +6629,18 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   ungroup_layers: ungroupLayers as ToolDispatch<never>,
   set_group_parent: setGroupParent as ToolDispatch<never>,
   rename_group: renameGroup as ToolDispatch<never>,
+  add_to_collection: addToCollection as ToolDispatch<never>,
+  remove_from_collection: removeFromCollection as ToolDispatch<never>,
   add_morpha_layer: addMorphaLayer as ToolDispatch<never>,
   add_audio_overlay: addAudioOverlay as ToolDispatch<never>,
   remove_audio_overlay: removeAudioOverlay as ToolDispatch<never>,
   update_audio_overlay: updateAudioOverlay as ToolDispatch<never>,
   set_video_layer_trim: setVideoLayerTrim as ToolDispatch<never>,
+  set_layer_block: setLayerBlock as ToolDispatch<never>,
+  move_band: moveBand as ToolDispatch<never>,
+  set_duration: setDuration as ToolDispatch<never>,
+  fit_duration_to_content: fitDurationToContent as ToolDispatch<never>,
+  cut_range: cutRange as ToolDispatch<never>,
   set_embed_origins: setEmbedOrigins as ToolDispatch<never>,
   add_embed_origin: addEmbedOrigin as ToolDispatch<never>,
   remove_embed_origin: removeEmbedOrigin as ToolDispatch<never>,
@@ -5839,6 +6658,9 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   set_matte_source: setMatteSource as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
+  add_page: addPage as ToolDispatch<never>,
+  delete_page: deletePage as ToolDispatch<never>,
+  reorder_pages: reorderPages as ToolDispatch<never>,
 };
 
 export const TOOL_DEFINITIONS: ToolFunction[] = [
@@ -5930,7 +6752,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           elementId: { type: "string", description: "Layer id (video.<id>, image.<id>, shapes.<id>, or group.<id>)." },
           property: {
             type: "string",
-            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
           },
           frame: {
             type: "number",
@@ -5968,7 +6790,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
                 },
                 property: {
                   type: "string",
-                  enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+                  enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
                 },
                 frame: {
                   type: "number",
@@ -6006,7 +6828,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           property: {
             type: "string",
-            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
           },
           keyframes: {
             type: "array",
@@ -6047,7 +6869,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           elementId: { type: "string" },
           property: {
             type: "string",
-            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
           },
           frame: { type: "number" },
         },
@@ -6067,7 +6889,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           elementId: { type: "string" },
           property: {
             type: "string",
-            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
           },
           delta: {
             type: "number",
@@ -6090,7 +6912,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           elementId: { type: "string", description: "Layer id (video/image/shape/group)." },
           property: {
             type: "string",
-            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity"],
+            enum: ["x", "y", "width", "height", "scale", "rotation", "opacity", "curve"],
           },
           mode: {
             type: "string",
@@ -6665,9 +7487,46 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "add_to_collection",
+      description:
+        "Add a layer to the user's reusable Collection. Pass ANY element id — a leaf (text.<id>, image.<id>, …) or a whole group.<id> (a lower-third, logo sting, brand intro). It then appears in the user's Collection (list_collection), where they — and, if this project is in a workspace, every teammate — can drop a self-contained COPY of it into any other project (add_from_collection). Copies are IMMUTABLE: adding copies the whole subtree + its asset bytes, so editing or deleting this source never changes a copy already placed elsewhere. Works on solo projects too (a personal Collection). Give the layer a clear name first (rename_layer / rename_group) — that name is what shows in the Collection.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description:
+              "The element id to add — any leaf (text/image/video/shapes.<id>) or a group.<id>.",
+          },
+        },
+        required: ["elementId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "remove_from_collection",
+      description:
+        "Remove a layer from the user's Collection so it's no longer offered for reuse. Pass the element id that was added with add_to_collection. Copies already placed in other projects are unaffected (they're self-contained). No-op if the id isn't in the collection.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description: "The element id to remove from the Collection.",
+          },
+        },
+        required: ["elementId"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_morpha_layer",
       description:
-        "Embed another of the user's projects (\"a morpha\") inside this one as a version-pinned band. The source's layers are inlined into the host as a collapsible group, re-keyed to fresh ids, pinned to one immutable version of the source. Pass the source project's id as source_morpha_id (and optionally a version label); the server resolves and inlines the pinned version. Editing the band's inner layers is a local override until you publish it back as a new version of the source.",
+        "Embed another of the user's projects (\"a morpha\") inside this one as a version-pinned band. The source's layers are inlined into the host as a collapsible group, re-keyed to fresh ids, pinned to one immutable version of the source. Pass the source project's id as source_morpha_id (and optionally a version label); the server resolves and inlines the pinned version. Editing the band's inner layers only affects THIS video — the change is local and never propagates back to the source. To pin the band to a different saved version, re-pin it from the editor's Inspector. describe_video marks an embedded band with morpha:true + source_morpha_id so you can tell it apart from a plain group.",
       parameters: {
         type: "object",
         properties: {
@@ -6796,6 +7655,110 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "set_layer_block",
+      description:
+        "Set (or replace) a layer's timeline BLOCK — the [start, start+duration) window it exists for. The layer is drawn ONLY inside that window, and its animation keyframes are sampled RELATIVE to the block start, so moving or trimming the block re-anchors its intro instead of leaving it behind. This is how a layer 'starts' at a point like an iMovie clip rather than being present for the whole composition. Works on any leaf or group. Frames are in the layer's parent timeline (composition frames at root; band-local inside an embedded morpha band). To place a whole embedded reel, use move_band.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description:
+              "Element id of the layer (image.<id>, video.<id>, text.<id>, shapes.<id>, or group.<id>).",
+          },
+          start: {
+            type: "number",
+            description:
+              "First frame the layer appears (0-indexed, 30 fps), in its parent timeline.",
+          },
+          duration: {
+            type: "number",
+            description:
+              "How many frames the layer lasts (≥ 1). Hidden outside [start, start+duration).",
+          },
+        },
+        required: ["elementId", "start", "duration"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "move_band",
+      description:
+        "Place an embedded morpha band on the host timeline: set its TIME ORIGIN (the frame it starts). The band's whole inner reel plays relative to this frame, so its intro animations fire when the band appears instead of at 0:00 (the fix for 'the embedded intro doesn't animate'). Keeps the band's current window length; if it had none, the band spans from start to the composition end. Pass the band group's id (from describe_video — a group with morpha:true).",
+      parameters: {
+        type: "object",
+        properties: {
+          bandId: {
+            type: "string",
+            description:
+              "The embedded band's group id (group.<id> or the bare <id>).",
+          },
+          start: {
+            type: "number",
+            description:
+              "Host-timeline frame where the band begins (0-indexed, 30 fps).",
+          },
+        },
+        required: ["bandId", "start"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_duration",
+      description:
+        "Author an EXPLICIT composition length in seconds, pinning it (duration_authored=true) so the auto-fit no longer drives it. Morpha normally DERIVES the comp length from content (the furthest keyframe / video window / audio end); this overrides that with a fixed length — the stage becomes a fixed canvas you author into, and content past the end is kept but not played or exported. Clamped to [1, 600] s. Use it to shorten a comp to a target length (e.g. a 15-second cut) or to reserve a longer stage than the current content fills. Call fit_duration_to_content to release the pin.",
+      parameters: {
+        type: "object",
+        properties: {
+          seconds: {
+            type: "number",
+            description:
+              "Composition length in seconds (clamped to 1..600). 30 fps; durationInFrames = ceil(seconds*30).",
+          },
+        },
+        required: ["seconds"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fit_duration_to_content",
+      description:
+        "Clear an authored composition length and return to AUTO-FIT — the comp length tracks the furthest content (keyframe / video window / audio end) again, with a 1-second floor. The inverse of set_duration. NOTE: headless (no loaded media) this can UNDER-fit when a video layer's source_out_frame is null — its natural length is unmeasurable, so it contributes only its start frame; the length self-corrects the next time the project is opened in the editor, where the real clip durations are known.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cut_range",
+      description:
+        "Ripple-delete a time window [startFrame, endFrame) — remove that span and pull all later content earlier by delta = endFrame - startFrame (the NLE 'ripple delete' / 'close gap'). Shifts every keyframe, colour keyframe, speed keyframe, marker, audio overlay, loop region, and start_at through the cut, and is SOURCE-AWARE for video layers: a clip that straddles the cut is trimmed, and one whose interior is removed is SPLIT into two layers. Audio overlays interior to the cut are truncated at the seam (overlays have no source-in to bridge the gap). REFUSES to cut across a video layer that carries speed-ramp keyframes — remove them, or cut outside that layer's span, first. The composition length shrinks accordingly (an authored length loses only the overlap with its visible region). Frames are 0-indexed project-timeline frames at 30 fps; endFrame is exclusive and clamped to the composition length.",
+      parameters: {
+        type: "object",
+        properties: {
+          startFrame: {
+            type: "number",
+            description: "First frame of the window to remove (0-indexed, inclusive).",
+          },
+          endFrame: {
+            type: "number",
+            description:
+              "End frame of the window to remove (0-indexed, EXCLUSIVE). Must be > startFrame; clamped to the composition length.",
+          },
+        },
+        required: ["startFrame", "endFrame"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "set_embed_origins",
       description:
         "Replace the project's embed allowlist — the hostnames permitted to load this project through the public <morpha-video> embed. Pass the full desired list; it overwrites the previous one. An empty array turns embedding OFF (the public embed endpoint 404s the project). Each entry is normalized to a bare lowercased hostname (scheme, port, and path stripped, e.g. \"https://example.com/x\" → \"example.com\"); duplicates are dropped.",
@@ -6856,7 +7819,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_custom_font",
       description:
-        "Register a custom (non-Google) typeface on the project so text layers can use it by family name via font_family (exactly like a Google family). `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (/api/upload-asset; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path.",
+        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (/api/upload-asset; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path.",
       parameters: {
         type: "object",
         properties: {
@@ -6960,6 +7923,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: "number",
             description: "Tracking between glyphs in px; may be negative. Default 0.",
           },
+          curve: {
+            type: "number",
+            description:
+              "Curve the text onto an arc, in degrees of total sweep. 0 = straight (default). POSITIVE = a SMILE (⌣, ends rise); NEGATIVE = an ARCH (⌒, rainbow). Clamped ±135. A tasteful smile is ~+60. Applies to a SINGLE line — multi-line text is joined to one line while curved (the stored text is untouched, so curve:0 restores it).",
+          },
           line_height: {
             type: "number",
             description: "Line height as a multiple of font size (1.2 = 120%).",
@@ -6997,6 +7965,33 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
               offsetY: { type: "number" },
               blur: { type: "number" },
               color: { type: "string" },
+            },
+          },
+          decorations: {
+            type: ["object", "null"],
+            description:
+              "Per-character underline / strikethrough. { underline?: [{start,end}], strikethrough?: [{start,end}] } — each a list of half-open character ranges [start,end) (UTF-16 offsets) into `text`. E.g. underline the first word of \"Big news\": underline:[{start:0,end:3}]. Ranges are normalized (sorted + merged). null clears all decorations; editing `text` in the SAME call re-indexes existing ranges against the new text. Not rendered on curved text.",
+            properties: {
+              underline: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    start: { type: "number" },
+                    end: { type: "number" },
+                  },
+                },
+              },
+              strikethrough: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    start: { type: "number" },
+                    end: { type: "number" },
+                  },
+                },
+              },
             },
           },
         },
@@ -7052,6 +8047,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: "number",
             description: "Tracking between glyphs in px; may be negative. Default 0.",
           },
+          curve: {
+            type: "number",
+            description:
+              "Curve the text onto an arc, in degrees of total sweep. 0 = straight (default). POSITIVE = a SMILE (⌣, ends rise); NEGATIVE = an ARCH (⌒, rainbow). Clamped ±135. A tasteful smile is ~+60. Single line only (multi-line is joined while curved).",
+          },
           line_height: {
             type: "number",
             description: "Line height as a multiple of font size (1.2 = 120%).",
@@ -7091,6 +8091,33 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
               color: { type: "string" },
             },
           },
+          decorations: {
+            type: ["object", "null"],
+            description:
+              "Per-character underline / strikethrough. { underline?: [{start,end}], strikethrough?: [{start,end}] } — half-open character ranges [start,end) (UTF-16 offsets) into `text`. E.g. underline the first word of \"Big news\": underline:[{start:0,end:3}]. Ranges are normalized (sorted + merged). Not rendered on curved text.",
+            properties: {
+              underline: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    start: { type: "number" },
+                    end: { type: "number" },
+                  },
+                },
+              },
+              strikethrough: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    start: { type: "number" },
+                    end: { type: "number" },
+                  },
+                },
+              },
+            },
+          },
         },
         required: [],
       },
@@ -7101,7 +8128,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_caption_track",
       description:
-        "Build a caption track from pre-timed lines (e.g. derived from transcribe_clip's word timings). mode \"line-sync\" (default) creates one text layer per line, each shown only during its [startFrame, endFrame) window via hold-eased opacity keyframes — the active-line karaoke read; mode \"static\" makes a single layer with all lines joined. `style` picks a preset look. Lines default to a lower-third band. Returns the created text element ids.",
+        "Build a caption track from pre-timed lines (e.g. derived from transcribe_clip's word timings). mode \"line-sync\" (default) creates one text layer per line, each shown only during its [startFrame, endFrame) window via hold-eased opacity keyframes — the active-line karaoke read; mode \"static\" makes a single layer with all lines joined. `style` picks a preset look. Lines default to a lower-third band. The caption layers are always wrapped in a \"captions\" group so they don't clutter the layers list. Returns the created text element ids plus `groupElementId` (the captions group).",
       parameters: {
         type: "object",
         properties: {
@@ -7350,6 +8377,68 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
         },
         required: ["elementId", "muted"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_page",
+      description:
+        "Append a page to the carousel (carousel mode only). Without duplicate_index a blank page is appended, sized to the project's canvas. With duplicate_index the page at that position is deep-copied (a fresh id is minted). There is no limit on page count. The new page becomes the active page; its index is returned.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Optional name for the new page.",
+          },
+          duplicate_index: {
+            type: "number",
+            description:
+              "Optional. 0-based index of an existing page to deep-copy instead of appending a blank one.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_page",
+      description:
+        "Remove the page at `index` from the carousel (carousel mode only). Fails on an out-of-range index or when only one page remains — a carousel must keep at least one page. The active page stays active; when the active page itself is deleted, active_index falls to the neighbouring page (the one that slid into its position, or the new last page).",
+      parameters: {
+        type: "object",
+        properties: {
+          index: {
+            type: "number",
+            description: "0-based index of the page to remove.",
+          },
+        },
+        required: ["index"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "reorder_pages",
+      description:
+        "Move a page from `from_index` to `to_index` within the carousel (carousel mode only). The remaining pages shift to fill the gap; active_index is rewritten so it keeps pointing at the same page it did before the move. Fails on out-of-range indices.",
+      parameters: {
+        type: "object",
+        properties: {
+          from_index: {
+            type: "number",
+            description: "0-based index of the page to move.",
+          },
+          to_index: {
+            type: "number",
+            description: "0-based destination index for the page.",
+          },
+        },
+        required: ["from_index", "to_index"],
       },
     },
   },

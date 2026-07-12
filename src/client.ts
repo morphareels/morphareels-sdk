@@ -237,12 +237,13 @@ export interface MorphaClient {
     projectId: string,
     opts: { url: string; filename?: string },
   ): Promise<Record<string, unknown>>;
-  /** Register a custom (non-Google) typeface so text layers can reference it by
-   *  `font_family`. `src` is a full font URL (https://…/font.woff2) OR a font
-   *  filename already uploaded to the project's asset bucket (.woff2/.woff/.ttf/
-   *  .otf). Dedupes by family+weight+style. Returns the project's full custom-
-   *  font list. (Registering the real face is the robust cure for the editor
-   *  faux-synthesizing a weight a font ships no real cut for.) */
+  /** Register a typeface Morpha does NOT ship, so text layers can reference it
+   *  by `font_family`. Families already in the built-in catalogs (anything
+   *  list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are
+   *  REJECTED — they need no registration; just set font_family to the name.
+   *  `src` is a full font URL (https://…/font.woff2) OR a font filename already
+   *  uploaded to the project's asset bucket (.woff2/.woff/.ttf/.otf). Dedupes
+   *  by family+weight+style. Returns the project's full custom-font list. */
   setCustomFont(
     projectId: string,
     opts: {

@@ -1,3 +1,7 @@
+import os from "node:os";
+import path from "node:path";
+import { mkdirSync } from "node:fs";
+
 export interface RenderFrameOptions {
   /** Project id, served at `${origin}/api/project/<id>`. */
   projectId: string;
@@ -23,6 +27,15 @@ export interface RenderFrameOptions {
    * so this default leaves headroom above that; raise it for very large clips.
    */
   timeoutMs?: number;
+  /**
+   * Directory for the persistent Chromium profile that caches web fonts,
+   * images, and the render bundle across calls. Defaults to
+   * `<os.tmpdir()>/morpha-render-cache`, with a per-project subdirectory. A
+   * warm profile fetches each web font once and serves it from disk on later
+   * renders, so repeated renders don't re-fetch (and aren't blocked by a slow
+   * font CDN). Set this to relocate or isolate the cache.
+   */
+  cacheDir?: string;
 }
 
 /**
@@ -47,16 +60,17 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
   const height = Math.max(64, Math.round(opts.height ?? 1920));
   const timeout = opts.timeoutMs ?? 90_000;
 
-  const browser = await pw.chromium.launch({
+  const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
-    headless: true,
+    viewport: { width, height },
+    projectId: opts.projectId,
+    cacheDir: opts.cacheDir,
   });
   try {
-    const ctx = await browser.newContext({ viewport: { width, height } });
     if (opts.token) {
       await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
     }
-    const page = await ctx.newPage();
+    const page = ctx.pages()[0] ?? (await ctx.newPage());
     const url = `${origin}/render-canvas?project=${encodeURIComponent(opts.projectId)}&frame=${frame}`;
     // `domcontentloaded`, not `networkidle`: a <video preload="auto"> streaming
     // a large non-faststart clip keeps the network busy well past the 500ms
@@ -125,7 +139,7 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
 
     return await page.locator("canvas").first().screenshot({ type: "png" });
   } finally {
-    await browser.close();
+    await ctx.close();
   }
 };
 
@@ -148,6 +162,13 @@ export interface RenderVideoOptions {
    * modern machine; long projects or slow-loading clips need more headroom.
    */
   timeoutMs?: number;
+  /**
+   * Directory for the persistent Chromium profile (see RenderFrameOptions).
+   * Defaults to `<os.tmpdir()>/morpha-render-cache` with a per-project
+   * subdirectory, so fonts and clips are cached across exports rather than
+   * re-fetched cold on every call.
+   */
+  cacheDir?: string;
 }
 
 /**
@@ -170,18 +191,17 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
   const origin = opts.origin ?? "https://morphareels.ai";
   const timeout = opts.timeoutMs ?? 600_000;
 
-  const browser = await pw.chromium.launch({
+  const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
-    headless: true,
+    viewport: { width: 1080, height: 1920 },
+    projectId: opts.projectId,
+    cacheDir: opts.cacheDir,
   });
   try {
-    const ctx = await browser.newContext({
-      viewport: { width: 1080, height: 1920 },
-    });
     if (opts.token) {
       await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
     }
-    const page = await ctx.newPage();
+    const page = ctx.pages()[0] ?? (await ctx.newPage());
     const url = `${origin}/render-export?project=${encodeURIComponent(opts.projectId)}`;
     await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
@@ -223,6 +243,42 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     }
     return Buffer.from(base64, "base64");
   } finally {
-    await browser.close();
+    await ctx.close();
+  }
+};
+
+// Launch a persistent Chromium context so the on-disk HTTP cache (web fonts,
+// images, the render bundle) is reused across renders instead of re-fetched on
+// every call — a cold browser per render is why repeated renders of a project
+// kept re-downloading CDN-hosted fonts and intermittently failing when that CDN
+// was slow. Keyed per project; if the profile is locked (a concurrent render of
+// the same project holds Chromium's SingletonLock) it falls back to a private
+// dir so the render still runs — just without the shared warm cache.
+const launchRenderContext = async (
+  pw: typeof import("playwright"),
+  opts: {
+    channel: string;
+    viewport: { width: number; height: number };
+    projectId: string;
+    cacheDir?: string;
+  },
+): Promise<import("playwright").BrowserContext> => {
+  const base = opts.cacheDir ?? path.join(os.tmpdir(), "morpha-render-cache");
+  const profileDir = path.join(
+    base,
+    opts.projectId.replace(/[^a-zA-Z0-9_-]/g, "_") || "default",
+  );
+  const launch = (dir: string) => {
+    mkdirSync(dir, { recursive: true });
+    return pw.chromium.launchPersistentContext(dir, {
+      channel: opts.channel,
+      headless: true,
+      viewport: opts.viewport,
+    });
+  };
+  try {
+    return await launch(profileDir);
+  } catch {
+    return launch(`${profileDir}-${process.pid}-${Date.now()}`);
   }
 };

@@ -1,5 +1,10 @@
 import { z } from "zod";
 import { SHAPE_IDS } from "./shapes.ts";
+// Cross-tree import (same precedent as tools.ts): the font catalogues live in
+// editor/src/ — the parser needs them to drop custom_fonts entries that
+// duplicate a built-in family (see stripBuiltinCustomFonts). font-sources.ts
+// imports only pure catalogue data, so no cycle.
+import { getFontEntry } from "./font-sources.ts";
 
 const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/u, "expected #rrggbb");
 
@@ -113,6 +118,31 @@ const perElementDataFields = {
   // (e.g. "image.abc123"). Used to map host-side edits back onto the source on
   // publish. Absent on layers authored directly in the host project.
   source_layer_id: z.string().min(1).optional(),
+  // Timeline BLOCK — the layer's on-timeline existence window. `start` is the
+  // frame the layer begins, expressed in its PARENT's timeline (composition
+  // frames for a root layer; band-local frames for a descendant of an embedded
+  // morpha band). `duration` is how many frames it lasts. Two coupled effects,
+  // both keyed on `start`:
+  //   1. VISIBILITY — the layer is drawn only while the frame is inside
+  //      [start, start+duration). (See frameOutsideBlock.)
+  //   2. BLOCK-LOCAL TIME — the layer's own animation keyframes are sampled
+  //      RELATIVE to `start` (at frame − start), so moving or trimming the
+  //      block re-anchors its animation instead of leaving it behind. (See
+  //      effectiveFrameOffset.)
+  // For an embedded morpha band GROUP, `start` additionally serves as the
+  // band's TIME ORIGIN: every descendant subtracts it too, so the band's whole
+  // internal animation plays relative to where the band is placed.
+  // ABSENT block ⇒ "always present" — a block spanning the whole composition
+  // with keyframes sampled at absolute frames: exactly the legacy behavior. So
+  // adding this field is backward-compatible (old projects lack it and are
+  // unchanged), and migration only writes a block where it changes nothing
+  // visible (a caption gate → block) or fixes a bug (a band's time origin).
+  block: z
+    .object({
+      start: z.number().int().nonnegative(),
+      duration: z.number().int().positive(),
+    })
+    .optional(),
 };
 
 // One per image layer on the project. (x, y) is the CENTRE of the layer's
@@ -251,6 +281,28 @@ export type SpeedKeyframe = NonNullable<
 // the same transformed box used for image layers, so a text layer animates
 // identically to any other leaf. Looping is the general `track_loops`
 // mechanism — there is no text-specific sequencing.
+// A single decoration range: half-open [start, end) character offsets (UTF-16
+// code units) into a text layer's `text`. `end > start`; the store/tools keep
+// range lists normalized (sorted, merged, non-overlapping).
+export const textDecorationRangeSchema = z
+  .object({
+    start: z.number().int().min(0),
+    end: z.number().int().min(0),
+  })
+  .strict();
+
+// The two decoration kinds a text layer supports, each an independent set of
+// ranges. Orthogonal: a character can be both underlined and struck.
+export const textDecorationsSchema = z
+  .object({
+    underline: z.array(textDecorationRangeSchema).optional(),
+    strikethrough: z.array(textDecorationRangeSchema).optional(),
+  })
+  .strict();
+
+export type TextDecorationRange = z.infer<typeof textDecorationRangeSchema>;
+export type TextDecorations = z.infer<typeof textDecorationsSchema>;
+
 export const textLayerSchema = z
   .object({
     ...perElementDataFields,
@@ -298,6 +350,17 @@ export const textLayerSchema = z
     line_height: z.number().positive().optional(),
     // Pixel tracking between glyphs. May be negative. Default 0.
     letter_spacing: z.number().optional(),
+    // Curved baseline. Degrees of total arc the text bends onto: 0 = straight
+    // (default). POSITIVE curves the text into a SMILE (⌣ — ends rise, middle
+    // dips); NEGATIVE into an ARCH (⌒ — a rainbow). The magnitude is the total
+    // sweep in degrees; the renderer clamps to ±135 (beyond that a single
+    // title line self-crowds). Curve applies to a SINGLE visual line — while
+    // curved, multi-line text is joined to one line for painting and the
+    // stored `text` is left untouched (toggling curve back to 0 restores the
+    // wrapping losslessly). Rendered on the canvas path only, so the DOM
+    // preview matches the export by construction (curve !== 0 promotes the
+    // layer to canvas-fallback in dom-render-mode.ts). < 2 glyphs = no-op.
+    curve: z.number().default(0),
     // Horizontal alignment of each line within the layer's box. Default
     // "center" when omitted — matches today's renderer.
     text_align: z.enum(["left", "center", "right"]).optional(),
@@ -340,10 +403,33 @@ export const textLayerSchema = z
     hidden: z.boolean().optional(),
     // Optional Inspector colour-label tag.
     color_label: colorLabelSchema.optional(),
+    // Per-character text decorations layered on top of the flat `text` string.
+    // Each list is a set of half-open character ranges [start, end) in UTF-16
+    // code units into `text`, kept normalized (sorted, merged, non-overlapping).
+    // Absent / empty ⇒ no decorations. Editing `text` rebases the offsets (see
+    // rebaseDecorations in text-decorations.ts). Rendered natively via CSS
+    // text-decoration in the DOM preview and mirrored with drawn rules on the
+    // canvas export, so preview == export.
+    decorations: textDecorationsSchema.optional(),
   })
   .strict();
 
 export type TextLayer = z.infer<typeof textLayerSchema>;
+
+// Curve (arc-baseline) bounds, shared by every write + render site so the
+// renderer, the tool catalog, and the Inspector agree. `CURVE_MAX_DEG` is the
+// legibility clamp — beyond ±135° a single title line starts to self-crowd.
+// `CURVE_MIN_DEG` is the dead-band: below half a degree the arc is
+// indistinguishable from straight, so we take the plain horizontal path (this
+// also guards the `radius = width / θ` divide-by-zero as θ → 0).
+export const CURVE_MAX_DEG = 135;
+export const CURVE_MIN_DEG = 0.5;
+export const clampCurve = (v: number): number =>
+  !Number.isFinite(v) ? 0 : Math.max(-CURVE_MAX_DEG, Math.min(CURVE_MAX_DEG, v));
+// True when a resolved curve value should actually bend the text (past the
+// dead-band). Callers still AND this with a ">= 2 glyphs" check.
+export const curveIsActive = (v: number | undefined | null): boolean =>
+  Math.abs(clampCurve(v ?? 0)) >= CURVE_MIN_DEG;
 
 // Resolve a video layer's playback window against the source's actual
 // duration. `sourceDurationSeconds` comes from the loaded HTMLVideoElement
@@ -620,6 +706,11 @@ export const trackPropertySchema = z.enum([
   "opacity",
   "scale",
   "rotation",
+  // Text-only: the arc-baseline curve (degrees). Animating it bends a straight
+  // line into a smile/arch over time. Inert on non-text layers (the renderer
+  // only reads a curve track in drawTextLayer), mirroring how width/height
+  // tracks are inert on groups.
+  "curve",
 ]);
 
 export const elementTracksSchema = z.partialRecord(
@@ -897,9 +988,14 @@ export const activeOverlayFilename = (o: AudioOverlay): string =>
 // later child move/animation doesn't silently swing the pivot. The group
 // itself has no body, no styles, no border — it exists purely to compose a
 // transform onto its descendants. Animations under "group.<id>" use the same
-// five tracks as a leaf (x, y, scale, rotation, opacity). Group's x/y act as
-// translation offsets applied around (pivotX, pivotY) — there is no separate
-// base position for groups.
+// five tracks as a leaf (x, y, scale, rotation, opacity).
+//
+// x / y / scale / rotation are the group's STATIC BASE transform, composed
+// about (pivotX, pivotY) exactly like a leaf's base: T(pivot + x, y) · R(rot)
+// · S(scale) · T(-pivot). Resizing/rotating a non-animated group writes this
+// base (no keyframes); a keyframe track under "group.<id>" overrides the base
+// for that property when present. Defaults are identity (0, 0, 1, 0), so a
+// freshly created group and any pre-base project both compose to identity.
 export const groupSchema = z
   .object({
     ...perElementDataFields,
@@ -907,6 +1003,12 @@ export const groupSchema = z
     name: z.string().default(""),
     pivotX: z.number(),
     pivotY: z.number(),
+    // Static base transform, composed about (pivotX, pivotY). Overridden
+    // per-property by any keyframe track under "group.<id>".
+    x: z.number().default(0),
+    y: z.number().default(0),
+    scale: z.number().default(1),
+    rotation: z.number().default(0),
     children: z.array(z.string()).default([]),
     // Optional backdrop fill painted behind the group's children. The rect is
     // centred on (pivotX, pivotY) in group-local space and sized by
@@ -994,6 +1096,41 @@ const stripLegacyClipFrame = (raw: unknown): unknown => {
     );
   }
   return next;
+};
+
+// Strip the deprecated `carousel.aspect` field. Carousel pages used to be
+// locked to a 3-value aspect enum; they now share the project's own
+// `canvas_width`/`canvas_height`. `carouselSchema` is `.strict()`, so a leftover
+// `aspect` key on an already-saved carousel would fail to parse — drop it here.
+const stripLegacyCarouselAspect = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!r.carousel || typeof r.carousel !== "object") return raw;
+  const carousel = { ...(r.carousel as Record<string, unknown>) };
+  if (!("aspect" in carousel)) return raw;
+  delete carousel.aspect;
+  return { ...r, carousel };
+};
+
+// Drop custom_fonts entries that duplicate a built-in catalogue family.
+// custom_fonts is only for typefaces Morpha does not ship: a stray entry for a
+// catalogue family (e.g. an agent registering "Fredoka" against a CDN URL)
+// shadows the reliable built-in loader, so the family loads only through the
+// fragile FontFace path and paints as a system fallback. set_custom_font
+// rejects such writes going forward; this preprocess heals projects that
+// already carry them (the worker's project GET persists the healed shape for
+// owners, mirroring the legacy-translate migration).
+const stripBuiltinCustomFonts = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.custom_fonts) || r.custom_fonts.length === 0) return raw;
+  const kept = (r.custom_fonts as unknown[]).filter((f) => {
+    if (!f || typeof f !== "object") return true;
+    const family = (f as { family?: unknown }).family;
+    return typeof family !== "string" || getFontEntry(family) === null;
+  });
+  if (kept.length === r.custom_fonts.length) return raw;
+  return { ...r, custom_fonts: kept };
 };
 
 // Convert legacy `translateX` / `translateY` keyframe tracks to absolute
@@ -1490,16 +1627,222 @@ const migrateFlattenPerElementMaps = (raw: unknown): unknown => {
   return next;
 };
 
-const preprocessProject = (raw: unknown): unknown =>
-  migrateFlattenPerElementMaps(
+// Migrate the short-lived group-level `shared` flag (the first "Blocks"
+// release, v1.0.52) into the project-level `collection` id-list. A group with
+// `shared:true` becomes a "group.<id>" entry in `collection`; the flag is then
+// stripped from EVERY group so the strict groupSchema (which no longer declares
+// `shared`) parses. `collection` is the canonical store now — it holds any
+// element id, not just groups. Idempotent (a project with no `shared` keys is
+// returned untouched) and non-destructive (clones the groups it rewrites).
+const migrateSharedGroupsToCollection = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.groups)) return raw;
+  let touched = false;
+  const collected: string[] = [];
+  const groups = r.groups.map((g) => {
+    if (!g || typeof g !== "object" || Array.isArray(g)) return g;
+    const gr = g as Record<string, unknown>;
+    if (!("shared" in gr)) return g;
+    touched = true;
+    const { shared, ...rest } = gr;
+    if (shared === true && typeof rest.id === "string") {
+      collected.push(`group.${rest.id}`);
+    }
+    return rest;
+  });
+  if (!touched) return raw;
+  const existing = Array.isArray(r.collection)
+    ? (r.collection as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  return { ...r, groups, collection: Array.from(new Set([...existing, ...collected])) };
+};
+
+// Narrow an unknown to a plain object record (not an array). Module-level
+// counterpart to the function-local `isObj` used elsewhere in this file.
+const asRecord = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : null;
+
+// Recognise a PURE visibility gate: an opacity keyframe array whose every
+// keyframe is `hold`-eased with a value strictly in {0,1}, rising to 1 and then
+// falling back to 0. That's the shape the old caption / set_layer_visible path
+// produced to fake a [start, end) window. Returns the window, or null for a
+// genuine fade (interpolating easing / intermediate opacity) which must stay a
+// keyframe.
+const detectVisibilityGate = (
+  kfs: unknown,
+): { start: number; end: number } | null => {
+  if (!Array.isArray(kfs) || kfs.length < 2) return null;
+  const parsed: { frame: number; value: number }[] = [];
+  for (const kf of kfs) {
+    const k = asRecord(kf);
+    if (!k) return null;
+    if (k.easing !== "hold") return null;
+    if (k.value !== 0 && k.value !== 1) return null;
+    if (typeof k.frame !== "number" || !Number.isFinite(k.frame)) return null;
+    parsed.push({ frame: k.frame, value: k.value });
+  }
+  parsed.sort((a, b) => a.frame - b.frame);
+  const rise = parsed.find((k) => k.value === 1);
+  if (!rise) return null;
+  const fall = parsed.find((k) => k.frame > rise.frame && k.value === 0);
+  if (!fall) return null;
+  return { start: rise.frame, end: fall.frame };
+};
+
+// Convert legacy caption / visibility opacity-gates into timeline blocks. A
+// caption line used to be N opacity keyframes (hidden→1→0, all hold-eased); the
+// block model expresses that same window as a single [start, duration). This
+// preprocess recognises a PURE gate (see detectVisibilityGate) on a layer whose
+// ONLY per-element animation data is that opacity track — i.e. an actual
+// caption / show-hide layer, never a moving/tinted one — and replaces the track
+// with a `block`. Genuine fades, and any layer with other motion / colour
+// tracks, are left untouched, so the conversion is render-identical: it only
+// tidies the data (40 lines → 40 blocks, not 120 keyframes). Idempotent: a layer
+// that already has a `block` is skipped, and a converted layer no longer has an
+// opacity gate to re-trigger on — so the editor's re-parse poll sees no phantom
+// diff. Runs OUTERMOST, after per-element maps are flattened onto each layer.
+const migrateLayersToBlocks = (raw: unknown): unknown => {
+  const proj = asRecord(raw);
+  if (!proj) return raw;
+  const arrays = [
+    "image_layers",
+    "video_layers",
+    "text_layers",
+    "shapes",
+    "groups",
+  ];
+  let changed = false;
+  const nextProj: Record<string, unknown> = { ...proj };
+  for (const key of arrays) {
+    const arr = proj[key];
+    if (!Array.isArray(arr)) continue;
+    let arrChanged = false;
+    const nextArr = arr.map((layer) => {
+      const l = asRecord(layer);
+      if (!l) return layer;
+      if (l.block !== undefined && l.block !== null) return layer;
+      const anims = asRecord(l.animations);
+      if (!anims) return layer;
+      const animKeys = Object.keys(anims);
+      // Only convert when opacity is the SOLE animated property and there are no
+      // colour / loop tracks — the exact profile of a caption / show-hide layer.
+      if (animKeys.length !== 1 || animKeys[0] !== "opacity") return layer;
+      const colorTracks = asRecord(l.color_tracks);
+      if (colorTracks && Object.keys(colorTracks).length > 0) return layer;
+      const trackLoops = asRecord(l.track_loops);
+      if (trackLoops && Object.keys(trackLoops).length > 0) return layer;
+      const gate = detectVisibilityGate(anims.opacity);
+      if (!gate) return layer;
+      arrChanged = true;
+      const nextLayer: Record<string, unknown> = { ...l };
+      nextLayer.block = {
+        start: gate.start,
+        duration: Math.max(1, gate.end - gate.start),
+      };
+      delete nextLayer.animations;
+      return nextLayer;
+    });
+    if (arrChanged) {
+      nextProj[key] = nextArr;
+      changed = true;
+    }
+  }
+  return changed ? nextProj : raw;
+};
+
+// True when a RAW project (or version blob, which wraps the project under
+// `.project`) has at least one layer that migrateLayersToBlocks would convert —
+// a pure caption/visibility opacity-gate with no block yet. The one-shot
+// backfill uses this to rewrite ONLY the blobs that actually change, avoiding
+// write amplification (re-serializing every project would differ on key order /
+// defaults even when semantically unchanged).
+export const rawProjectHasConvertibleGate = (raw: unknown): boolean => {
+  const proj = asRecord(raw);
+  if (!proj) return false;
+  const target = asRecord(proj.project) ?? proj;
+  const arrays = [
+    "image_layers",
+    "video_layers",
+    "text_layers",
+    "shapes",
+    "groups",
+  ];
+  for (const key of arrays) {
+    const arr = target[key];
+    if (!Array.isArray(arr)) continue;
+    for (const layer of arr) {
+      const l = asRecord(layer);
+      if (!l) continue;
+      if (l.block !== undefined && l.block !== null) continue;
+      const anims = asRecord(l.animations);
+      if (!anims) continue;
+      if (Object.keys(anims).length !== 1 || !("opacity" in anims)) continue;
+      const ct = asRecord(l.color_tracks);
+      if (ct && Object.keys(ct).length > 0) continue;
+      const tl = asRecord(l.track_loops);
+      if (tl && Object.keys(tl).length > 0) continue;
+      if (detectVisibilityGate(anims.opacity)) return true;
+    }
+  }
+  return false;
+};
+
+// Fold a group's legacy single-frame-0 transform keyframe into the new static
+// base. Before groups carried a base, a whole-group move / scale / rotate was
+// stored as a lone frame-0 keyframe (a constant). Groups now have a base
+// x/y/scale/rotation, so collapse that constant into the base and drop the
+// track: a frame-0-only keyframe evaluates to its value at every frame, so this
+// is visually identical, and it lets subsequent edits write the base like a
+// leaf instead of stacking a second keyframe. Genuine animations (any keyframe
+// at frame > 0, or two-plus keyframes) are left untouched. Runs after
+// migrateFlattenPerElementMaps so each group already carries its `animations`.
+const GROUP_BASE_TRANSFORM_PROPS = ["x", "y", "scale", "rotation"] as const;
+const migrateGroupConstantTracksToBase = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object") return raw;
+  const groups = (raw as { groups?: unknown }).groups;
+  if (!Array.isArray(groups)) return raw;
+  for (const g of groups) {
+    if (!g || typeof g !== "object") continue;
+    const grp = g as Record<string, unknown>;
+    const anims = grp.animations;
+    if (!anims || typeof anims !== "object") continue;
+    const tracks = anims as Record<string, unknown>;
+    for (const prop of GROUP_BASE_TRANSFORM_PROPS) {
+      const track = tracks[prop];
+      if (!Array.isArray(track) || track.length !== 1) continue;
+      const kf = track[0] as { frame?: unknown; value?: unknown };
+      if (kf?.frame !== 0 || typeof kf.value !== "number") continue;
+      grp[prop] = kf.value;
+      delete tracks[prop];
+    }
+  }
+  return raw;
+};
+
+const preprocessProject = (raw: unknown): unknown => {
+  const base = migrateFlattenPerElementMaps(
     migrateImageTextLayers(
       migrateBackgroundToImageLayer(
         migrateShapeColorsToFills(
-          migrateTranslateToAbsolute(stripLegacyClipFrame(raw)),
+          migrateTranslateToAbsolute(
+            stripBuiltinCustomFonts(
+              stripLegacyCarouselAspect(stripLegacyClipFrame(raw)),
+            ),
+          ),
         ),
       ),
     ),
   );
+  // Both outermost migrators run after the per-element maps are flattened onto
+  // each layer. They touch disjoint fields (collection ids vs. layer blocks), so
+  // their order relative to each other doesn't matter.
+  return migrateGroupConstantTracksToBase(
+    migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+  );
+};
 
 // A "public property" exposes one layer's content as a partner-overridable
 // attribute on the <morpha-video> embed (e.g. `name="title"` mapped to
@@ -1574,6 +1917,67 @@ const customFontSchema = z
 
 export type CustomFont = z.infer<typeof customFontSchema>;
 
+// One timeline marker — a named, frame-aligned cue point. Shared by the
+// top-level composition and every carousel page so a page's timeline carries
+// the same editorial cues a single-composition morpha does.
+export const markerSchema = z
+  .object({
+    id: z.string().min(1),
+    frame: z.number().int().nonnegative(),
+    label: z.string().default(""),
+    color: z.string().optional(), // #rrggbb, optional accent override
+  })
+  .strict();
+export type Marker = z.infer<typeof markerSchema>;
+
+// One page of a carousel — a FULL composition (video OR image), the same shape
+// the single-composition editor edits. It carries every timeline field the
+// top-level project does (video_layers / audio_overlays / duration / start_at /
+// loop region / markers) so a video page's timeline works identically; the
+// still-only pages saved before this widening still parse because every new
+// field defaults. Canvas dims come from the parent project's own
+// `canvas_width`/`canvas_height` (changeable like any video), and uploaded
+// assets resolve against the parent carousel's project id (one asset bucket).
+export const pageCompositionSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().optional(),
+    image_layers: z.array(imageLayerSchema).default([]),
+    video_layers: z.array(videoLayerSchema).default([]),
+    text_layers: z.array(textLayerSchema).default([]),
+    shapes: z.array(shapeSchema).default([]),
+    groups: z.array(groupSchema).default([]),
+    layer_order: z.array(z.string()).default([]),
+    audio_overlays: z.array(audioOverlaySchema).default([]),
+    duration_seconds: z.number().positive().default(1),
+    // Whether `duration_seconds` is USER-AUTHORED (an explicit page length the
+    // user set) rather than DERIVED from content — the page-level twin of the
+    // project field. Must survive the pageToProject/projectToPage round-trip:
+    // without it a hand-trimmed page re-projects as un-authored and the
+    // editor's recomputeDuration re-fits the trim away. Default false so
+    // already-saved pages parse unchanged.
+    duration_authored: z.boolean().default(false),
+    start_at: z.number().nonnegative().nullable().default(null),
+    markers: z.array(markerSchema).default([]),
+    loop: z.array(loopPassSchema).default([]),
+    loop_start_frame: z.number().int().min(0).default(0),
+    loop_end_frame: z.number().int().min(1).nullable().default(null),
+  })
+  .strict();
+export type PageComposition = z.infer<typeof pageCompositionSchema>;
+
+// The carousel record on a project when `mode` is "carousel". Holds one or
+// more full compositions (video or image pages) that all share the project's
+// own canvas dims; `active_index` is the page the editor is currently
+// projecting. No upper bound on page count.
+export const carouselSchema = z
+  .object({
+    active_index: z.number().int().nonnegative().default(0),
+    pages: z.array(pageCompositionSchema).min(1),
+  })
+  .strict();
+export type Carousel = z.infer<typeof carouselSchema>;
+
 export const projectSchema = z.preprocess(
   preprocessProject,
   z
@@ -1605,6 +2009,15 @@ export const projectSchema = z.preprocess(
       // Layer groups. See groupSchema. Empty by default; older projects parse
       // cleanly because the field defaults to [].
       groups: z.array(groupSchema).default([]),
+      // Element ids (a leaf like "text.<id>" or a "group.<id>") the user has
+      // added to their reusable COLLECTION from THIS project. A workspace
+      // teammate — and the owner on their own solo projects — can drop a
+      // self-contained COPY of one into another project (see list_collection /
+      // add_from_collection); copies are immutable, nothing links back. Storing
+      // ids (not a per-layer flag) lets ANY layer, not just groups, be
+      // collected; ids whose layer was later deleted are simply skipped when the
+      // collection is read. Default [] so existing projects parse unchanged.
+      collection: z.array(z.string()).default([]),
       // Composition duration in seconds (drives the timeline / export length).
       // DERIVED from content, not set by hand: the editor (store
       // recomputeDuration) and the worker (write-back) re-fit it to the
@@ -1644,18 +2057,7 @@ export const projectSchema = z.preprocess(
       // markers, action cues, "CTA here" notes). Frame-aligned, purely
       // editorial — they don't affect the render. Default [] so older
       // projects parse cleanly.
-      markers: z
-        .array(
-          z
-            .object({
-              id: z.string().min(1),
-              frame: z.number().int().nonnegative(),
-              label: z.string().default(""),
-              color: z.string().optional(), // #rrggbb, optional accent override
-            })
-            .strict(),
-        )
-        .default([]),
+      markers: z.array(markerSchema).default([]),
       // Loop section — see loopPassSchema. Empty ⇒ the comp plays once;
       // N passes ⇒ pass i applying its overrides plays in the loop region
       // (see loop_start_frame / loop_end_frame) once each. The region is a
@@ -1709,6 +2111,15 @@ export const projectSchema = z.preprocess(
       // platform presets + a Pro-gated Custom row.
       canvas_width: z.number().int().positive().default(1080),
       canvas_height: z.number().int().positive().default(1920),
+      // Project mode. "video" (default) is the single-composition editor that
+      // exports one MP4; "carousel" holds ordered pages in `carousel` and
+      // exports ordered PNGs. Additive + defaulted so existing R2 projects
+      // parse unchanged as "video".
+      mode: z.enum(["video", "carousel"]).default("video"),
+      // The carousel record — present only in carousel mode, holding the
+      // still pages. null (default) in video mode. Style is chosen at creation,
+      // never flipped on an existing morpha.
+      carousel: carouselSchema.nullable().default(null),
     })
     .strict(),
 );
@@ -1855,7 +2266,7 @@ const collectGroupedIds = (project: Project): Set<string> => {
 // `layer_order` (which silently ignores them). Today only the canvas
 // backdrop is pinned, but the mechanism is general — any pinned-tagged
 // layer behaves the same way.
-const collectPinnedRootIds = (project: Project): string[] =>
+export const collectPinnedRootIds = (project: Project): string[] =>
   project.image_layers
     .filter((l) => l.pinned === true)
     .map((l) => `image.${l.id}`);
@@ -1964,6 +2375,20 @@ export const resolveLayerOrder = (project: Project): string[] =>
 export const resolveLeafOrder = (project: Project): string[] =>
   flattenTree(resolveLayerTree(project), true);
 
+// The project's CURRENT root-level render order as an explicit `layer_order`
+// value: every non-pinned root id (leaves and groups, no descendants),
+// back-to-front exactly as resolveLayerTree renders them today. Ops that
+// append a new id to `layer_order` expecting it to land ON TOP must write
+// this first when the existing order may be partial — unlisted root ids
+// (legacy projects on the canonical fallback) render ABOVE the explicit
+// list, so appending to a partial list sinks the new layer underneath them.
+export const materializeRootLayerOrder = (project: Project): string[] => {
+  const pinned = new Set(collectPinnedRootIds(project));
+  return resolveLayerTree(project)
+    .map((n) => n.id)
+    .filter((id) => !pinned.has(id));
+};
+
 // The immediate parent group's bare id (no "group." prefix), or null if the
 // element sits at the tree root or isn't referenced by any group.
 export const findParentGroup = (
@@ -1994,6 +2419,32 @@ export const getAncestorGroupChain = (
     current = `group.${parentGid}`;
   }
   return chain;
+};
+
+// Drop any selected id whose ANCESTOR group is also in the same selection. A
+// group already carries its descendants, so any operation that moves both the
+// group and one of its members (multi-drag, align, distribute) would shift that
+// member twice — once via the group's transform, once via its own base. Keeping
+// only the top-most selected element on each nesting path makes every such
+// operation move independent things. Order-preserving; dedupes first occurrence.
+// The single source of truth shared by the drag co-move path (CanvasOverlay) and
+// the align / distribute store actions.
+export const deNestSelection = (
+  project: Project,
+  ids: readonly string[],
+): string[] => {
+  const sel = new Set(ids);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (getAncestorGroupChain(project, id).some((g) => sel.has(`group.${g}`))) {
+      continue;
+    }
+    out.push(id);
+  }
+  return out;
 };
 
 // All descendant element ids of a group (depth-first, leaves and nested
@@ -2090,4 +2541,83 @@ export const layerOf = (
 ): AnyLayer | null =>
   elementIndex(project).get(elementId) ??
   findLayerByElementId(project, elementId);
+
+// ───────────────────────────────────────────────────────────────────────────
+// Timeline blocks — a layer's on-timeline existence window + block-local time.
+//
+// Every layer optionally carries a `block` ({start, duration}); absent means
+// "always present" (a block spanning the whole comp, keyframes sampled at
+// absolute frames). These four resolvers are the SINGLE source of truth for the
+// block model — the renderer, DOM sync, content-duration, and tools all route
+// through them so canvas and DOM stay frame-for-frame identical. Never re-derive
+// the offset/gate inline.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Sentinel duration for an absent (always-present) block: unbounded, so the
+// visibility gate never culls and sampling is at absolute frames. Never
+// serialized — a stored block always has a finite positive duration.
+const ALWAYS_PRESENT_DURATION = Number.POSITIVE_INFINITY;
+
+// The layer's on-timeline window in its PARENT's timeline, defaulting to the
+// always-present window when the layer has no stored block.
+export const blockOf = (
+  project: Project,
+  elementId: string,
+): { start: number; duration: number } => {
+  const block = layerOf(project, elementId)?.block;
+  if (!block) return { start: 0, duration: ALWAYS_PRESENT_DURATION };
+  return { start: block.start, duration: block.duration };
+};
+
+// Sum of the TIME ORIGINS of every ANCESTOR embedded morpha band of `elementId`
+// (each band's block.start). A band's whole subtree plays relative to where the
+// band sits on the host timeline, so its descendants subtract this. Regular
+// (non-band) ancestor groups contribute nothing — grouping never retimes.
+// Memoized per Project identity (structural, frame-independent) so the per-frame
+// render loop doesn't re-walk the ancestor chain 5× per layer — same
+// invalidate-on-clone contract as elementIndex.
+const bandOriginSumCache = new WeakMap<Project, Map<string, number>>();
+const ancestorBandOriginSum = (project: Project, elementId: string): number => {
+  let cache = bandOriginSumCache.get(project);
+  if (!cache) {
+    cache = new Map();
+    bandOriginSumCache.set(project, cache);
+  }
+  const hit = cache.get(elementId);
+  if (hit !== undefined) return hit;
+  let sum = 0;
+  for (const gid of getAncestorGroupChain(project, elementId)) {
+    const g = layerOf(project, `group.${gid}`) as Group | null;
+    if (g && isMorphaGroup(g)) sum += g.block?.start ?? 0;
+  }
+  cache.set(elementId, sum);
+  return sum;
+};
+
+// The frame offset to subtract before sampling a layer's OWN animation tracks,
+// making keyframes block-relative (own block.start) AND band-local (ancestor
+// band origins). A blockless root layer with no band ancestors returns 0 ⇒
+// absolute-frame sampling ⇒ identical to the pre-blocks behavior. The renderer's
+// resolveTrack/evalFill and content-duration route every track read through this.
+export const effectiveFrameOffset = (
+  project: Project,
+  elementId: string,
+): number =>
+  ancestorBandOriginSum(project, elementId) + blockOf(project, elementId).start;
+
+// True when the layer is NOT drawn at `frame` (frame outside its block window).
+// `frame` is the raw composition frame; the layer's block window is expressed in
+// its PARENT timeline, so ancestor band origins are subtracted first. Always
+// false for an always-present (blockless) layer. The one gate the canvas
+// (drawNode) and the DOM sync both call.
+export const frameOutsideBlock = (
+  project: Project,
+  elementId: string,
+  frame: number,
+): boolean => {
+  const { start, duration } = blockOf(project, elementId);
+  if (duration === ALWAYS_PRESENT_DURATION) return false;
+  const parentFrame = frame - ancestorBandOriginSum(project, elementId);
+  return parentFrame < start || parentFrame >= start + duration;
+};
 

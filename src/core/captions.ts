@@ -232,15 +232,13 @@ export const buildCaptionsForClip = (
   if (captionIds.length === 0) {
     return { project, ok: false, error: "caption track produced no layers" };
   }
-  let cur = track.project;
-
-  // 2. wrap them in a "captions" group.
-  const capGroup = groupLayers(cur, { elementIds: captionIds, name: "captions" });
-  if (!capGroup.result.ok) {
-    return { project: cur, ok: false, error: `group captions failed: ${capGroup.result.error}` };
+  // 2. add_caption_track already wraps the caption layers in a "captions" group;
+  // reuse it rather than nesting a second "captions"-inside-"captions".
+  const captionsGroupId = (track.result.data as { groupElementId?: string }).groupElementId;
+  if (!captionsGroupId) {
+    return { project, ok: false, error: "caption track produced no captions group" };
   }
-  const captionsGroupId = (capGroup.result.data as { elementId: string }).elementId;
-  cur = capGroup.project;
+  let cur = track.project;
 
   // 3. group [video, captions] together — only when they share a parent (both
   // freshly at root is the common case). If the video is already nested, leave

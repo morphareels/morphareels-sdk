@@ -1,9 +1,9 @@
 import type { Project } from "./schemas.ts";
 
-// The single source of truth for "what a blank project is". A fresh project
-// the user creates via the editor's New button, and the editor store's
-// boot-time placeholder, both come from here — so the empty starting state is
-// defined in exactly one place.
+// The single source of truth for "what a blank morpha is". A fresh document the
+// user creates via the New flow, and the editor store's boot-time placeholder,
+// both come from here — so the empty starting state is defined in exactly one
+// place.
 //
 // The body mirrors the minimal valid project the schema accepts: a single
 // pinned `is_background` image_layer (the canvas backdrop — the renderer paints
@@ -26,6 +26,8 @@ export const blankProject = (opts: BlankProjectOpts): Project => {
     project_id: opts.projectId,
     ...(opts.name ? { name: opts.name } : {}),
     schema_version: 2,
+    mode: "video",
+    carousel: null,
     image_layers: [
       {
         id: "background",
@@ -46,6 +48,7 @@ export const blankProject = (opts: BlankProjectOpts): Project => {
     shapes: [],
     layer_order: [],
     groups: [],
+    collection: [],
     // Derived from content (see src/content-duration.ts) — a blank project has
     // no time-based content yet, so this seeds at the 1s floor and grows as
     // content is added. Editor + worker re-fit it on every change.
