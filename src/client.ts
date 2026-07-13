@@ -288,7 +288,8 @@ export interface MorphaClient {
     clip: string,
     opts?: { channel?: string; timeoutMs?: number; steps?: ProcessStep[] },
   ): Promise<ProcessClipOutcome>;
-  /** Process every (unique) video clip in the project, reusing one browser. */
+  /** Process every (unique) video clip in the project — including every
+   *  carousel page's clips — reusing one browser. */
   processProject(
     projectId: string,
     opts?: { clips?: string[]; channel?: string; timeoutMs?: number; steps?: ProcessStep[] },
@@ -361,6 +362,19 @@ const getUploadDispatcher = (): Promise<unknown> => {
 const unquoteEtag = (raw: string): string => {
   const v = raw.trim();
   return v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
+};
+
+/** Every unique clip filename a project references. A carousel keeps its
+ *  content on `carousel.pages[]` (the top-level `video_layers` stays empty),
+ *  so discovery sweeps every page's video layers as well as the top level. */
+export const projectClips = (project: Project): string[] => {
+  const layers = [
+    ...project.video_layers,
+    ...(project.mode === "carousel" && project.carousel
+      ? project.carousel.pages.flatMap((p) => p.video_layers)
+      : []),
+  ];
+  return [...new Set(layers.map((v) => v.clip))];
 };
 
 /**
@@ -829,7 +843,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       let clips = opts.clips;
       if (!clips) {
         const project = await getProject(projectId);
-        clips = [...new Set(project.video_layers.map((v) => v.clip))];
+        clips = projectClips(project);
       }
       return processClipsHeadless({ origin, token, projectId, ...opts, clips });
     },

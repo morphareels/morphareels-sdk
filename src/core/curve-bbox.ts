@@ -85,32 +85,50 @@ export const fitCurveBox = (
 };
 
 // Re-tighten one curve shape's bbox to hug its ink, preserving the curve's
-// absolute on-canvas position. Idempotent — an already-tight curve is returned
-// unchanged (same reference), so callers can cheaply skip no-op work.
+// absolute on-canvas position AT EVERY FRAME. Idempotent — an already-fitted
+// curve is returned unchanged (same reference), so callers can cheaply skip
+// no-op work.
 //
-// Skipped (returned unchanged) when re-basing the fraction points would move
-// the rendered curve:
-//   - non-curve / missing points   — nothing to fit.
-//   - rotation ≠ 0                  — the box rotates about its own centre;
-//                                     moving the centre would swing the ink.
-//   - a size track (width/height/scale) — fractions are relative to the base
-//                                     box, so re-basing them distorts the
-//                                     animated curve at any driven frame.
-// An x/y track is fine: those override the base centre absolutely, so shifting
-// the (unread) base centre is inert.
+// The heal must be render-neutral under whatever transforms the layer carries,
+// so it picks its strategy from them (scale/rotation orbit the pivot, which for
+// every path here must be the bbox centre):
+//   - static rotation only        — fit tight in the local frame; the centre
+//                                   moves by δ locally, so place the new centre
+//                                   at old + Rθ·δ (the rotated image of the new
+//                                   local centre) and the ink is exactly
+//                                   preserved while the rotated box hugs it.
+//   - x/y tracks                  — a track REPLACES the centre, so re-basing
+//                                   the fractions alone would shift the ink at
+//                                   every driven frame by the centre delta;
+//                                   shift each keyframe's VALUE by the same
+//                                   world delta and the whole animation stays
+//                                   rigidly on the new box.
+//   - scale / rotation TRACKS     — no single centre move is right for every
+//                                   frame, so keep the centre PINNED and grow
+//                                   the box symmetrically about it. Offsets
+//                                   from the centre are preserved exactly, so
+//                                   any per-frame scale/rotation about it
+//                                   renders identically. (The box is symmetric
+//                                   rather than minimal — contained, not tight.)
+//
+// Skipped (returned unchanged) only when no re-base can be render-neutral:
+//   - non-curve / missing points  — nothing to fit.
+//   - width/height tracks         — fractions multiply the per-frame animated
+//                                   dims, so any re-base distorts driven frames.
+//   - pivot off-centre while rotation/scale orbit it — preserving the pivot's
+//                                   absolute position would need fractions
+//                                   outside the schema's [0,1].
 export const healCurveShape = (shape: Shape): Shape => {
   if (shape.kind !== "curve") return shape;
   if (!shape.points || shape.points.length < 3) return shape;
-  if (shape.rotation !== 0) return shape;
   const tracks = shape.animations;
-  if (
-    tracks &&
-    ((tracks.width?.length ?? 0) > 0 ||
-      (tracks.height?.length ?? 0) > 0 ||
-      (tracks.scale?.length ?? 0) > 0)
-  ) {
-    return shape;
-  }
+  const has = (p: "x" | "y" | "width" | "height" | "scale" | "rotation") =>
+    (tracks?.[p]?.length ?? 0) > 0;
+  if (has("width") || has("height")) return shape;
+  const pinned = has("scale") || has("rotation");
+  const pivotCentred =
+    Math.abs(shape.pivotX - 0.5) < 1e-6 && Math.abs(shape.pivotY - 0.5) < 1e-6;
+  if (!pivotCentred && (pinned || shape.rotation !== 0)) return shape;
 
   const left = shape.x - shape.width / 2;
   const top = shape.y - shape.height / 2;
@@ -123,25 +141,84 @@ export const healCurveShape = (shape: Shape): Shape => {
   const p2 = abs(shape.points[2]);
   const fit = fitCurveBox([p0, c, p2], shape.stroke_width ?? 10);
 
+  let next: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    points: [CurvePoint, CurvePoint, CurvePoint];
+  };
+  let animations = shape.animations;
+
+  if (pinned) {
+    // Centre-pinned symmetric box: widest padded reach from the (fixed) centre
+    // per axis. Fractions re-based about the same centre keep every offset —
+    // and therefore every scale/rotation-driven frame — identical.
+    const fitLeft = fit.x - fit.width / 2;
+    const fitRight = fit.x + fit.width / 2;
+    const fitTop = fit.y - fit.height / 2;
+    const fitBottom = fit.y + fit.height / 2;
+    const halfW = Math.max(shape.x - fitLeft, fitRight - shape.x, 0.5);
+    const halfH = Math.max(shape.y - fitTop, fitBottom - shape.y, 0.5);
+    const w = halfW * 2;
+    const h = halfH * 2;
+    const frac = (p: CurvePoint): CurvePoint => ({
+      x: (p.x - (shape.x - halfW)) / w,
+      y: (p.y - (shape.y - halfH)) / h,
+    });
+    next = {
+      x: shape.x,
+      y: shape.y,
+      width: w,
+      height: h,
+      points: [frac(p0), frac(c), frac(p2)],
+    };
+  } else {
+    // Tight fit. Under a static rotation the box orbits its own centre, so the
+    // new centre must land on the rotated image of the fitted local centre for
+    // the ink to stay put (θ = 0 reduces to placing it at the fit centre).
+    const dx = fit.x - shape.x;
+    const dy = fit.y - shape.y;
+    const rad = (shape.rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const dwx = dx * cos - dy * sin;
+    const dwy = dx * sin + dy * cos;
+    next = {
+      x: shape.x + dwx,
+      y: shape.y + dwy,
+      width: fit.width,
+      height: fit.height,
+      points: fit.points,
+    };
+    // An x/y track replaces the centre at driven frames — carry the animation
+    // along by the same world delta so the re-based fractions stay rigid.
+    if ((has("x") || has("y")) && tracks) {
+      const shift = (
+        kfs: NonNullable<typeof tracks.x>,
+        delta: number,
+      ): NonNullable<typeof tracks.x> =>
+        delta === 0 ? kfs : kfs.map((k) => ({ ...k, value: k.value + delta }));
+      animations = {
+        ...tracks,
+        ...(has("x") ? { x: shift(tracks.x!, dwx) } : {}),
+        ...(has("y") ? { y: shift(tracks.y!, dwy) } : {}),
+      };
+    }
+  }
+
   // No meaningful drift → keep the existing reference (no churn, and the reload
   // poll's deep-diff stays clean).
   if (
-    Math.abs(fit.x - shape.x) < 0.5 &&
-    Math.abs(fit.y - shape.y) < 0.5 &&
-    Math.abs(fit.width - shape.width) < 0.5 &&
-    Math.abs(fit.height - shape.height) < 0.5
+    Math.abs(next.x - shape.x) < 0.5 &&
+    Math.abs(next.y - shape.y) < 0.5 &&
+    Math.abs(next.width - shape.width) < 0.5 &&
+    Math.abs(next.height - shape.height) < 0.5
   ) {
     return shape;
   }
 
-  return {
-    ...shape,
-    x: fit.x,
-    y: fit.y,
-    width: fit.width,
-    height: fit.height,
-    points: fit.points,
-  };
+  return { ...shape, ...next, animations };
 };
 
 // Heal every curve shape in a project — the top-level composition AND every

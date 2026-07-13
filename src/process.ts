@@ -8,6 +8,8 @@
 // uploads a clip MUST process it through this path or by opening the editor.
 // Requires `playwright` (optional peer dependency) and Google Chrome available.
 
+import { scopeAuthHeaderToOrigin } from "./browser-auth.ts";
+
 /** A processing step. `transcript` + `audio_split` are the audio-only steps the
  *  caption flow needs; `proxy` / `text_regions` / `objects` decode video frames
  *  (slow in headless Chrome). Pass a subset as `steps` to run only those. */
@@ -203,7 +205,7 @@ export const processClip = async (
   try {
     const ctx = await browser.newContext();
     if (opts.token) {
-      await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
+      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = await ctx.newPage();
     return await runOne(
@@ -235,7 +237,7 @@ export const processClips = async (
   try {
     const ctx = await browser.newContext();
     if (opts.token) {
-      await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
+      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = await ctx.newPage();
     const out: ProcessClipOutcome[] = [];

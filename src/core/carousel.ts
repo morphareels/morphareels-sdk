@@ -4,6 +4,7 @@ import type { PageComposition, Project } from "./schemas.ts";
 // module references the other's bindings only inside function bodies — never
 // during module evaluation — so ESM live bindings resolve them at call time.
 import { reflowComposition } from "./tools.ts";
+import { findLayer } from "./import-elements.ts";
 
 // Pure conversions between a carousel's inline `PageComposition` records and the
 // full `Project` the single-composition editor understands. A page is a FULL
@@ -153,6 +154,37 @@ export const commitPageToCarousel = (
     next.canvas_height = edited.canvas_height;
   }
   return next;
+};
+
+// Resolve the composition a cross-project element import should read. A
+// video-mode source passes through unchanged; on a carousel the layers live in
+// carousel.pages[] (the top-level arrays are empty), so return the projection
+// of the page holding the requested elements. Ids spanning several pages are
+// an error (import them page by page — one composition feeds one graft); ids
+// that resolve in NO composition pass the source through unchanged so the
+// import surfaces its canonical "no importable elements" failure downstream.
+export const importSourceComposition = (
+  source: Project,
+  elementIds: string[],
+): { composition: Project; error: string | null } => {
+  if (source.mode !== "carousel" || !source.carousel) {
+    return { composition: source, error: null };
+  }
+  const pagesWithHits = source.carousel.pages.filter((page) =>
+    elementIds.some((id) => findLayer(page, id) !== null),
+  );
+  if (pagesWithHits.length === 0) return { composition: source, error: null };
+  if (pagesWithHits.length > 1) {
+    return {
+      composition: source,
+      error:
+        "the requested elements live on different carousel pages — import them one page at a time",
+    };
+  }
+  return {
+    composition: pageToProject(source, pagesWithHits[0]),
+    error: null,
+  };
 };
 
 // A fresh empty page sized to the given canvas dims: one pinned `is_background`

@@ -57,7 +57,7 @@ export type {
 // ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───
 // createClient({ token }) → getProject / listTools / callTool / addVideo /
 // processClip / renderFrame.
-export { createClient } from "./client.ts";
+export { createClient, projectClips } from "./client.ts";
 export type {
   MorphaClient,
   MorphaClientOptions,

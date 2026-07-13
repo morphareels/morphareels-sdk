@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
+import { scopeAuthHeaderToOrigin } from "./browser-auth.ts";
 
 export interface RenderFrameOptions {
   /** Project id, served at `${origin}/api/project/<id>`. */
@@ -68,7 +69,7 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
   });
   try {
     if (opts.token) {
-      await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
+      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     const url = `${origin}/render-canvas?project=${encodeURIComponent(opts.projectId)}&frame=${frame}`;
@@ -199,7 +200,7 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
   });
   try {
     if (opts.token) {
-      await ctx.setExtraHTTPHeaders({ Authorization: `Bearer ${opts.token}` });
+      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     const url = `${origin}/render-export?project=${encodeURIComponent(opts.projectId)}`;
