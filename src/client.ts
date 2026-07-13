@@ -420,7 +420,23 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         `getProject(${projectId}) failed: HTTP ${res.status} ${await safeText(res)}`.trim(),
       );
     }
-    return projectSchema.parse(migrateProject(await res.json()));
+    const raw = migrateProject(await res.json());
+    const parsed = projectSchema.safeParse(raw);
+    if (!parsed.success) {
+      // The strict schema rejects fields newer than this SDK build (the server
+      // evolves ahead of installed clients) — say so instead of surfacing a
+      // bare ZodError that reads like corrupt data.
+      const issues = parsed.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      throw new Error(
+        `getProject(${projectId}): the project JSON doesn't match this SDK's schema (${issues}). ` +
+          `This usually means the server is newer than your installed morphareels-sdk — ` +
+          `update it (npm i morphareels-sdk@latest) and retry.`,
+      );
+    }
+    return parsed.data;
   };
 
   const listTools = async (): Promise<ToolFunction[]> => {

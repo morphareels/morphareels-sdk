@@ -212,6 +212,58 @@ export const hasDecorations = (
 
 // ── Renderer mappings ───────────────────────────────────────────────────────
 
+// Whitespace runs sitting at the end of a line — i.e. immediately before a
+// "\n" or the end of the string. `[^\S\n]` = any whitespace except the
+// newline itself, so blank lines survive as line breaks.
+const TRAILING_LINE_WS = /[^\S\n]+(?=\n|$)/g;
+
+// Strip trailing whitespace from every line of `text`. Trailing spaces have
+// no ink, but both CSS (`white-space: pre`/`pre-wrap` before a forced break)
+// and canvas fillText count them toward the line's advance width — which
+// visibly shifts center- and right-aligned lines off the ink the user sees
+// ("text alignment doesn't apply to multiple lines"). Every render surface
+// aligns on this stripped model; the STORED text is never touched, so the
+// caret / editing round-trip keeps the user's spaces.
+export const stripLineTrailingWhitespace = (text: string): string =>
+  text.replace(TRAILING_LINE_WS, "");
+
+// stripLineTrailingWhitespace + decoration ranges remapped into the stripped
+// string. Offsets after a removed span shift left by its length; an offset
+// INSIDE a removed span collapses to the span's start (its characters are
+// gone, so a decoration covering only trailing spaces normalizes away).
+export const stripLineTrailingWhitespaceWithDecorations = (
+  text: string,
+  decorations: TextDecorations | null | undefined,
+): { text: string; decorations: TextDecorations | undefined } => {
+  const removed: Range[] = [];
+  let m: RegExpExecArray | null;
+  TRAILING_LINE_WS.lastIndex = 0;
+  while ((m = TRAILING_LINE_WS.exec(text)) !== null) {
+    removed.push({ start: m.index, end: m.index + m[0].length });
+  }
+  if (removed.length === 0) {
+    return { text, decorations: normalizeDecorations(decorations) };
+  }
+  const stripped = stripLineTrailingWhitespace(text);
+  const shift = (o: number): number => {
+    let d = 0;
+    for (const s of removed) {
+      if (o <= s.start) break;
+      d += Math.min(o, s.end) - s.start;
+    }
+    return o - d;
+  };
+  const remap = (list: readonly Range[] | undefined): Range[] =>
+    (list ?? []).map((r) => ({ start: shift(r.start), end: shift(r.end) }));
+  return {
+    text: stripped,
+    decorations: normalizeDecorations({
+      underline: remap(decorations?.underline),
+      strikethrough: remap(decorations?.strikethrough),
+    }),
+  };
+};
+
 const coversAt = (list: readonly Range[], offset: number): boolean =>
   list.some((r) => r.start <= offset && r.end > offset);
 

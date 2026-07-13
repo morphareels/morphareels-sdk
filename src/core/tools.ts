@@ -654,6 +654,9 @@ export type InlineMorphaOptions = {
 // version-pinned "band". Pure: returns a fresh host project, never mutating
 // either input. The band is an ordinary `group` (so the renderer/export
 // composite it natively, no new layer kind) carrying provenance fields.
+// A carousel source keeps its composition in `carousel.pages[]` (top-level
+// arrays empty), so it inlines as the projection of its ACTIVE page —
+// matching the content-tools-target-the-active-page convention.
 //
 // - The source's canvas backdrop (`is_background`) becomes the band group's
 //   editable/removable backdrop fill, so the morpha looks as it does
@@ -676,7 +679,14 @@ export const inlineMorpha = (
   }
 
   const next = cloneProject(host);
-  const src = cloneProject(source);
+  // Inlining a carousel record verbatim would inline its EMPTY top-level
+  // composition (a silent empty band) — project its active page instead,
+  // clamping the cursor the same way dispatchOnProject does.
+  const effectiveSource =
+    source.mode === "carousel" && source.carousel && source.carousel.pages.length > 0
+      ? pageToProject(source, source.carousel.pages[clampedActiveIndex(source)])
+      : source;
+  const src = cloneProject(effectiveSource);
 
   // Source canvas backdrop → band group backdrop fill (editable, removable).
   const srcBg = findBackgroundLayer(src);
@@ -759,7 +769,9 @@ export const inlineMorpha = (
   // live nested under it.
   const bandId = mintId("group");
   const bandElementId = `group.${bandId}`;
-  const displayName = opts.sourceName ?? src.name ?? "";
+  // Fall back to the RECORD's name — a carousel projection's `name` is the
+  // active page's, not the project's.
+  const displayName = opts.sourceName ?? source.name ?? "";
   next.groups = [
     ...next.groups,
     {
@@ -787,7 +799,7 @@ export const inlineMorpha = (
         ? {
             block: {
               start: Math.max(0, Math.round(opts.blockStart)),
-              duration: Math.max(1, computeContentDurationFrames(source)),
+              duration: Math.max(1, computeContentDurationFrames(effectiveSource)),
             },
           }
         : {}),
@@ -4943,7 +4955,8 @@ const setEmbedOrigins: ToolDispatch<SetEmbedOriginsArgs> = (project, args) => {
 // and a custom_fonts duplicate would shadow that reliable loader with a
 // second source of truth. `src` is EITHER a full URL (https://…, data:…) OR an
 // uploaded asset filename in the project's asset bucket (uploaded via
-// /api/upload-asset). Like add_image_layer this does NOT verify an uploaded
+// POST /api/upload-asset/<projectId>, raw bytes + X-Filename header). Like
+// add_image_layer this does NOT verify an uploaded
 // filename exists. Dedupes by family+weight+style, replacing a matching face.
 // The editor/embed font loader (fonts.ts) decodes each via the FontFace API
 // before the first render. NOTE: a pasted URL only loads if that host sends
@@ -6629,6 +6642,66 @@ const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
+// select_page
+// ---------------------------------------------------------------------------
+//
+// Switch which page is ACTIVE — the page every content tool (and
+// describe_video / inspect_layers) reads and writes through dispatchOnProject.
+// add_page activates the page it creates as a side effect; this is the
+// deliberate way to move the cursor, and the only way BACK to an earlier
+// page. Re-selecting the already-active page is a harmless success.
+
+type SelectPageArgs = { index?: unknown };
+
+const selectPage: ToolDispatch<SelectPageArgs> = (project, args) => {
+  if (project.mode !== "carousel" || !project.carousel) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "select_page requires a carousel morpha",
+      },
+    };
+  }
+  const { index } = args;
+  const pages = project.carousel.pages;
+  if (
+    typeof index !== "number" ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= pages.length
+  ) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `index must be an integer in [0, ${pages.length - 1}]`,
+      },
+    };
+  }
+  const next = cloneProject(project);
+  const carousel = next.carousel;
+  if (!carousel) {
+    return {
+      project,
+      result: { ok: false, error: "carousel record missing after clone" },
+    };
+  }
+  carousel.active_index = index;
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        index,
+        page_count: carousel.pages.length,
+        name: carousel.pages[index].name ?? null,
+      },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
 // Catalog + dispatch table
 // ---------------------------------------------------------------------------
 
@@ -6696,6 +6769,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   add_page: addPage as ToolDispatch<never>,
   delete_page: deletePage as ToolDispatch<never>,
   reorder_pages: reorderPages as ToolDispatch<never>,
+  select_page: selectPage as ToolDispatch<never>,
 };
 
 // ---------------------------------------------------------------------------
@@ -6712,12 +6786,14 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
 // to `dispatch` on a video-mode project.
 
 // The tools that operate on the carousel RECORD itself. add_page /
-// delete_page / reorder_pages manage the page list; set_canvas_size is itself
-// carousel-aware (reflows every page — see setCanvasSize).
+// delete_page / reorder_pages manage the page list; select_page moves the
+// active-page cursor; set_canvas_size is itself carousel-aware (reflows every
+// page — see setCanvasSize).
 const CAROUSEL_RECORD_TOOLS = new Set([
   "add_page",
   "delete_page",
   "reorder_pages",
+  "select_page",
   "set_canvas_size",
 ]);
 
@@ -6753,7 +6829,7 @@ export const carouselOverview = (project: Project): CarouselOverview => {
       has_video: p.video_layers.length > 0,
     })),
     note:
-      "This is a carousel. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use add_page / delete_page / reorder_pages to manage pages, and set_canvas_size to resize every page at once.",
+      "This is a carousel. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage pages, and set_canvas_size to resize every page at once.",
   };
 };
 
@@ -6813,7 +6889,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "describe_video",
       description:
-        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a carousel project the tree describes the ACTIVE page and the data carries a `carousel` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; add_page / delete_page / reorder_pages manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
+        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a carousel project the tree describes the ACTIVE page and the data carries a `carousel` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -7072,7 +7148,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_image_layer",
       description:
-        "Add an image layer. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop or /api/upload-asset). To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
+        "Add an image layer. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Filename header). To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
@@ -7963,7 +8039,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_custom_font",
       description:
-        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (/api/upload-asset; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path.",
+        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (POST /api/upload-asset/<projectId>, raw bytes + X-Filename header; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path.",
       parameters: {
         type: "object",
         properties: {
@@ -8400,7 +8476,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_image_filename",
       description:
-        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop or /api/upload-asset). Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
+        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Filename header). Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
       parameters: {
         type: "object",
         properties: {
@@ -8583,6 +8659,24 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
         },
         required: ["from_index", "to_index"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "select_page",
+      description:
+        "Switch which page of the carousel is ACTIVE — the page the content tools target (carousel mode only). Subsequent describe_video / inspect_layers / all content tools read and write this page until the active page changes again. Pages are addressed by 0-based index from describe_video's carousel block. Selecting the already-active page is a harmless no-op; fails on an out-of-range index.",
+      parameters: {
+        type: "object",
+        properties: {
+          index: {
+            type: "number",
+            description: "0-based index of the page to make active.",
+          },
+        },
+        required: ["index"],
       },
     },
   },
