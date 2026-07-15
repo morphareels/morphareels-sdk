@@ -955,6 +955,13 @@ export const stylesSchema = z.record(z.string(), layerStyleSchema);
 // `denoisedFilename`; `useDenoised` picks which one plays (absent/true ⇒
 // cleaned). Both are resolved through `activeOverlayFilename` — the single
 // source of truth so preview, export, and the timeline waveform never drift.
+//
+// `sourceLayerId` welds the overlay to the video layer it was split out of
+// (the element-id form, "video.<id>"). When set, the editor renders the
+// overlay as a waveform footer ON that clip instead of a standalone bottom
+// row, and drags it with the clip; clearing it (Detach) reverts the overlay
+// to an independent track. Absent on standalone audio (music / voiceover) and
+// on legacy split overlays created before the link existed.
 export const audioOverlaySchema = z
   .object({
     id: z.string().min(1),
@@ -968,6 +975,7 @@ export const audioOverlaySchema = z
     soloed: z.boolean().optional(),
     denoisedFilename: z.string().min(1).optional(),
     useDenoised: z.boolean().optional(),
+    sourceLayerId: z.string().min(1).optional(),
   })
   .strict();
 
@@ -1059,9 +1067,13 @@ export const isMorphaGroup = (group: Group): boolean =>
 // Schema version. Bumped when on-disk JSON gains a meaning that older
 // readers can't infer:
 //   1 = post-rev1-migration shape with top-left anchored x/y (legacy).
-//   2 = current. (x, y) on image_layers / shapes / clip_inset is the
-//       CENTRE of the bounding box. migrateProject converts < 2 → 2.
-export const SCHEMA_VERSION = 2 as const;
+//   2 = (x, y) on image_layers / shapes / clip_inset is the CENTRE of the
+//       bounding box. migrateProject converts < 2 → 2.
+//   3 = current. PAGES-ONLY model: a project is `{ …meta, canvas_width,
+//       canvas_height, active_index, pages[≥1] }`. The old top-level
+//       composition arrays + `mode` + `carousel` are gone — migrateToPages
+//       folds them into `pages`. See migrateToPages below.
+export const SCHEMA_VERSION = 3 as const;
 
 // Strip deprecated clip_frame fields from raw input before validation. The
 // pre-refactor schema modelled the source video as a built-in singleton
@@ -1822,6 +1834,245 @@ const migrateGroupConstantTracksToBase = (raw: unknown): unknown => {
   return raw;
 };
 
+// ---------------------------------------------------------------------------
+// Shared composition reflow — used by the v3 migrator (below) and the
+// set_canvas_size tool (src/tools.ts) so both fit content to a new canvas
+// IDENTICALLY. Uniform fit-scale s = min(newW/oldW, newH/oldH) about the
+// centre, then recentre so the old centre maps to the new centre — nothing
+// distorts (a circle stays a circle). Leaf x/y are absolute positions
+// (affine-mapped); width/height scale by s; a group's pivot is an absolute
+// point (mapped) but its x/y keyframes are translation offsets (scale only).
+// A pinned backdrop always fills the canvas. Mutates the layer arrays in place.
+type ReflowLeaf = {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  is_background?: boolean;
+  animations?: {
+    x?: { value: number }[];
+    y?: { value: number }[];
+    width?: { value: number }[];
+    height?: { value: number }[];
+  };
+};
+type ReflowGroup = {
+  pivotX?: number;
+  pivotY?: number;
+  box_width?: number;
+  box_height?: number;
+  animations?: Record<string, { value: number }[] | undefined>;
+};
+type ReflowComposition = {
+  image_layers?: ReflowLeaf[];
+  video_layers?: ReflowLeaf[];
+  text_layers?: ReflowLeaf[];
+  shapes?: ReflowLeaf[];
+  groups?: ReflowGroup[];
+};
+
+export const reflowCompositionLayers = (
+  comp: ReflowComposition,
+  oldW: number,
+  oldH: number,
+  newW: number,
+  newH: number,
+): void => {
+  if (oldW <= 0 || oldH <= 0 || (oldW === newW && oldH === newH)) return;
+  const s = Math.min(newW / oldW, newH / oldH);
+  const mapX = (v: number): number => (v - oldW / 2) * s + newW / 2;
+  const mapY = (v: number): number => (v - oldH / 2) * s + newH / 2;
+  const reflowLeaf = (r: ReflowLeaf | undefined): void => {
+    if (!r) return;
+    if (r.is_background) {
+      r.x = newW / 2;
+      r.y = newH / 2;
+      r.width = newW;
+      r.height = newH;
+      return;
+    }
+    if (typeof r.x === "number") r.x = mapX(r.x);
+    if (typeof r.y === "number") r.y = mapY(r.y);
+    if (typeof r.width === "number") r.width *= s;
+    if (typeof r.height === "number") r.height *= s;
+    const t = r.animations;
+    if (!t) return;
+    if (t.x) for (const kf of t.x) kf.value = mapX(kf.value);
+    if (t.y) for (const kf of t.y) kf.value = mapY(kf.value);
+    if (t.width) for (const kf of t.width) kf.value *= s;
+    if (t.height) for (const kf of t.height) kf.value *= s;
+  };
+  for (const l of comp.image_layers ?? []) reflowLeaf(l);
+  for (const l of comp.video_layers ?? []) reflowLeaf(l);
+  for (const l of comp.shapes ?? []) reflowLeaf(l);
+  for (const l of comp.text_layers ?? []) reflowLeaf(l);
+  for (const g of comp.groups ?? []) {
+    if (!g) continue;
+    if (typeof g.pivotX === "number") g.pivotX = mapX(g.pivotX);
+    if (typeof g.pivotY === "number") g.pivotY = mapY(g.pivotY);
+    if (typeof g.box_width === "number") g.box_width *= s;
+    if (typeof g.box_height === "number") g.box_height *= s;
+    const t = g.animations;
+    if (!t) continue;
+    for (const prop of ["x", "y", "width", "height"] as const) {
+      const kfs = t[prop];
+      if (kfs) for (const kf of kfs) kf.value *= s;
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// v2 → v3: unify to the PAGES-ONLY model.
+//
+// Pre-v3 a project stored its composition TWO ways at once: the top-level layer
+// arrays (the "video" composition) AND an optional `carousel.pages[]`, switched
+// by a `mode` flag. Nothing enforced "exactly one is populated", so half-
+// migrated hybrids existed in prod (a real 9:16 top-level video carrying an
+// orphaned 4:5 carousel page). v3 removes the split: every project is
+// `{ …meta, canvas_width, canvas_height, active_index, pages[≥1] }`, each page a
+// full composition. This migrator folds the old shape into `pages`:
+//   • plain video           → pages = [ topLevelComposition ]
+//   • carousel (empty top)   → pages = carousel.pages (carry active_index)
+//   • hybrid (both present)  → pages = [ topLevelComposition, …carousel.pages ]
+// then reflows any page whose own backdrop diverges from the project canvas (the
+// orphaned 4:5 page in a 9:16 project) so every page fits the ONE canvas. Runs
+// OUTERMOST — after the per-element/background/blocks migrators have normalised
+// the flat composition — so folded pages already carry current-shape layers.
+// Idempotent: an already-v3 record (has `pages`) is normalised and returned.
+const PAGE_COMP_FIELDS = [
+  "image_layers",
+  "video_layers",
+  "text_layers",
+  "shapes",
+  "groups",
+  "layer_order",
+  "audio_overlays",
+  "duration_seconds",
+  "duration_authored",
+  "start_at",
+  "markers",
+  "loop",
+  "loop_start_frame",
+  "loop_end_frame",
+] as const;
+
+const hasNonBackgroundContent = (r: Record<string, unknown>): boolean =>
+  ["image_layers", "video_layers", "text_layers", "shapes", "groups"].some(
+    (f) =>
+      Array.isArray(r[f]) &&
+      (r[f] as unknown[]).some(
+        (l) => l && typeof l === "object" && !(l as { is_background?: boolean }).is_background,
+      ),
+  );
+
+// A page's implied canvas = its pinned background layer's box (the backdrop
+// always fills the canvas). null when there's no such layer.
+const impliedCanvasOf = (
+  page: Record<string, unknown>,
+): { w: number; h: number } | null => {
+  const imgs = page.image_layers;
+  if (!Array.isArray(imgs)) return null;
+  const bg = imgs.find(
+    (l) => l && typeof l === "object" && (l as { is_background?: boolean }).is_background,
+  ) as { width?: unknown; height?: unknown } | undefined;
+  if (!bg) return null;
+  const { width: w, height: h } = bg;
+  return typeof w === "number" && typeof h === "number" && w > 0 && h > 0
+    ? { w, h }
+    : null;
+};
+
+const makePage = (
+  src: Record<string, unknown>,
+  name: unknown,
+): Record<string, unknown> => {
+  const page: Record<string, unknown> = {};
+  for (const f of PAGE_COMP_FIELDS) if (f in src) page[f] = src[f];
+  page.id =
+    typeof src.id === "string" && src.id.length > 0
+      ? src.id
+      : crypto.randomUUID();
+  if (typeof name === "string" && name.length > 0) page.name = name;
+  return page;
+};
+
+const migrateToPages = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object") return raw;
+  const r = { ...(raw as Record<string, unknown>) };
+
+  const canvasW =
+    typeof r.canvas_width === "number" && r.canvas_width > 0 ? r.canvas_width : 1080;
+  const canvasH =
+    typeof r.canvas_height === "number" && r.canvas_height > 0
+      ? r.canvas_height
+      : 1920;
+
+  // Already v3 — normalise (drop any lingering legacy keys, ensure active_index).
+  if (Array.isArray(r.pages)) {
+    for (const f of PAGE_COMP_FIELDS) delete r[f];
+    delete r.mode;
+    delete r.carousel;
+    if (typeof r.active_index !== "number" || r.active_index < 0)
+      r.active_index = 0;
+    r.schema_version = SCHEMA_VERSION;
+    return r;
+  }
+
+  const carousel =
+    r.carousel && typeof r.carousel === "object"
+      ? (r.carousel as { pages?: unknown; active_index?: unknown })
+      : null;
+  const carouselPages: Record<string, unknown>[] =
+    carousel && Array.isArray(carousel.pages)
+      ? (carousel.pages.filter(
+          (p) => p && typeof p === "object",
+        ) as Record<string, unknown>[])
+      : [];
+
+  const pages: Record<string, unknown>[] = [];
+  let activeIndex = 0;
+
+  if (carouselPages.length > 0) {
+    if (hasNonBackgroundContent(r)) {
+      // Hybrid: the top level is a real composition — keep it as page 0, then
+      // the carousel pages follow.
+      pages.push(makePage(r, r.name));
+      for (const pg of carouselPages) pages.push(makePage(pg, pg.name));
+      activeIndex = 0;
+    } else {
+      // Pure carousel: the top level was emptied — carousel pages ARE the project.
+      for (const pg of carouselPages) pages.push(makePage(pg, pg.name));
+      const ci =
+        carousel && typeof carousel.active_index === "number"
+          ? carousel.active_index
+          : 0;
+      activeIndex = Math.max(0, Math.min(ci, pages.length - 1));
+    }
+  } else {
+    // Plain video (or an empty project) → a single page from the top level.
+    pages.push(makePage(r, r.name));
+    activeIndex = 0;
+  }
+
+  // Fit any page whose backdrop diverges from the project canvas.
+  for (const pg of pages) {
+    const implied = impliedCanvasOf(pg);
+    if (implied && (implied.w !== canvasW || implied.h !== canvasH)) {
+      reflowCompositionLayers(pg, implied.w, implied.h, canvasW, canvasH);
+    }
+  }
+
+  for (const f of PAGE_COMP_FIELDS) delete r[f];
+  delete r.mode;
+  delete r.carousel;
+  r.canvas_width = canvasW;
+  r.canvas_height = canvasH;
+  r.pages = pages;
+  r.active_index = activeIndex;
+  r.schema_version = SCHEMA_VERSION;
+  return r;
+};
+
 const preprocessProject = (raw: unknown): unknown => {
   const base = migrateFlattenPerElementMaps(
     migrateImageTextLayers(
@@ -1836,11 +2087,13 @@ const preprocessProject = (raw: unknown): unknown => {
       ),
     ),
   );
-  // Both outermost migrators run after the per-element maps are flattened onto
-  // each layer. They touch disjoint fields (collection ids vs. layer blocks), so
-  // their order relative to each other doesn't matter.
-  return migrateGroupConstantTracksToBase(
-    migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+  // The per-element-map migrators run first (they flatten onto each layer).
+  // migrateToPages runs OUTERMOST — it folds the now-current flat composition
+  // (plus any carousel pages) into the v3 `pages` array.
+  return migrateToPages(
+    migrateGroupConstantTracksToBase(
+      migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+    ),
   );
 };
 
@@ -1992,23 +2245,18 @@ export const projectSchema = z.preprocess(
       // can see it.
       org_id: z.string().nullable().optional(),
       schema_version: z.literal(SCHEMA_VERSION),
-      image_layers: z.array(imageLayerSchema).default([]),
-      video_layers: z.array(videoLayerSchema).default([]),
-      // Text layers — first-class leaf type, addressed as text.<id>.
-      text_layers: z.array(textLayerSchema).default([]),
-      shapes: z.array(shapeSchema).default([]),
-      // Ordered list of ROOT-LEVEL element ids defining the top of the z-stack
-      // tree (later in array = higher z = on top). Element ids:
-      // "video.<id>", "image.<id>", "shapes.<id>", "group.<id>". Children of
-      // any group are ordered by that group's `children` field, NOT here.
-      // Empty → canonical fallback (ungrouped video layers, then shapes, then
-      // image layers, then groups, all in array order). Missing-from-array but
-      // present-and-ungrouped → appended (defaults to top); present-in-array
-      // but grouped or missing → silently skipped.
-      layer_order: z.array(z.string()).default([]),
-      // Layer groups. See groupSchema. Empty by default; older projects parse
-      // cleanly because the field defaults to [].
-      groups: z.array(groupSchema).default([]),
+      // The composition pages. A project is an ordered list of full
+      // compositions (≥1); a single-page project is a plain "video", a
+      // multi-page one is what used to be a "carousel". Each page (see
+      // pageCompositionSchema) is a complete composition — its own layers,
+      // timeline, and duration — that can be a still OR a video. All pages share
+      // the project's `canvas_width`/`canvas_height`. There is no `mode` and no
+      // separate top-level composition: the editor always edits
+      // `pages[active_index]`, and every render/export path targets a page.
+      pages: z.array(pageCompositionSchema).min(1),
+      // Index of the page currently open in the editor. Persisted so reopening a
+      // project lands on the same page; clamped into range on load.
+      active_index: z.number().int().nonnegative().default(0),
       // Element ids (a leaf like "text.<id>" or a "group.<id>") the user has
       // added to their reusable COLLECTION from THIS project. A workspace
       // teammate — and the owner on their own solo projects — can drop a
@@ -2018,59 +2266,12 @@ export const projectSchema = z.preprocess(
       // collected; ids whose layer was later deleted are simply skipped when the
       // collection is read. Default [] so existing projects parse unchanged.
       collection: z.array(z.string()).default([]),
-      // Composition duration in seconds (drives the timeline / export length).
-      // DERIVED from content, not set by hand: the editor (store
-      // recomputeDuration) and the worker (write-back) re-fit it to the
-      // furthest video-window / keyframe / audio end on every change, with a
-      // 1s floor (see src/content-duration.ts). This stored value is the last
-      // fitted result; the default only applies to a field-less project until
-      // the first re-fit. 30 fps; durationInFrames = ceil(duration_seconds * 30).
-      duration_seconds: z.number().positive().default(1),
-      // Whether `duration_seconds` is USER-AUTHORED (an explicit composition
-      // length the user set by dragging the timeline end handle) rather than
-      // DERIVED from content. When false (the default, and the state of every
-      // legacy project), the editor's recomputeDuration and the worker
-      // write-back re-fit `duration_seconds` to the furthest content (auto-fit,
-      // which also seeds the length as content is added). When true, that
-      // re-fit becomes DISPLAY-ONLY — it never overwrites the authored length —
-      // so the composition is a fixed stage you can author into (needed for
-      // building from scratch, where content doesn't exist to derive a length
-      // from yet) and can be dragged shorter than its content (content past the
-      // end is kept, just not played/exported). "Fit to content" clears this
-      // back to false. Default false ⇒ existing projects behave exactly as
-      // before until the user drags the end.
-      duration_authored: z.boolean().default(false),
-      // Poster timestamp in SECONDS the editor seeks to on first load instead
-      // of frame 0 — so a freshly-opened project doesn't sit on a blank /
-      // cold-open frame. The landing "Try" templates set this to a composed
-      // still (their builds finish a few seconds in, then hold). Clamped into
-      // the comp on load; clones carry it. null/absent ⇒ open at frame 0 (the
-      // historic behaviour). A returning user's saved scrub position still
-      // wins — see the editor load path in App.tsx.
-      start_at: z.number().nonnegative().nullable().default(null),
-      // Audio overlays — independent sound clips scheduled at frame-aligned
-      // starts. Played in the editor preview via WebAudio and mixed into the
-      // MP4 export's AAC track alongside any source-mp4 audio. Default [] so
-      // older projects parse cleanly.
-      audio_overlays: z.array(audioOverlaySchema).default([]),
-      // Timeline markers — named cue points on the timeline ruler (beat
-      // markers, action cues, "CTA here" notes). Frame-aligned, purely
-      // editorial — they don't affect the render. Default [] so older
-      // projects parse cleanly.
-      markers: z.array(markerSchema).default([]),
-      // Loop section — see loopPassSchema. Empty ⇒ the comp plays once;
-      // N passes ⇒ pass i applying its overrides plays in the loop region
-      // (see loop_start_frame / loop_end_frame) once each. The region is a
-      // SUB-SECTION of the video, not the whole video — frames outside
-      // [loop_start_frame, loop_end_frame) play linearly once.
-      loop: z.array(loopPassSchema).default([]),
-      // Loop region — the sub-section of the video that repeats. Frame
-      // numbers in the video's local frame space (0 = video start). If
-      // loop_end_frame is null, the region ends at the video's last frame.
-      // Defaults cover the whole video for back-compat with projects whose
-      // loop was authored before this field existed.
-      loop_start_frame: z.number().int().min(0).default(0),
-      loop_end_frame: z.number().int().min(1).nullable().default(null),
+      // NOTE: composition timeline fields — duration_seconds, duration_authored,
+      // start_at, audio_overlays, markers, loop, loop_start_frame,
+      // loop_end_frame — live on each PAGE now (see pageCompositionSchema), not
+      // on the project. The project only carries what's shared across pages
+      // (canvas dims, fonts) plus per-project metadata.
+      //
       // The version this project state is checkpointed against. null when
       // no version exists yet (brand-new project or pre-versions JSON).
       // Set by the worker on save_version / restore_version; the editor
@@ -2111,15 +2312,6 @@ export const projectSchema = z.preprocess(
       // platform presets + a Pro-gated Custom row.
       canvas_width: z.number().int().positive().default(1080),
       canvas_height: z.number().int().positive().default(1920),
-      // Project mode. "video" (default) is the single-composition editor that
-      // exports one MP4; "carousel" holds ordered pages in `carousel` and
-      // exports ordered PNGs. Additive + defaulted so existing R2 projects
-      // parse unchanged as "video".
-      mode: z.enum(["video", "carousel"]).default("video"),
-      // The carousel record — present only in carousel mode, holding the
-      // still pages. null (default) in video mode. Style is chosen at creation,
-      // never flipped on an existing morpha.
-      carousel: carouselSchema.nullable().default(null),
     })
     .strict(),
 );
@@ -2130,6 +2322,16 @@ export type TrackProperty = z.infer<typeof trackPropertySchema>;
 export type ElementTracks = z.infer<typeof elementTracksSchema>;
 export type Animations = z.infer<typeof animationsSchema>;
 export type Project = z.infer<typeof projectSchema>;
+// A flat, single-composition VIEW of one page of a project — the shape the
+// renderer and the pure tools operate on. It carries the page's composition
+// (layers + timeline) plus the project-level context a render/tool needs
+// (project_id, canvas dims, fonts, collection, embed). Built by
+// compositionForPage() and folded back by writeCompositionBack() (src/
+// carousel.ts). This is a pure selector, NOT stored state — the persisted
+// Project is pages-only. Structurally it equals the pre-v3 flat Project, so the
+// ~1000 `project.<field>` reads in the renderer/tools compile unchanged.
+export type Composition = Omit<Project, "pages" | "active_index"> &
+  Omit<PageComposition, "id" | "name">;
 export type ImageLayer = z.infer<typeof imageLayerSchema>;
 export type VideoLayer = z.infer<typeof videoLayerSchema>;
 export type ShapeKind = z.infer<typeof shapeKindSchema>;
@@ -2152,7 +2354,7 @@ export type Fill = z.infer<typeof fillSchema>;
 // size — text_size is the single source of truth for the font, so it must
 // always be set; an unset text_size makes the renderer derive the font from the
 // box height, which lets a box resize silently change the font.
-export const resolveDefaultTextSize = (project: Project): number => {
+export const resolveDefaultTextSize = (project: Composition): number => {
   const sizes = project.text_layers
     .map((t) => t.text_size)
     .filter((s): s is number => typeof s === "number" && s > 0)
@@ -2243,7 +2445,7 @@ export type Version = z.infer<typeof versionSchema>;
 // group with no kids", which is renderably distinct from a leaf).
 export type LayerNode = { id: string; children?: LayerNode[] };
 
-const collectPresentIds = (project: Project): Set<string> => {
+const collectPresentIds = (project: Composition): Set<string> => {
   const present = new Set<string>();
   for (const v of project.video_layers) present.add(`video.${v.id}`);
   for (const s of project.shapes) present.add(`shapes.${s.id}`);
@@ -2253,7 +2455,7 @@ const collectPresentIds = (project: Project): Set<string> => {
   return present;
 };
 
-const collectGroupedIds = (project: Project): Set<string> => {
+const collectGroupedIds = (project: Composition): Set<string> => {
   const out = new Set<string>();
   for (const g of project.groups ?? []) {
     for (const child of g.children) out.add(child);
@@ -2266,7 +2468,7 @@ const collectGroupedIds = (project: Project): Set<string> => {
 // `layer_order` (which silently ignores them). Today only the canvas
 // backdrop is pinned, but the mechanism is general — any pinned-tagged
 // layer behaves the same way.
-export const collectPinnedRootIds = (project: Project): string[] =>
+export const collectPinnedRootIds = (project: Composition): string[] =>
   project.image_layers
     .filter((l) => l.pinned === true)
     .map((l) => `image.${l.id}`);
@@ -2283,7 +2485,7 @@ export const collectPinnedRootIds = (project: Project): string[] =>
 //     of layer_order; non-pinned layers sit above them. Render order in
 //     the tree is back-to-front, so the pinned layer paints first.
 // A given element id appears at most once in the whole tree.
-export const resolveLayerTree = (project: Project): LayerNode[] => {
+export const resolveLayerTree = (project: Composition): LayerNode[] => {
   const present = collectPresentIds(project);
   const grouped = collectGroupedIds(project);
   const groupById = new Map<string, Group>();
@@ -2366,13 +2568,13 @@ const flattenTree = (nodes: LayerNode[], leavesOnly: boolean): string[] => {
 // Includes group ids interleaved with their descendants. Backwards-compatible
 // with the pre-groups behaviour for projects that have no groups (the result
 // is identical to the old shapes-then-images list).
-export const resolveLayerOrder = (project: Project): string[] =>
+export const resolveLayerOrder = (project: Composition): string[] =>
   flattenTree(resolveLayerTree(project), false);
 
 // Flat render-order list of LEAF ids only (video + shape + image layers).
 // Use this for hit-testing and any consumer that wants to address visual
 // layers and not the abstract groups containing them.
-export const resolveLeafOrder = (project: Project): string[] =>
+export const resolveLeafOrder = (project: Composition): string[] =>
   flattenTree(resolveLayerTree(project), true);
 
 // The project's CURRENT root-level render order as an explicit `layer_order`
@@ -2382,7 +2584,7 @@ export const resolveLeafOrder = (project: Project): string[] =>
 // this first when the existing order may be partial — unlisted root ids
 // (legacy projects on the canonical fallback) render ABOVE the explicit
 // list, so appending to a partial list sinks the new layer underneath them.
-export const materializeRootLayerOrder = (project: Project): string[] => {
+export const materializeRootLayerOrder = (project: Composition): string[] => {
   const pinned = new Set(collectPinnedRootIds(project));
   return resolveLayerTree(project)
     .map((n) => n.id)
@@ -2392,7 +2594,7 @@ export const materializeRootLayerOrder = (project: Project): string[] => {
 // The immediate parent group's bare id (no "group." prefix), or null if the
 // element sits at the tree root or isn't referenced by any group.
 export const findParentGroup = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): string | null => {
   for (const g of project.groups ?? []) {
@@ -2401,12 +2603,28 @@ export const findParentGroup = (
   return null;
 };
 
+// The `reorder_layer` target index (within a parent's bottom→top sibling list)
+// that lands `host` DIRECTLY ABOVE `source` — the arrangement the Layers panel
+// nests a consumed mask stencil under its host. Accounts for the splice
+// shifting `source` down by one when the host starts below it. Returns null
+// when either id is absent or they're already the same slot (nothing to move).
+export const maskArrangeTarget = (
+  siblings: string[],
+  host: string,
+  source: string,
+): number | null => {
+  const h = siblings.indexOf(host);
+  const s = siblings.indexOf(source);
+  if (h < 0 || s < 0 || h === s) return null;
+  return h < s ? s : s + 1;
+};
+
 // Ancestor group ids (bare, no prefix) from root-most to immediate parent,
 // excluding the element itself. Empty for root-level elements / unknown ids.
 // The maxDepth bound is defensive — dispatchers refuse cycles, but a hand-
 // edited file could in principle produce one.
 export const getAncestorGroupChain = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): string[] => {
   const chain: string[] = [];
@@ -2430,7 +2648,7 @@ export const getAncestorGroupChain = (
 // The single source of truth shared by the drag co-move path (CanvasOverlay) and
 // the align / distribute store actions.
 export const deNestSelection = (
-  project: Project,
+  project: Composition,
   ids: readonly string[],
 ): string[] => {
   const sel = new Set(ids);
@@ -2451,7 +2669,7 @@ export const deNestSelection = (
 // groups). Used by ungroup to splice children back in, by renderer hit-test
 // to pick a leaf for drill-down, and to enforce group cycle prevention.
 export const getGroupDescendants = (
-  project: Project,
+  project: Composition,
   groupId: string,
 ): string[] => {
   const groupById = new Map<string, Group>();
@@ -2486,7 +2704,7 @@ export type AnyLayer = ImageLayer | VideoLayer | TextLayer | Shape | Group;
 // layer. The single lookup that replaces the ~25 inline
 // `if (eid.startsWith("image.")) { …find… }` dispatches across editor + tools.
 export const findLayerByElementId = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): AnyLayer | null => {
   const dot = elementId.indexOf(".");
@@ -2512,13 +2730,13 @@ export const findLayerByElementId = (
 // Per-Project-identity cache of element id → layer record. The store clones the
 // project (structuredClone) on every mutation, so a fresh identity invalidates
 // this automatically — no manual invalidation needed.
-const elementIndexCache = new WeakMap<Project, Map<string, AnyLayer>>();
+const elementIndexCache = new WeakMap<Composition, Map<string, AnyLayer>>();
 
 // Build (once per Project identity, then cached) a map from element id → layer.
 // For per-frame hot paths (renderer/geometry samplers) that previously did O(1)
 // `project.animations[eid]` map lookups and must stay O(1) now that the data
 // is on the records.
-export const elementIndex = (project: Project): Map<string, AnyLayer> => {
+export const elementIndex = (project: Composition): Map<string, AnyLayer> => {
   const cached = elementIndexCache.get(project);
   if (cached) return cached;
   const idx = new Map<string, AnyLayer>();
@@ -2536,7 +2754,7 @@ export const elementIndex = (project: Project): Map<string, AnyLayer> => {
 // identity); never caches a null. Mutators in src/tools.ts that splice layer
 // arrays mid-function should use findLayerByElementId (uncached) instead.
 export const layerOf = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): AnyLayer | null =>
   elementIndex(project).get(elementId) ??
@@ -2561,7 +2779,7 @@ const ALWAYS_PRESENT_DURATION = Number.POSITIVE_INFINITY;
 // The layer's on-timeline window in its PARENT's timeline, defaulting to the
 // always-present window when the layer has no stored block.
 export const blockOf = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): { start: number; duration: number } => {
   const block = layerOf(project, elementId)?.block;
@@ -2576,8 +2794,8 @@ export const blockOf = (
 // Memoized per Project identity (structural, frame-independent) so the per-frame
 // render loop doesn't re-walk the ancestor chain 5× per layer — same
 // invalidate-on-clone contract as elementIndex.
-const bandOriginSumCache = new WeakMap<Project, Map<string, number>>();
-const ancestorBandOriginSum = (project: Project, elementId: string): number => {
+const bandOriginSumCache = new WeakMap<Composition, Map<string, number>>();
+const ancestorBandOriginSum = (project: Composition, elementId: string): number => {
   let cache = bandOriginSumCache.get(project);
   if (!cache) {
     cache = new Map();
@@ -2600,7 +2818,7 @@ const ancestorBandOriginSum = (project: Project, elementId: string): number => {
 // absolute-frame sampling ⇒ identical to the pre-blocks behavior. The renderer's
 // resolveTrack/evalFill and content-duration route every track read through this.
 export const effectiveFrameOffset = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): number =>
   ancestorBandOriginSum(project, elementId) + blockOf(project, elementId).start;
@@ -2611,7 +2829,7 @@ export const effectiveFrameOffset = (
 // false for an always-present (blockless) layer. The one gate the canvas
 // (drawNode) and the DOM sync both call.
 export const frameOutsideBlock = (
-  project: Project,
+  project: Composition,
   elementId: string,
   frame: number,
 ): boolean => {

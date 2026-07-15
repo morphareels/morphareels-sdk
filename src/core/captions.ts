@@ -8,7 +8,7 @@
 // I/O layer fetches it and passes the words in.
 
 import { dispatch, type ToolDispatch } from "./tools.ts";
-import { findParentGroup, type Project } from "./schemas.ts";
+import { findParentGroup, type Composition } from "./schemas.ts";
 
 export interface CaptionLine {
   text: string;
@@ -118,7 +118,7 @@ const clipStem = (filename: string): string =>
   filename.replace(/\.[^.]+$/, "");
 
 export const videoElementIdForClip = (
-  project: Project,
+  project: Composition,
   clip: string,
 ): string | null => {
   const v = project.video_layers.find((x) => x.clip === clip);
@@ -128,7 +128,7 @@ export const videoElementIdForClip = (
 // True when this video already sits in a group that contains a "captions"
 // group — the idempotency guard so we never double-caption.
 export const hasCaptionsForClip = (
-  project: Project,
+  project: Composition,
   videoElementId: string,
 ): boolean => {
   const parentId = findParentGroup(project, videoElementId);
@@ -148,9 +148,9 @@ export const hasCaptionsForClip = (
 // the hasCaptionsForClip guard. No-op (ok: true, removed: 0) when the clip has
 // no captions. Pure — mirrors hasCaptionsForClip's lookup.
 export const removeCaptionsForClip = (
-  project: Project,
+  project: Composition,
   videoElementId: string,
-): { project: Project; ok: boolean; removed: number } => {
+): { project: Composition; ok: boolean; removed: number } => {
   const parentId = findParentGroup(project, videoElementId);
   if (!parentId) return { project, ok: true, removed: 0 };
   const parent = project.groups.find((g) => g.id === parentId);
@@ -185,7 +185,7 @@ export const removeCaptionsForClip = (
 };
 
 export interface BuildCaptionsResult {
-  project: Project;
+  project: Composition;
   ok: boolean;
   error?: string;
   captionsGroupId?: string;
@@ -196,7 +196,7 @@ export interface BuildCaptionsResult {
 // group, and group that with the video layer. Idempotent + no-op when there's
 // nothing to caption. Returns the (possibly unchanged) project.
 export const buildCaptionsForClip = (
-  project: Project,
+  project: Composition,
   opts: { clip: string; lines: CaptionLine[]; style?: string },
 ): BuildCaptionsResult => {
   const { clip, lines } = opts;

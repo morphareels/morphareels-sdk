@@ -364,17 +364,12 @@ const unquoteEtag = (raw: string): string => {
   return v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
 };
 
-/** Every unique clip filename a project references. A carousel keeps its
- *  content on `carousel.pages[]` (the top-level `video_layers` stays empty),
- *  so discovery sweeps every page's video layers as well as the top level. */
+/** Every unique clip filename a project references. A project is pages-only —
+ *  its content lives on `pages[]` — so discovery sweeps every page's video
+ *  layers, deduping across (and within) pages. */
 export const projectClips = (project: Project): string[] => {
-  const layers = [
-    ...project.video_layers,
-    ...(project.mode === "carousel" && project.carousel
-      ? project.carousel.pages.flatMap((p) => p.video_layers)
-      : []),
-  ];
-  return [...new Set(layers.map((v) => v.clip))];
+  const clips = project.pages.flatMap((p) => p.video_layers.map((v) => v.clip));
+  return [...new Set(clips)];
 };
 
 /**

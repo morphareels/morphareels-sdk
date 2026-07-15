@@ -221,13 +221,11 @@ export const healCurveShape = (shape: Shape): Shape => {
   return { ...shape, ...next, animations };
 };
 
-// Heal every curve shape in a project — the top-level composition AND every
-// carousel page. Returns the same project reference when nothing changed so
-// it's cheap to run on every load / poll tick without tripping identity-based
-// re-renders or the reload poll's deep-diff.
+// Heal every curve shape in a project — across every page. Returns the same
+// project reference when nothing changed so it's cheap to run on every load /
+// poll tick without tripping identity-based re-renders or the reload poll's
+// deep-diff.
 export const healCurveBboxes = (project: Project): Project => {
-  let changed = false;
-
   const healShapes = (shapes: Shape[]): Shape[] => {
     let touched = false;
     const next = shapes.map((s) => {
@@ -238,20 +236,10 @@ export const healCurveBboxes = (project: Project): Project => {
     return touched ? next : shapes;
   };
 
-  const shapes = healShapes(project.shapes);
-  if (shapes !== project.shapes) changed = true;
-
-  let carousel = project.carousel;
-  if (carousel) {
-    const pages = carousel.pages.map((page) => {
-      const pageShapes = healShapes(page.shapes);
-      return pageShapes === page.shapes ? page : { ...page, shapes: pageShapes };
-    });
-    if (pages.some((p, i) => p !== carousel!.pages[i])) {
-      carousel = { ...carousel, pages };
-      changed = true;
-    }
-  }
-
-  return changed ? { ...project, shapes, carousel } : project;
+  const pages = project.pages.map((page) => {
+    const pageShapes = healShapes(page.shapes);
+    return pageShapes === page.shapes ? page : { ...page, shapes: pageShapes };
+  });
+  const changed = pages.some((p, i) => p !== project.pages[i]);
+  return changed ? { ...project, pages } : project;
 };

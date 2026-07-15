@@ -27,10 +27,11 @@ import {
   type FontSource,
 } from "./font-sources.ts";
 import {
+  activeComposition,
   blankPage,
-  commitPageToCarousel,
-  pageToProject,
-  projectToPage,
+  clampActiveIndex,
+  compositionForPage,
+  writeCompositionBack,
 } from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
@@ -42,9 +43,11 @@ import {
   isMorphaGroup,
   materializeRootLayerOrder,
   projectSchema,
+  reflowCompositionLayers,
   resolveDefaultTextSize,
   resolveLayerTree,
   type AudioOverlay,
+  type Composition,
   type ColorKeyframe,
   type Easing,
   type ElementColorTracks,
@@ -90,22 +93,41 @@ export type ToolResult =
   | { ok: true; data?: unknown }
   | { ok: false; error: string };
 
+// A composition-scoped tool (the vast majority: layers, keyframes, styles,
+// groups, audio, duration, text …) operates on a flat `Composition` — the
+// active page projected with its project-level render context. `project` is the
+// historical field name kept so the ~1000 `project.<field>` reads in the tool
+// bodies compile unchanged; it holds a Composition, not the whole Project.
 export type ToolOutcome = {
-  project: Project;
+  project: Composition;
   result: ToolResult;
 };
 
 export type ToolDispatch<Args = Record<string, unknown>> = (
-  project: Project,
+  project: Composition,
   args: Args,
 ) => ToolOutcome;
+
+// A project-scoped tool operates on the whole pages-only Project — the few that
+// manage the page list (add/delete/reorder/select) or touch every page at once
+// (set_canvas_size). Routed by dispatchOnProject; never runs on a projection.
+export type ProjectToolOutcome = {
+  project: Project;
+  result: ToolResult;
+};
+
+export type ProjectToolDispatch<Args = Record<string, unknown>> = (
+  project: Project,
+  args: Args,
+) => ProjectToolOutcome;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-const cloneProject = (p: Project): Project =>
-  structuredClone(p) as Project;
+// Deep clone a Composition (the common case in composition tools) or a whole
+// Project (the project-scoped tools). Generic so both callers keep their type.
+const cloneProject = <T>(p: T): T => structuredClone(p) as T;
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
 
@@ -228,7 +250,7 @@ const normalizeStopOffset = (
 // frozen pivot — so this returns zeros for them. Used by apply_preset to
 // turn delta-style tuple values (slide/shake) into absolute keyframes.
 const baseForElement = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): { x: number; y: number } => {
   if (elementId.startsWith("image.")) {
@@ -279,7 +301,7 @@ const VALID_EASINGS: Easing[] = [
 ];
 
 const ensureTrack = (
-  project: Project,
+  project: Composition,
   elementId: string,
   property: TrackProperty,
 ): Keyframe[] => {
@@ -302,7 +324,7 @@ const sortByFrame = (kfs: Keyframe[]) => {
 // already exists at that frame, its value (and optionally easing) are updated;
 // otherwise a new one is inserted with linear easing as the default.
 const upsertKeyframe = (
-  project: Project,
+  project: Composition,
   elementId: string,
   property: TrackProperty,
   frame: number,
@@ -324,14 +346,14 @@ const upsertKeyframe = (
 // resolver to invent missing entries (so old files round-trip cleanly), but
 // dispatchers that splice into the root list need a definite ordering — call
 // this on the cloned project before any layer_order mutation.
-const normalizeRoot = (project: Project): void => {
+const normalizeRoot = (project: Composition): void => {
   project.layer_order = resolveLayerTree(project).map((n) => n.id);
 };
 
 // Base-position centre of a child element. Used to seed a new group's pivot.
 // Returns null for unknown ids; the caller defaults to the canvas centre.
 const childBaseCenter = (
-  project: Project,
+  project: Composition,
   childId: string,
 ): { x: number; y: number } | null => {
   if (childId.startsWith("video.")) {
@@ -376,7 +398,7 @@ export const BACKGROUND_LAYER_ID = "background";
 
 export type LayerKind = "image" | "video" | "text" | "shapes" | "group";
 
-const allLayerIdsForKind = (project: Project, kind: LayerKind): Set<string> => {
+const allLayerIdsForKind = (project: Composition, kind: LayerKind): Set<string> => {
   const out = new Set<string>();
   const arr =
     kind === "image"
@@ -392,7 +414,7 @@ const allLayerIdsForKind = (project: Project, kind: LayerKind): Set<string> => {
   return out;
 };
 
-export const generateLayerId = (project: Project, kind: LayerKind): string => {
+export const generateLayerId = (project: Composition, kind: LayerKind): string => {
   const existing = allLayerIdsForKind(project, kind);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const buf = new Uint8Array(3);
@@ -423,7 +445,7 @@ export const generateLayerId = (project: Project, kind: LayerKind): string => {
 //   - `public_properties[*].layer_id`
 // Both ids must share the same kind prefix; the function throws otherwise.
 export const rekeyElementId = (
-  project: Project,
+  project: Composition,
   oldElementId: string,
   newElementId: string,
 ): void => {
@@ -526,7 +548,7 @@ export const rekeyElementId = (
 // is the caller's splice, which also carries off its per-element animations /
 // style / track_loops / color_tracks). When a reference site is added to
 // rekeyElementId, add it here too.
-const purgeElementId = (project: Project, elementId: string): void => {
+const purgeElementId = (project: Composition, elementId: string): void => {
   // 2. layer_order
   project.layer_order = project.layer_order.filter((id) => id !== elementId);
 
@@ -592,7 +614,7 @@ const purgeElementId = (project: Project, elementId: string): void => {
 // `text.label-raj`). Mutates `project` in place; returns the list of rekeys
 // performed so the route can report what changed.
 export const normalizeProjectLayerIds = (
-  project: Project,
+  project: Composition,
 ): Array<{ from: string; to: string }> => {
   const rekeys: Array<{ from: string; to: string }> = [];
   const kinds: LayerKind[] = ["image", "video", "text", "shapes", "group"];
@@ -667,8 +689,8 @@ export type InlineMorphaOptions = {
 //   for media layers, `asset_project_id` (so its image/clip resolves from the
 //   source's R2 bucket), then nested under the band group in source z-order.
 export const inlineMorpha = (
-  host: Project,
-  source: Project,
+  host: Composition,
+  source: Composition,
   opts: InlineMorphaOptions,
 ): ToolOutcome => {
   if (!opts.sourceMorphaId) {
@@ -679,14 +701,9 @@ export const inlineMorpha = (
   }
 
   const next = cloneProject(host);
-  // Inlining a carousel record verbatim would inline its EMPTY top-level
-  // composition (a silent empty band) — project its active page instead,
-  // clamping the cursor the same way dispatchOnProject does.
-  const effectiveSource =
-    source.mode === "carousel" && source.carousel && source.carousel.pages.length > 0
-      ? pageToProject(source, source.carousel.pages[clampedActiveIndex(source)])
-      : source;
-  const src = cloneProject(effectiveSource);
+  // `source` is already the flat active-page composition (addMorphaLayer
+  // projects it via activeComposition), so it inlines directly.
+  const src = cloneProject(source);
 
   // Source canvas backdrop → band group backdrop fill (editable, removable).
   const srcBg = findBackgroundLayer(src);
@@ -799,7 +816,7 @@ export const inlineMorpha = (
         ? {
             block: {
               start: Math.max(0, Math.round(opts.blockStart)),
-              duration: Math.max(1, computeContentDurationFrames(effectiveSource)),
+              duration: Math.max(1, computeContentDurationFrames(source)),
             },
           }
         : {}),
@@ -858,7 +875,7 @@ export interface PendingMedia {
 // bundle. Returns null if the id isn't a present group. Deep-clones every
 // record so the bundle is detached from `project`.
 export const collectSubtree = (
-  project: Project,
+  project: Composition,
   rootElementId: string,
 ): SubtreeBundle | null => {
   if (!rootElementId.startsWith("group.")) return null;
@@ -895,7 +912,7 @@ export const collectSubtree = (
 // position, so a paste offset lives on the translation track). Mirrors the
 // store's group-nudge so a pasted group can be dragged clear of the original.
 const bumpGroupFrameZero = (
-  project: Project,
+  project: Composition,
   elementId: string,
   property: TrackProperty,
   delta: number,
@@ -914,10 +931,10 @@ const bumpGroupFrameZero = (
 // another project are repointed at that bucket and returned as `pendingMedia`
 // for the caller to copy across. Pure: never mutates `dest` or `bundle`.
 export const pasteSubtree = (
-  dest: Project,
+  dest: Composition,
   bundle: SubtreeBundle,
   opts: { sourceProjectId: string; offset?: number },
-): { project: Project; rootElementId: string; pendingMedia: PendingMedia[] } => {
+): { project: Composition; rootElementId: string; pendingMedia: PendingMedia[] } => {
   const next = cloneProject(dest);
   const offset = opts.offset ?? 0;
 
@@ -931,7 +948,7 @@ export const pasteSubtree = (
     shapes: bundle.shapes.map((l) => structuredClone(l)),
     groups: bundle.groups.map((l) => structuredClone(l)),
     layer_order: [bundle.rootElementId],
-  } as unknown as Project;
+  } as unknown as Composition;
 
   const reserved: Record<LayerKind, Set<string>> = {
     image: new Set([...next.image_layers, ...sub.image_layers].map((l) => l.id)),
@@ -1044,9 +1061,10 @@ const addMorphaLayer: ToolDispatch<AddMorphaLayerArgs> = (project, args) => {
       },
     };
   }
-  let source: Project;
+  let source: Composition;
   try {
-    source = projectSchema.parse(args.source_project);
+    // The injected JSON is a full (multi-page) Project; inline its active page.
+    source = activeComposition(projectSchema.parse(args.source_project));
   } catch (e) {
     return {
       project,
@@ -1065,9 +1083,9 @@ const addMorphaLayer: ToolDispatch<AddMorphaLayerArgs> = (project, args) => {
 // snapshot (the version-picker re-pin), preserving the band's host placement
 // (pivot, transform tracks, name, colour label, z-order slot) and re-pinning it.
 export const replaceBand = (
-  host: Project,
+  host: Composition,
   bandGroupId: string,
-  freshSource: Project,
+  freshSource: Composition,
   pin: InlineMorphaOptions,
 ): ToolOutcome => {
   const old = host.groups.find((g) => g.id === bandGroupId);
@@ -1132,13 +1150,13 @@ export const replaceBand = (
 // but tolerant of migrated projects where the id may differ). Returns null
 // only for a project that's never been through `projectSchema.parse` — the
 // preprocess guarantees one exists.
-const findBackgroundLayer = (project: Project): ImageLayer | null => {
+const findBackgroundLayer = (project: Composition): ImageLayer | null => {
   for (const l of project.image_layers) {
     if (l.is_background) return l;
   }
   return null;
 };
-const backgroundElementId = (project: Project): string | null => {
+const backgroundElementId = (project: Composition): string | null => {
   const l = findBackgroundLayer(project);
   return l ? `image.${l.id}` : null;
 };
@@ -1147,7 +1165,7 @@ const backgroundElementId = (project: Project): string | null => {
 // schema keep working — they pass "background.canvas" and the dispatcher
 // rewrites it on the fly. Everything else passes through unchanged.
 const resolveBackgroundAlias = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): string => {
   if (elementId === "background.canvas") {
@@ -1177,7 +1195,7 @@ const bareIdOf = (elementId: string, type: ElementType): string =>
 // transform tracks (`animations`) plus the fill colour track (`color_tracks`,
 // surfaced as the pseudo-property "fill"). Returns just the keys, never the
 // keyframe arrays themselves — that's the whole point of the overview.
-const animatedProps = (project: Project, elementId: string): string[] => {
+const animatedProps = (project: Composition, elementId: string): string[] => {
   const out: string[] = [];
   const layer = findLayerByElementId(project, elementId);
   const tracks = layer?.animations as Record<string, unknown[]> | undefined;
@@ -1225,7 +1243,7 @@ type OverviewNode = {
 };
 
 const overviewNode = (
-  project: Project,
+  project: Composition,
   node: { id: string; children?: { id: string; children?: unknown[] }[] },
 ): OverviewNode | null => {
   const elementId = node.id;
@@ -1403,7 +1421,7 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
 type InspectLayersArgs = { elementIds?: unknown; elementId?: unknown };
 
 const fullLayerRecord = (
-  project: Project,
+  project: Composition,
   elementId: string,
 ): Record<string, unknown> | null => {
   const type = elementTypeOf(elementId);
@@ -2473,7 +2491,7 @@ const duplicateInList = <
   },
 >(
   list: T[],
-  next: Project,
+  next: Composition,
   baseId: string,
   kind: LayerKind,
   count: number,
@@ -3325,7 +3343,7 @@ type ColorProperty = (typeof COLOR_PROPS)[number];
 // or image_layer (including the pinned canvas-backdrop image_layer). The
 // caller is responsible for resolving any "background.canvas" alias before
 // reaching here (see resolveBackgroundAlias).
-const isValidColorTarget = (project: Project, elementId: string): boolean => {
+const isValidColorTarget = (project: Composition, elementId: string): boolean => {
   if (elementId.startsWith("image.")) {
     const id = elementId.slice("image.".length);
     return project.image_layers.some((l) => l.id === id);
@@ -4093,6 +4111,7 @@ type AddAudioOverlayArgs = {
   fadeInFrames?: number;
   fadeOutFrames?: number;
   endFrame?: number;
+  sourceLayerId?: string;
 };
 
 const reserveAudioOverlayId = (existing: Set<string>): string => {
@@ -4106,10 +4125,26 @@ const reserveAudioOverlayId = (existing: Set<string>): string => {
 };
 
 const addAudioOverlay: ToolDispatch<AddAudioOverlayArgs> = (project, args) => {
-  const { filename, startFrame, gain, fadeInFrames, fadeOutFrames, endFrame } =
-    args;
+  const {
+    filename,
+    startFrame,
+    gain,
+    fadeInFrames,
+    fadeOutFrames,
+    endFrame,
+    sourceLayerId,
+  } = args;
   if (!filename || typeof filename !== "string") {
     return { project, result: { ok: false, error: "filename is required" } };
+  }
+  if (
+    sourceLayerId !== undefined &&
+    (typeof sourceLayerId !== "string" || sourceLayerId.length === 0)
+  ) {
+    return {
+      project,
+      result: { ok: false, error: "sourceLayerId must be a non-empty string" },
+    };
   }
   if (!Number.isFinite(startFrame) || startFrame < 0) {
     return {
@@ -4177,6 +4212,7 @@ const addAudioOverlay: ToolDispatch<AddAudioOverlayArgs> = (project, args) => {
     fadeOutFrames:
       fadeOutFrames === undefined ? 0 : Math.round(fadeOutFrames),
     ...(endFrame !== undefined ? { endFrame: Math.round(endFrame) } : {}),
+    ...(sourceLayerId !== undefined ? { sourceLayerId } : {}),
   };
   next.audio_overlays = [...(next.audio_overlays ?? []), overlay];
   return { project: next, result: { ok: true, data: overlay } };
@@ -4213,6 +4249,10 @@ type UpdateAudioOverlayArgs = {
   fadeOutFrames?: number;
   endFrame?: number | null;
   filename?: string;
+  // Weld / detach the overlay from a video layer. A "video.<id>" string welds
+  // it (renders as a clip footer, drags with the clip); null clears the link
+  // (Detach → standalone track). Undefined leaves it untouched.
+  sourceLayerId?: string | null;
 };
 
 const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
@@ -4227,9 +4267,23 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     fadeOutFrames,
     endFrame,
     filename,
+    sourceLayerId,
   } = args;
   if (!id || typeof id !== "string") {
     return { project, result: { ok: false, error: "id is required" } };
+  }
+  if (
+    sourceLayerId !== undefined &&
+    sourceLayerId !== null &&
+    (typeof sourceLayerId !== "string" || sourceLayerId.length === 0)
+  ) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "sourceLayerId must be a non-empty string or null",
+      },
+    };
   }
   const overlays = project.audio_overlays ?? [];
   const idx = overlays.findIndex((o) => o.id === id);
@@ -4309,6 +4363,11 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     delete merged.endFrame;
   } else if (endFrame !== undefined) {
     merged.endFrame = Math.round(endFrame);
+  }
+  if (sourceLayerId === null) {
+    delete merged.sourceLayerId;
+  } else if (sourceLayerId !== undefined) {
+    merged.sourceLayerId = sourceLayerId;
   }
   if (
     merged.endFrame !== undefined &&
@@ -4515,7 +4574,7 @@ const MAX_DURATION_SECONDS = 600;
 // `endFrame` is a frame COUNT (>= 1). Mutates the (already-cloned) project in
 // place so the clamp lives in exactly one spot across the three tools. Mirrors
 // the loop-clamp in store.ts setAuthoredDurationFrames / fitDurationToContent.
-const clampLoopRegionToLength = (project: Project, endFrame: number): void => {
+const clampLoopRegionToLength = (project: Composition, endFrame: number): void => {
   if (project.loop_start_frame > endFrame - 1) {
     project.loop_start_frame = Math.max(0, endFrame - 1);
   }
@@ -5990,13 +6049,13 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
 
   let cur = project;
   const created: string[] = [];
-  const setName = (proj: Project, elementId: string, name: string) => {
+  const setName = (proj: Composition, elementId: string, name: string) => {
     const id = elementId.slice("text.".length);
     const tl = proj.text_layers.find((t) => t.id === id);
     if (tl) tl.name = name;
   };
   const setBlock = (
-    proj: Project,
+    proj: Composition,
     elementId: string,
     block: { start: number; duration: number },
   ) => {
@@ -6179,11 +6238,11 @@ const setLoop: ToolDispatch<SetLoopArgs> = (project, args) => {
 // uniform scale. Mirrors the editor's CanvasSizePill behaviour — both the
 // editor store and this tool call reflowComposition.
 
-// Reflow a composition into a new canvas size. Pure: clones, never mutates the
-// input. Leaf x/y are absolute positions (affine-mapped about the centre);
-// width/height scale uniformly. A group's pivot is an absolute point (mapped
-// like a position) but its x/y keyframes are TRANSLATION OFFSETS around that
-// pivot, so they only scale. scale/rotation/opacity tracks are left untouched.
+// Reflow a project into a new canvas size: EVERY page's layers are fit-scaled
+// and recentred from the old canvas to the new one (via the shared
+// reflowCompositionLayers), then the project dims are stamped. Pure: clones,
+// never mutates the input. All pages share the one canvas, so a resize is a
+// whole-project operation — there is no per-page canvas to diverge.
 export const reflowComposition = (
   project: Project,
   newW: number,
@@ -6194,65 +6253,18 @@ export const reflowComposition = (
   const next = cloneProject(project);
   next.canvas_width = newW;
   next.canvas_height = newH;
-  const s = Math.min(newW / oldW, newH / oldH);
-  const mapX = (v: number): number => (v - oldW / 2) * s + newW / 2;
-  const mapY = (v: number): number => (v - oldH / 2) * s + newH / 2;
-
-  const reflowLeaf = (r: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    animations?: ElementTracks;
-  }): void => {
-    r.x = mapX(r.x);
-    r.y = mapY(r.y);
-    r.width *= s;
-    r.height *= s;
-    const t = r.animations;
-    if (!t) return;
-    if (t.x) for (const kf of t.x) kf.value = mapX(kf.value);
-    if (t.y) for (const kf of t.y) kf.value = mapY(kf.value);
-    if (t.width) for (const kf of t.width) kf.value *= s;
-    if (t.height) for (const kf of t.height) kf.value *= s;
-  };
-  for (const l of next.image_layers) {
-    if (l.is_background) {
-      // The pinned backdrop always covers the canvas — the renderer ignores
-      // its stored rect, but keep it coherent with the new frame.
-      l.x = newW / 2;
-      l.y = newH / 2;
-      l.width = newW;
-      l.height = newH;
-      continue;
-    }
-    reflowLeaf(l);
+  for (const page of next.pages) {
+    reflowCompositionLayers(page, oldW, oldH, newW, newH);
   }
-  next.video_layers.forEach(reflowLeaf);
-  next.shapes.forEach(reflowLeaf);
-  next.text_layers.forEach(reflowLeaf);
-
-  for (const g of next.groups) {
-    g.pivotX = mapX(g.pivotX);
-    g.pivotY = mapY(g.pivotY);
-    g.box_width *= s;
-    g.box_height *= s;
-    const t = g.animations;
-    if (!t) continue;
-    // x/y are offsets from the pivot — scale only, no recentre.
-    for (const prop of ["x", "y", "width", "height"] as const) {
-      const kfs = t[prop];
-      if (!kfs) continue;
-      for (const kf of kfs) kf.value *= s;
-    }
-  }
-
   return next;
 };
 
 type SetCanvasSizeArgs = { width?: unknown; height?: unknown };
 
-const setCanvasSize: ToolDispatch<SetCanvasSizeArgs> = (project, args) => {
+const setCanvasSize: ProjectToolDispatch<SetCanvasSizeArgs> = (
+  project,
+  args,
+) => {
   const { width, height } = args;
   const validDim = (n: unknown): n is number =>
     typeof n === "number" && Number.isInteger(n) && n > 0;
@@ -6272,30 +6284,6 @@ const setCanvasSize: ToolDispatch<SetCanvasSizeArgs> = (project, args) => {
         ok: true,
         data: { canvas_width: width, canvas_height: height },
       },
-    };
-  }
-  // Carousel: the content lives in carousel.pages[] and the top level is
-  // empty, so a plain reflow of the record is a silent no-op. Every page
-  // shares the record's dims, so a resize is a WHOLE-carousel operation:
-  // reflow each page (project it at the old dims, scale, fold back) and stamp
-  // the record dims. Carousel-awareness lives in the tool itself rather than
-  // the dispatchOnProject wrapper so the raw `dispatch` path — the SDK's
-  // offline export and the editor controller's runTool — behaves correctly on
-  // a carousel record too.
-  if (project.mode === "carousel" && project.carousel) {
-    const next = cloneProject(project);
-    next.carousel!.pages = project.carousel.pages.map((page) => {
-      const projected = pageToProject(project, page);
-      return projectToPage(
-        page.id,
-        reflowComposition(projected, width, height),
-      );
-    });
-    next.canvas_width = width;
-    next.canvas_height = height;
-    return {
-      project: next,
-      result: { ok: true, data: { canvas_width: width, canvas_height: height } },
     };
   }
   const next = reflowComposition(project, width, height);
@@ -6438,25 +6426,20 @@ const setImageFilename: ToolDispatch<SetImageFilenameArgs> = (project, args) => 
 };
 
 // ---------------------------------------------------------------------------
-// add_page
+// add_page / delete_page / reorder_pages / select_page
 // ---------------------------------------------------------------------------
 //
-// Append a page to a carousel. With duplicate_index, deep-clones that page
-// (minting a fresh id); otherwise appends a blank page sized to the locked
-// aspect. Sets active_index to the new page and returns its index.
+// Page management on the pages-only project. Every project has ≥1 page, so
+// these operate on project.pages + project.active_index directly — no carousel
+// record, no "carousel mode" gate. A single-page "video" is just a 1-page
+// project; add_page turns it into a multi-page one.
 
+// Append a page. With duplicate_index, deep-clones that page (minting a fresh
+// id); otherwise appends a blank page sized to the project canvas. Sets
+// active_index to the new page and returns its index.
 type AddPageArgs = { name?: unknown; duplicate_index?: unknown };
 
-const addPage: ToolDispatch<AddPageArgs> = (project, args) => {
-  if (project.mode !== "carousel" || !project.carousel) {
-    return {
-      project,
-      result: {
-        ok: false,
-        error: "add_page requires a carousel morpha",
-      },
-    };
-  }
+const addPage: ProjectToolDispatch<AddPageArgs> = (project, args) => {
   const { name, duplicate_index } = args;
   if (name !== undefined && typeof name !== "string") {
     return {
@@ -6464,7 +6447,7 @@ const addPage: ToolDispatch<AddPageArgs> = (project, args) => {
       result: { ok: false, error: "name must be a string" },
     };
   }
-  const pages = project.carousel.pages;
+  const pages = project.pages;
   let page: PageComposition;
   if (duplicate_index !== undefined) {
     if (
@@ -6488,46 +6471,25 @@ const addPage: ToolDispatch<AddPageArgs> = (project, args) => {
     page = blankPage(project.canvas_width, project.canvas_height, name);
   }
   const next = cloneProject(project);
-  const carousel = next.carousel;
-  if (!carousel) {
-    return {
-      project,
-      result: { ok: false, error: "carousel record missing after clone" },
-    };
-  }
-  carousel.pages.push(page);
-  const index = carousel.pages.length - 1;
-  carousel.active_index = index;
+  next.pages.push(page);
+  const index = next.pages.length - 1;
+  next.active_index = index;
   return {
     project: next,
-    result: { ok: true, data: { index, page_count: carousel.pages.length } },
+    result: { ok: true, data: { index, page_count: next.pages.length } },
   };
 };
 
-// ---------------------------------------------------------------------------
-// delete_page
-// ---------------------------------------------------------------------------
-//
-// Remove a page from a carousel. Refuses to drop below 1 page. The active
-// page is tracked by id across the splice — deleting a page before it must
-// not silently retarget active_index at a different page. Only when the
-// active page itself is deleted does active_index fall to the page that slid
-// into its position (or the new last page).
-
+// Remove a page. Refuses to drop below 1 page. The active page is tracked by id
+// across the splice — deleting a page before it must not silently retarget
+// active_index at a different page. Only when the active page itself is deleted
+// does active_index fall to the page that slid into its position (or the new
+// last page).
 type DeletePageArgs = { index?: unknown };
 
-const deletePage: ToolDispatch<DeletePageArgs> = (project, args) => {
-  if (project.mode !== "carousel" || !project.carousel) {
-    return {
-      project,
-      result: {
-        ok: false,
-        error: "delete_page requires a carousel morpha",
-      },
-    };
-  }
+const deletePage: ProjectToolDispatch<DeletePageArgs> = (project, args) => {
   const { index } = args;
-  const pages = project.carousel.pages;
+  const pages = project.pages;
   if (
     typeof index !== "number" ||
     !Number.isInteger(index) ||
@@ -6545,60 +6507,37 @@ const deletePage: ToolDispatch<DeletePageArgs> = (project, args) => {
   if (pages.length <= 1) {
     return {
       project,
-      result: { ok: false, error: "a carousel must keep at least 1 page" },
+      result: { ok: false, error: "a project must keep at least 1 page" },
     };
   }
   const next = cloneProject(project);
-  const carousel = next.carousel;
-  if (!carousel) {
-    return {
-      project,
-      result: { ok: false, error: "carousel record missing after clone" },
-    };
-  }
-  const activePageId = carousel.pages[carousel.active_index]?.id;
-  carousel.pages.splice(index, 1);
-  const survivingIndex = carousel.pages.findIndex(
-    (p) => p.id === activePageId,
-  );
-  carousel.active_index =
+  const activePageId = next.pages[clampActiveIndex(next)]?.id;
+  next.pages.splice(index, 1);
+  const survivingIndex = next.pages.findIndex((p) => p.id === activePageId);
+  next.active_index =
     survivingIndex >= 0
       ? survivingIndex
-      : Math.min(index, carousel.pages.length - 1);
+      : Math.min(index, next.pages.length - 1);
   return {
     project: next,
     result: {
       ok: true,
       data: {
         index,
-        active_index: carousel.active_index,
-        page_count: carousel.pages.length,
+        active_index: next.active_index,
+        page_count: next.pages.length,
       },
     },
   };
 };
 
-// ---------------------------------------------------------------------------
-// reorder_pages
-// ---------------------------------------------------------------------------
-//
 // Move a page from one position to another. active_index is rewritten so it
 // keeps pointing at the same page it did before the move.
-
 type ReorderPagesArgs = { from_index?: unknown; to_index?: unknown };
 
-const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
-  if (project.mode !== "carousel" || !project.carousel) {
-    return {
-      project,
-      result: {
-        ok: false,
-        error: "reorder_pages requires a carousel morpha",
-      },
-    };
-  }
+const reorderPages: ProjectToolDispatch<ReorderPagesArgs> = (project, args) => {
   const { from_index, to_index } = args;
-  const pages = project.carousel.pages;
+  const pages = project.pages;
   const validIndex = (n: unknown): n is number =>
     typeof n === "number" && Number.isInteger(n) && n >= 0 && n < pages.length;
   if (!validIndex(from_index) || !validIndex(to_index)) {
@@ -6611,32 +6550,15 @@ const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
     };
   }
   const next = cloneProject(project);
-  const carousel = next.carousel;
-  if (!carousel) {
-    return {
-      project,
-      result: { ok: false, error: "carousel record missing after clone" },
-    };
-  }
-  // active_index isn't schema-bounded by the page count — clamp so a legacy /
-  // hand-edited record can't make the cursor read off the end.
-  const clamped = Math.min(
-    Math.max(0, carousel.active_index),
-    carousel.pages.length - 1,
-  );
-  const activeId = carousel.pages[clamped].id;
-  const [moved] = carousel.pages.splice(from_index, 1);
-  carousel.pages.splice(to_index, 0, moved);
-  carousel.active_index = carousel.pages.findIndex((p) => p.id === activeId);
+  const activeId = next.pages[clampActiveIndex(next)].id;
+  const [moved] = next.pages.splice(from_index, 1);
+  next.pages.splice(to_index, 0, moved);
+  next.active_index = next.pages.findIndex((p) => p.id === activeId);
   return {
     project: next,
     result: {
       ok: true,
-      data: {
-        from_index,
-        to_index,
-        active_index: carousel.active_index,
-      },
+      data: { from_index, to_index, active_index: next.active_index },
     },
   };
 };
@@ -6645,57 +6567,39 @@ const reorderPages: ToolDispatch<ReorderPagesArgs> = (project, args) => {
 // select_page
 // ---------------------------------------------------------------------------
 //
-// Switch which page is ACTIVE — the page every content tool (and
-// describe_video / inspect_layers) reads and writes through dispatchOnProject.
-// add_page activates the page it creates as a side effect; this is the
-// deliberate way to move the cursor, and the only way BACK to an earlier
-// page. Re-selecting the already-active page is a harmless success.
-
+// Switch which page is ACTIVE — the page every content tool (and describe_video
+// / inspect_layers) reads and writes through dispatchOnProject. add_page
+// activates the page it creates; this is the deliberate way to move the cursor,
+// and the only way BACK to an earlier page. Re-selecting the active page is a
+// harmless success. Persisted so headless callers can move between pages.
 type SelectPageArgs = { index?: unknown };
 
-const selectPage: ToolDispatch<SelectPageArgs> = (project, args) => {
-  if (project.mode !== "carousel" || !project.carousel) {
-    return {
-      project,
-      result: {
-        ok: false,
-        error: "select_page requires a carousel morpha",
-      },
-    };
-  }
+const selectPage: ProjectToolDispatch<SelectPageArgs> = (project, args) => {
   const { index } = args;
-  const pages = project.carousel.pages;
   if (
     typeof index !== "number" ||
     !Number.isInteger(index) ||
     index < 0 ||
-    index >= pages.length
+    index >= project.pages.length
   ) {
     return {
       project,
       result: {
         ok: false,
-        error: `index must be an integer in [0, ${pages.length - 1}]`,
+        error: `index must be an integer in [0, ${project.pages.length - 1}]`,
       },
     };
   }
   const next = cloneProject(project);
-  const carousel = next.carousel;
-  if (!carousel) {
-    return {
-      project,
-      result: { ok: false, error: "carousel record missing after clone" },
-    };
-  }
-  carousel.active_index = index;
+  next.active_index = index;
   return {
     project: next,
     result: {
       ok: true,
       data: {
         index,
-        page_count: carousel.pages.length,
-        name: carousel.pages[index].name ?? null,
+        page_count: next.pages.length,
+        name: next.pages[index].name ?? null,
       },
     },
   };
@@ -6759,128 +6663,91 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   add_caption_track: addCaptionTrack as ToolDispatch<never>,
   rename_layer: renameLayer as ToolDispatch<never>,
   set_loop: setLoop as ToolDispatch<never>,
-  set_canvas_size: setCanvasSize as ToolDispatch<never>,
   set_image_filename: setImageFilename as ToolDispatch<never>,
   set_video_clip: setVideoClip as ToolDispatch<never>,
   set_video_layer_muted: setVideoLayerMuted as ToolDispatch<never>,
   set_matte_source: setMatteSource as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
-  add_page: addPage as ToolDispatch<never>,
-  delete_page: deletePage as ToolDispatch<never>,
-  reorder_pages: reorderPages as ToolDispatch<never>,
-  select_page: selectPage as ToolDispatch<never>,
+};
+
+// Project-scoped tools operate on the whole pages-only Project (the page list +
+// active cursor + every-page resize), not a single composition. Kept in a
+// separate table so dispatchOnProject can route them to the record directly
+// while content tools run against the active page's projection.
+export const projectDispatch: Record<string, ProjectToolDispatch<never>> = {
+  set_canvas_size: setCanvasSize as ProjectToolDispatch<never>,
+  add_page: addPage as ProjectToolDispatch<never>,
+  delete_page: deletePage as ProjectToolDispatch<never>,
+  reorder_pages: reorderPages as ProjectToolDispatch<never>,
+  select_page: selectPage as ProjectToolDispatch<never>,
 };
 
 // ---------------------------------------------------------------------------
-// Carousel-aware dispatch
+// Page-aware dispatch
 // ---------------------------------------------------------------------------
 //
-// A carousel project keeps ALL content in carousel.pages[] — the top-level
-// composition arrays are empty. Raw `dispatch[name]` on such a record makes
-// every content tool read/write the empty top level: describe_video reports an
-// empty project and add_shape writes an invisible layer. `dispatchOnProject`
-// is the entry point headless surfaces (HTTP /api/tool, MCP — both via the
-// worker's dispatchPureTool) route through instead: it targets the ACTIVE page
-// for content tools and the record for page management, and is byte-identical
-// to `dispatch` on a video-mode project.
+// Every project is pages-only, and content tools edit ONE page — the active
+// one. `dispatchOnProject` is the entry point headless surfaces (HTTP
+// /api/tool, MCP — both via the worker's dispatchPureTool) and the SDK route
+// through: project-scoped tools run on the whole project; every content tool
+// runs against a projection of the ACTIVE page (compositionForPage) and folds
+// back via writeCompositionBack. describe_video carries a `pages` overview so
+// an agent learns multi-page projects have more than one page.
 
-// The tools that operate on the carousel RECORD itself. add_page /
-// delete_page / reorder_pages manage the page list; select_page moves the
-// active-page cursor; set_canvas_size is itself carousel-aware (reflows every
-// page — see setCanvasSize).
-const CAROUSEL_RECORD_TOOLS = new Set([
-  "add_page",
-  "delete_page",
-  "reorder_pages",
-  "select_page",
-  "set_canvas_size",
-]);
-
-// active_index is schema-checked as a nonnegative int but NOT bounded by the
-// page count, so a legacy / hand-edited record can carry an out-of-range
-// cursor — clamp instead of throwing.
-const clampedActiveIndex = (project: Project): number => {
-  const carousel = project.carousel!;
-  return Math.min(
-    Math.max(0, carousel.active_index),
-    carousel.pages.length - 1,
-  );
-};
-
-export interface CarouselOverview {
+export interface PagesOverview {
   page_count: number;
   active_index: number;
   pages: Array<{ index: number; name: string | null; has_video: boolean }>;
   note: string;
 }
 
-// The agent-facing summary of a carousel's pages, attached to describe_video's
-// data both headless (dispatchOnProject) and in the editor panel. Pages are
-// addressed by INDEX — page ids are internal storage keys, never surfaced.
-export const carouselOverview = (project: Project): CarouselOverview => {
-  const carousel = project.carousel!;
-  return {
-    page_count: carousel.pages.length,
-    active_index: clampedActiveIndex(project),
-    pages: carousel.pages.map((p, index) => ({
-      index,
-      name: p.name ?? null,
-      has_video: p.video_layers.length > 0,
-    })),
-    note:
-      "This is a carousel. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage pages, and set_canvas_size to resize every page at once.",
-  };
-};
+// The agent-facing summary of a project's pages, attached to describe_video's
+// data. Pages are addressed by INDEX — page ids are internal storage keys,
+// never surfaced. Omitted for single-page projects (a plain "video").
+export const pagesOverview = (project: Project): PagesOverview => ({
+  page_count: project.pages.length,
+  active_index: clampActiveIndex(project),
+  pages: project.pages.map((p, index) => ({
+    index,
+    name: p.name ?? null,
+    has_video: p.video_layers.length > 0,
+  })),
+  note:
+    "This project has multiple pages. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use select_page to move between pages, add_page / delete_page / reorder_pages to manage them, and set_canvas_size to resize every page at once.",
+});
 
-// Route one tool call against a project, carousel-aware. Video-mode projects
-// pass straight through to `dispatch[name]` (byte-identical). On a carousel:
-// page-management tools (and the carousel-aware set_canvas_size) run on the
-// record; every other tool runs on a projection of the ACTIVE page
-// (pageToProject) and, when it mutates, folds back via commitPageToCarousel —
-// so collection / custom_fonts / embed_origins edits made on the projection
-// merge to the record's top level. describe_video additionally carries the
-// carouselOverview block so an agent learns the pages exist.
+// Route one tool call against a pages-only project. Project-scoped tools
+// (pages, resize) run on the whole project. Every content tool runs on the
+// ACTIVE page's Composition and, when it mutates, folds back via
+// writeCompositionBack. describe_video on a multi-page project additionally
+// carries the pagesOverview block.
 export const dispatchOnProject = (
   project: Project,
   name: string,
   args: Record<string, unknown>,
-): ToolOutcome => {
-  const fn = dispatch[name] as
-    | ToolDispatch<Record<string, unknown>>
+): ProjectToolOutcome => {
+  const projFn = projectDispatch[name] as
+    | ProjectToolDispatch<Record<string, unknown>>
     | undefined;
+  if (projFn) return projFn(project, args);
+
+  const fn = dispatch[name] as ToolDispatch<Record<string, unknown>> | undefined;
   if (!fn) {
     return { project, result: { ok: false, error: `unknown tool: ${name}` } };
   }
-  if (project.mode !== "carousel" || !project.carousel) {
-    return fn(project, args);
-  }
-  if (CAROUSEL_RECORD_TOOLS.has(name)) return fn(project, args);
-  // The schema requires ≥1 page, but this entry point also takes projects
-  // built in memory — guard rather than let pageToProject throw.
-  if (project.carousel.pages.length === 0) {
-    return { project, result: { ok: false, error: "carousel has no pages" } };
-  }
-  const page = project.carousel.pages[clampedActiveIndex(project)];
-  const projection = pageToProject(project, page);
+  const index = clampActiveIndex(project);
+  const projection = compositionForPage(project, index);
   const { project: edited, result } = fn(projection, args);
-  if (name === "describe_video" && result.ok) {
+  if (name === "describe_video" && result.ok && project.pages.length > 1) {
     const data = result.data as Record<string, unknown>;
     return {
       project,
-      result: {
-        ok: true,
-        data: {
-          ...data,
-          // The projection's `name` is the PAGE name — surface the project's.
-          name: project.name ?? null,
-          carousel: carouselOverview(project),
-        },
-      },
+      result: { ok: true, data: { ...data, pages: pagesOverview(project) } },
     };
   }
   if (!result.ok || edited === projection) return { project, result };
-  return { project: commitPageToCarousel(project, page.id, edited), result };
+  return { project: writeCompositionBack(project, index, edited), result };
 };
 
 export const TOOL_DEFINITIONS: ToolFunction[] = [
@@ -7798,6 +7665,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             description:
               "Optional end frame; omit to play the asset's full natural length from startFrame.",
           },
+          sourceLayerId: {
+            type: "string",
+            description:
+              "Optional video layer element id (\"video.<id>\") to weld this overlay to. When set, the editor renders the overlay as a waveform footer on that clip and drags it with the clip instead of showing a standalone bottom row.",
+          },
         },
         required: ["filename", "startFrame"],
       },
@@ -7835,6 +7707,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           endFrame: {
             type: ["number", "null"],
             description: "End frame, or null to clear and use the asset's natural length.",
+          },
+          sourceLayerId: {
+            type: ["string", "null"],
+            description:
+              "Weld the overlay to a video layer (\"video.<id>\") so it renders as a clip footer and drags with the clip, or null to detach it back into a standalone track.",
           },
         },
         required: ["id"],

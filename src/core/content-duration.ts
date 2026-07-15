@@ -11,7 +11,7 @@
 // function rather than being set by hand. The drag handle / time-pill / the
 // `set_duration` tool that used to write it have all been retired.
 
-import type { AnyLayer, Project, VideoLayer, AudioOverlay } from "./schemas.ts";
+import type { AnyLayer, Composition, VideoLayer, AudioOverlay } from "./schemas.ts";
 import { effectiveFrameOffset, videoWindow } from "./schemas.ts";
 
 const FPS = 30;
@@ -71,7 +71,7 @@ const audioEndFrames = (
 // 0..(count - 1), so a keyframe at frame N needs a count of N + 1 to be
 // playable; video/audio ends are already exclusive counts.
 export const computeContentDurationFrames = (
-  project: Project,
+  project: Composition,
   opts: ContentDurationOptions = {},
 ): number => {
   const floorSeconds = opts.floorSeconds ?? DEFAULT_FLOOR_SECONDS;
@@ -131,6 +131,6 @@ export const computeContentDurationFrames = (
 // Same as `computeContentDurationFrames` but in seconds — the unit
 // `project.duration_seconds` stores.
 export const computeContentDurationSeconds = (
-  project: Project,
+  project: Composition,
   opts: ContentDurationOptions = {},
 ): number => computeContentDurationFrames(project, opts) / FPS;
