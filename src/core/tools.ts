@@ -1401,6 +1401,21 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
     public_properties: project.public_properties,
     // Loop section — see set_loop. Empty ⇒ the comp plays once.
     loop: project.loop,
+    // Audio tracks (music / voiceover / split-out clip audio). Surfaced here so
+    // an agent can find a track's `id` to target with update_audio_overlay
+    // (replace / regain / refade) or remove_audio_overlay — the id is not
+    // otherwise discoverable. `sourceLayerId` (when set) means the track is
+    // welded to that video layer's split-out audio. Empty ⇒ no standalone audio.
+    audio_overlays: (project.audio_overlays ?? []).map((o) => ({
+      id: o.id,
+      filename: o.filename,
+      startFrame: o.startFrame,
+      endFrame: o.endFrame ?? null,
+      gain: o.gain,
+      muted: o.muted ?? false,
+      soloed: o.soloed ?? false,
+      sourceLayerId: o.sourceLayerId ?? null,
+    })),
     layer_count: layerCount,
     // Overview tree, top of z-stack first. Each node lists which properties are
     // animated but NOT the keyframes — call inspect_layers for those.
@@ -2628,6 +2643,14 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
     }
     next.video_layers.splice(idx, 1);
     purgeElementId(next, elementId);
+    // Any overlay welded to this clip (its split-out audio) detaches back to
+    // a standalone track — an overlay pointing at a dead layer id would stay
+    // audible in preview/export but vanish from the Timeline (welded overlays
+    // render inside their source clip's row and are filtered out of the
+    // standalone rows).
+    for (const ov of next.audio_overlays ?? []) {
+      if (ov.sourceLayerId === elementId) delete ov.sourceLayerId;
+    }
     return { project: next, result: { ok: true } };
   }
   if (elementId.startsWith("text.")) {
@@ -4359,6 +4382,14 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
       ? { fadeOutFrames: Math.round(fadeOutFrames) }
       : {}),
   };
+  // Swapping the file (a "replace this track" edit) invalidates any AI-cleaned
+  // companion of the OLD file: activeOverlayFilename would otherwise keep
+  // playing the stale denoisedFilename and shadow the replacement. Drop both so
+  // the new file plays as-is until it's (re)denoised.
+  if (filename !== undefined && filename !== cur.filename) {
+    delete merged.denoisedFilename;
+    delete merged.useDenoised;
+  }
   if (endFrame === null) {
     delete merged.endFrame;
   } else if (endFrame !== undefined) {
@@ -6683,6 +6714,13 @@ export const projectDispatch: Record<string, ProjectToolDispatch<never>> = {
   select_page: selectPage as ProjectToolDispatch<never>,
 };
 
+// True when `name` resolves through dispatchOnProject — a project-scoped tool
+// (projectDispatch) or a page-composition tool (dispatch). Transport
+// reachability guards must use this, never `dispatch` alone: checking only the
+// page-level table 404s the project-scoped tools as "unknown tool".
+export const isPureToolName = (name: string): boolean =>
+  Boolean(projectDispatch[name] ?? dispatch[name]);
+
 // ---------------------------------------------------------------------------
 // Page-aware dispatch
 // ---------------------------------------------------------------------------
@@ -6756,7 +6794,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "describe_video",
       description:
-        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a carousel project the tree describes the ACTIVE page and the data carries a `carousel` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
+        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a multi-page project the tree describes the ACTIVE page and the data carries a `pages` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -8331,7 +8369,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_canvas_size",
       description:
-        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. On a carousel project this resizes the WHOLE carousel — every page shares the dims and reflows by the same factor. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
+        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. On a multi-page project this resizes EVERY page — all pages share the dims and reflow by the same factor. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
       parameters: {
         type: "object",
         properties: {
@@ -8482,7 +8520,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_page",
       description:
-        "Append a page to the carousel (carousel mode only). Without duplicate_index a blank page is appended, sized to the project's canvas. With duplicate_index the page at that position is deep-copied (a fresh id is minted). There is no limit on page count. The new page becomes the active page; its index is returned.",
+        "Append a page to the project — works on any project, turning a single-page video into a multi-page one. Without duplicate_index a blank page is appended, sized to the project's canvas. With duplicate_index the page at that position is deep-copied (a fresh id is minted). There is no limit on page count. The new page becomes the active page; its index is returned.",
       parameters: {
         type: "object",
         properties: {
@@ -8504,7 +8542,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "delete_page",
       description:
-        "Remove the page at `index` from the carousel (carousel mode only). Fails on an out-of-range index or when only one page remains — a carousel must keep at least one page. The active page stays active; when the active page itself is deleted, active_index falls to the neighbouring page (the one that slid into its position, or the new last page).",
+        "Remove the page at `index`. Fails on an out-of-range index or when only one page remains — a project must keep at least one page. The active page stays active; when the active page itself is deleted, active_index falls to the neighbouring page (the one that slid into its position, or the new last page).",
       parameters: {
         type: "object",
         properties: {
@@ -8522,7 +8560,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "reorder_pages",
       description:
-        "Move a page from `from_index` to `to_index` within the carousel (carousel mode only). The remaining pages shift to fill the gap; active_index is rewritten so it keeps pointing at the same page it did before the move. Fails on out-of-range indices.",
+        "Move a page from `from_index` to `to_index`. The remaining pages shift to fill the gap; active_index is rewritten so it keeps pointing at the same page it did before the move. Fails on out-of-range indices.",
       parameters: {
         type: "object",
         properties: {
@@ -8544,7 +8582,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "select_page",
       description:
-        "Switch which page of the carousel is ACTIVE — the page the content tools target (carousel mode only). Subsequent describe_video / inspect_layers / all content tools read and write this page until the active page changes again. Pages are addressed by 0-based index from describe_video's carousel block. Selecting the already-active page is a harmless no-op; fails on an out-of-range index.",
+        "Switch which page is ACTIVE — the page the content tools target. Subsequent describe_video / inspect_layers / all content tools read and write this page until the active page changes again. Pages are addressed by 0-based index from describe_video's pages block. Selecting the already-active page is a harmless no-op; fails on an out-of-range index.",
       parameters: {
         type: "object",
         properties: {

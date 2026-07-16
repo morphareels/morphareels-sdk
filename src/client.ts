@@ -237,6 +237,19 @@ export interface MorphaClient {
     projectId: string,
     opts: { url: string; filename?: string },
   ): Promise<Record<string, unknown>>;
+  /** Upload an audio track into a project — the only way to get audio bytes in
+   *  programmatically. `{ url }` fetches a public http(s) link server-side (the
+   *  `upload_audio` tool); `{ file }` streams a local path to the raw asset
+   *  route. Returns the stored `filename` — pass it to `add_audio_overlay` (add
+   *  a second track) or `update_audio_overlay` `{ id, filename }` (replace an
+   *  existing track's file; find the `id` in `describe_video`'s `audio_overlays`).
+   *  Accepts .mp3/.m4a/.wav/.ogg/.aac; capped at 16 MiB. */
+  uploadAudio(
+    projectId: string,
+    source:
+      | { url: string; filename?: string }
+      | { file: string; filename?: string },
+  ): Promise<Record<string, unknown> & { filename: string }>;
   /** Register a typeface Morpha does NOT ship, so text layers can reference it
    *  by `font_family`. Families already in the built-in catalogs (anything
    *  list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are
@@ -555,6 +568,35 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     throw lastErr ?? new Error("R2 PUT failed");
   };
 
+  // POST raw bytes to the asset route (`/api/upload-asset/:projectId`, filename
+  // in the X-Filename header, Content-Type derived server-side). The transport
+  // behind uploadAudio's `{ file }` branch — the editor uses the same route.
+  const uploadAssetBytes = async (
+    projectId: string,
+    bytes: Uint8Array,
+    filename: string,
+  ): Promise<Record<string, unknown> & { filename: string }> => {
+    const dispatcher = usingDefaultFetch ? await getUploadDispatcher() : undefined;
+    const init: RequestInit & { dispatcher?: unknown } = {
+      method: "POST",
+      headers: headers({ "X-Filename": filename }),
+      body: bytes as unknown as BodyInit,
+      ...(dispatcher ? { dispatcher } : {}),
+    };
+    const res = await doFetch(
+      `${origin}/api/upload-asset/${encodeURIComponent(projectId)}`,
+      init,
+    );
+    const json = (await res.json().catch(() => null)) as
+      | (Record<string, unknown> & { filename?: string; error?: string })
+      | null;
+    if (!res.ok || !json || typeof json.filename !== "string") {
+      const msg = json && typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
+      throw new Error(`upload-asset failed: ${msg}`);
+    }
+    return json as Record<string, unknown> & { filename: string };
+  };
+
   // Upload a large local clip via R2 multipart — many bounded part PUTs instead
   // of one held-open request, so a big clip on a slow uplink can't trip undici's
   // headersTimeout. Mirrors editor/src/api.ts `uploadClipMultipart`.
@@ -816,6 +858,21 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       postRaw("/api/upload-clip/finalize", { projectId, ...opts }),
     uploadImage: async (projectId, opts) =>
       (await serverData("upload_image", projectId, { ...opts })) as Record<string, unknown>,
+    uploadAudio: async (projectId, source) => {
+      if ("url" in source) {
+        return (await serverData("upload_audio", projectId, {
+          url: source.url,
+          filename: source.filename,
+        })) as Record<string, unknown> & { filename: string };
+      }
+      const [{ readFile }, { basename }] = await Promise.all([
+        import("node:fs/promises"),
+        import("node:path"),
+      ]);
+      const bytes = await readFile(source.file);
+      const filename = source.filename ?? basename(source.file);
+      return uploadAssetBytes(projectId, bytes, filename);
+    },
     setCustomFont: async (projectId, opts) => {
       const data = (await serverData("set_custom_font", projectId, {
         ...opts,
