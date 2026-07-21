@@ -155,7 +155,12 @@ const perElementDataFields = {
 // with `pinned: true` + `is_background: true` + no filename. The renderer
 // paints `is_background` layers across the full canvas regardless of
 // x/y/width/height. Pinned layers are forced to the bottom of the root
-// z-stack and refuse deletion / reorder from the UI + tools.
+// z-stack and refuse deletion / reorder from the UI + tools; the geometry
+// tools (move_layer, x/y/width/height keyframes) additionally refuse the
+// backdrop, since those writes render as silent no-ops. Editors should
+// exclude backdrop layers from canvas hit-testing and drag for the same
+// reason — a full-canvas hit target under every tap otherwise swallows
+// selection of the layers above it (the mobile drag-the-background bug).
 export const imageLayerSchema = z
   .object({
     ...perElementDataFields,

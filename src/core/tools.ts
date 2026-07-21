@@ -1175,6 +1175,32 @@ const resolveBackgroundAlias = (
   return elementId;
 };
 
+// Geometry props whose stored values the renderer IGNORES on the canvas
+// backdrop: an `is_background` layer always paints at (0, 0, canvas_width,
+// canvas_height) no matter what its x/y/width/height say (see
+// imageLayerSchema). Writing them "succeeds" but changes nothing on screen —
+// the same silent-no-op class as the mobile editor's drag-the-background bug
+// — so the geometry tools refuse the backdrop loudly instead.
+const BACKDROP_IGNORED_PROPS: ReadonlySet<string> = new Set([
+  "x",
+  "y",
+  "width",
+  "height",
+]);
+
+// True when elementId (after "background.canvas" alias resolution) names the
+// pinned is_background image_layer.
+const isBackdropElement = (project: Composition, elementId: string): boolean => {
+  const resolved = resolveBackgroundAlias(project, elementId);
+  if (!resolved.startsWith("image.")) return false;
+  const id = resolved.slice("image.".length);
+  const layer = project.image_layers.find((l) => l.id === id);
+  return layer?.is_background === true;
+};
+
+const backdropGeometryError = (elementId: string): string =>
+  `${elementId} is the canvas backdrop — it always paints the full canvas, so its position/size are ignored by the renderer. Use set_layer_fill to style it, or set_canvas_size to resize the canvas.`;
+
 type ElementType = "image" | "video" | "text" | "shapes" | "group";
 
 const elementTypeOf = (elementId: string): ElementType | null => {
@@ -1548,6 +1574,12 @@ const moveLayer: ToolDispatch<MoveLayerArgs> = (project, args) => {
   if (height !== undefined && (!Number.isFinite(height) || height <= 0)) {
     return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
+  if (isBackdropElement(project, elementId)) {
+    return {
+      project,
+      result: { ok: false, error: backdropGeometryError(elementId) },
+    };
+  }
 
   const next = cloneProject(project);
 
@@ -1802,6 +1834,12 @@ const addKeyframe: ToolDispatch<AddKeyframeArgs> = (project, args) => {
   if (!isValidColorTarget(project, elementId)) {
     return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
   }
+  if (BACKDROP_IGNORED_PROPS.has(property) && isBackdropElement(project, elementId)) {
+    return {
+      project,
+      result: { ok: false, error: backdropGeometryError(elementId) },
+    };
+  }
   if (easing !== undefined && !VALID_EASINGS.includes(easing as Easing)) {
     return { project, result: { ok: false, error: `invalid easing: ${easing}` } };
   }
@@ -1889,6 +1927,12 @@ const setKeyframesBatch: ToolDispatch<SetKeyframesBatchArgs> = (project, args) =
         result: { ok: false, error: `entry ${i}: invalid property: ${property}` },
       };
     }
+    if (BACKDROP_IGNORED_PROPS.has(property) && isBackdropElement(project, elementId)) {
+      return {
+        project,
+        result: { ok: false, error: `entry ${i}: ${backdropGeometryError(elementId)}` },
+      };
+    }
     if (typeof frame !== "number" || !Number.isFinite(frame) || frame < 0) {
       return {
         project,
@@ -1967,6 +2011,12 @@ const addKeyframes: ToolDispatch<AddKeyframesArgs> = (project, args) => {
   }
   if (!isValidColorTarget(project, elementId)) {
     return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
+  if (BACKDROP_IGNORED_PROPS.has(property) && isBackdropElement(project, elementId)) {
+    return {
+      project,
+      result: { ok: false, error: backdropGeometryError(elementId) },
+    };
   }
   let loopMode: LoopModeArg | undefined;
   if (loop !== undefined && loop !== null) {
@@ -2087,6 +2137,12 @@ const shiftTrack: ToolDispatch<ShiftTrackArgs> = (project, args) => {
   }
   if (!isValidColorTarget(project, elementId)) {
     return { project, result: { ok: false, error: `unknown elementId: ${elementId}` } };
+  }
+  if (BACKDROP_IGNORED_PROPS.has(property) && isBackdropElement(project, elementId)) {
+    return {
+      project,
+      result: { ok: false, error: backdropGeometryError(elementId) },
+    };
   }
   const next = cloneProject(project);
   const layer = findLayerByElementId(next, elementId);
@@ -6823,7 +6879,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "move_layer",
       description:
-        "Set static position/size/rotation of a layer. Writes x/y/w/h/rotation directly on image.<id>, video.<id>, and shapes.<id>; for group.<id> sets pivotX/pivotY (no width/height/rotation — use add_keyframe for group rotation). Note: when a layer has an x / y / rotation keyframe track, the track OVERRIDES the static value at every frame with a keyframe — use add_keyframe to animate, move_layer to set the un-animated default.",
+        "Set static position/size/rotation of a layer. Writes x/y/w/h/rotation directly on image.<id>, video.<id>, and shapes.<id>; for group.<id> sets pivotX/pivotY (no width/height/rotation — use add_keyframe for group rotation). Note: when a layer has an x / y / rotation keyframe track, the track OVERRIDES the static value at every frame with a keyframe — use add_keyframe to animate, move_layer to set the un-animated default. Refuses the canvas backdrop (the pinned is_background image_layer): it always paints the full canvas, so its geometry is render-ignored — style it with set_layer_fill instead.",
       parameters: {
         type: "object",
         properties: {
