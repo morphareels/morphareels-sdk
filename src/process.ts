@@ -1,8 +1,8 @@
 // Headless clip PROCESSING via a real browser — the agent-flow counterpart to
 // render.ts. Drives the editor's /process-clip route with Playwright + system
 // Chrome to run a clip's full pipeline (proxy build, audio split, transcription,
-// OCR, object detection); the artifacts + side-cars land in R2, and the readers
-// (transcribeClip / detectTextRegions / detectObjects) light up afterward.
+// OCR); the artifacts + side-cars land in R2, and the readers
+// (transcribeClip / detectTextRegions) light up afterward.
 //
 // Processing never runs on the worker (no server-side AI), so an agent that
 // uploads a clip MUST process it through this path or by opening the editor.
@@ -11,14 +11,13 @@
 import { scopeAuthHeaderToOrigin } from "./browser-auth.ts";
 
 /** A processing step. `transcript` + `audio_split` are the audio-only steps the
- *  caption flow needs; `proxy` / `text_regions` / `objects` decode video frames
+ *  caption flow needs; `proxy` / `text_regions` decode video frames
  *  (slow in headless Chrome). Pass a subset as `steps` to run only those. */
 export type ProcessStep =
   | "proxy"
   | "audio_split"
   | "transcript"
-  | "text_regions"
-  | "objects";
+  | "text_regions";
 
 export interface ProcessClipOutcome {
   clip: string;
@@ -48,7 +47,7 @@ export interface ProcessClipOptions {
   timeoutMs?: number;
   /** Restrict processing to these steps (default: all). The fast caption path is
    *  `["transcript", "audio_split"]` — it skips the slow/fragile video-frame
-   *  passes (proxy, OCR, object detection) so the run finishes in seconds. */
+   *  passes (proxy, OCR) so the run finishes in seconds. */
   steps?: ProcessStep[];
 }
 
@@ -57,7 +56,7 @@ export interface ProcessClipsOptions extends Omit<ProcessClipOptions, "clip"> {
   clips: string[];
 }
 
-// The pipeline runs transcript → OCR/objects → proxy → audio split serially,
+// The pipeline runs transcript → OCR → proxy → audio split serially,
 // each step time-bounded; 10 min covers a long clip's full run end-to-end. (The
 // transcript lands first, so even a clip that overruns this still gets captions.)
 const PROCESS_DEFAULT_TIMEOUT = 600_000;
@@ -116,7 +115,6 @@ const readManifest = async (
   const byStep: Record<string, { status?: string; error?: string } | undefined> = {
     transcript: m.passes?.transcript,
     text_regions: m.passes?.text_regions,
-    objects: m.passes?.objects,
     proxy: m.proxy,
     audio_split: m.audio_split,
   };
@@ -124,7 +122,6 @@ const readManifest = async (
     ? {
         transcript: byStep.transcript?.status ?? "pending",
         text_regions: byStep.text_regions?.status ?? "pending",
-        objects: byStep.objects?.status ?? "pending",
         proxy: byStep.proxy?.status ?? "pending",
         audio_split: byStep.audio_split?.status ?? "pending",
       }

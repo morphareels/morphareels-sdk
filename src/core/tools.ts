@@ -36,16 +36,22 @@ import {
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
   clampCurve,
+  CAPTIONS_GROUP_NAME,
   fillSchema,
   findLayerByElementId,
   findParentGroup,
   getGroupDescendants,
+  growBlockToCoverFrame,
   isMorphaGroup,
   materializeRootLayerOrder,
   projectSchema,
   reflowCompositionLayers,
+  removeWeldedCaptionLines,
   resolveDefaultTextSize,
   resolveLayerTree,
+  resolveMultiClipLanes,
+  weldedAudioTiming,
+  weldedSourceLayer,
   type AudioOverlay,
   type Composition,
   type ColorKeyframe,
@@ -339,6 +345,11 @@ const upsertKeyframe = (
     kfs.push({ frame, value, easing: easing ?? "linear" });
   }
   sortByFrame(kfs);
+  // A block gates visibility AND re-bases keyframes to its start, so a keyframe
+  // written past the block's end would silently never be drawn. Grow the block
+  // to cover it. No-op for a blockless (always-present) layer, which is what
+  // every headless-created layer is unless the caller asked for a block.
+  growBlockToCoverFrame(project, elementId, frame);
 };
 
 // Force project.layer_order to be a complete list of root-level element ids,
@@ -1228,6 +1239,11 @@ type OverviewNode = {
   source_in_frame?: number;
   source_out_frame?: number | null;
   timeline_start_frame?: number;
+  // Lane (track) grouping for video layers. Clips sharing a lane_id are one
+  // visual track laid end-to-end (split halves / cut_range fragments of one
+  // take). A lane is a TIME track, not a z-order group, so the tree stays 1:1;
+  // bucket video nodes by lane_id to see which clips belong to the same take.
+  lane_id?: string;
   pivotX?: number;
   pivotY?: number;
   childCount?: number;
@@ -1314,6 +1330,7 @@ const overviewNode = (
       source_in_frame: v.source_in_frame,
       source_out_frame: v.source_out_frame,
       timeline_start_frame: v.timeline_start_frame,
+      ...(v.lane_id !== undefined ? { lane_id: v.lane_id } : {}),
       ...animField,
     };
   }
@@ -1376,6 +1393,21 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
     project.shapes.length +
     project.groups.length;
 
+  // Lane (track) grouping — buckets video layers that share a lane_id, i.e. the
+  // pieces of one take laid end-to-end (razor-split halves, cut_range fragments).
+  // Every clip also carries its lane_id inline on its tree node; this summary
+  // surfaces ONLY the lanes that actually group 2+ clips (the interesting ones),
+  // so single-clip projects don't get a redundant 1:1 mapping. Within a lane the
+  // clips are ordered by timeline_start_frame; lanes are ordered by their
+  // earliest clip. A lane is a TIME track, not a z-order group — the tree stays
+  // unchanged. The grouping itself lives in resolveMultiClipLanes (src/schemas)
+  // so the Timeline/Inspector consume the exact same lanes; here we just map
+  // each lane's clips to their element ids.
+  const lanes = resolveMultiClipLanes(project).map((lane) => ({
+    lane_id: lane.lane_id,
+    clips: lane.clips.map((c) => `video.${c.id}`),
+  }));
+
   const data = {
     project_id: project.project_id,
     name: project.name ?? null,
@@ -1415,8 +1447,18 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
       muted: o.muted ?? false,
       soloed: o.soloed ?? false,
       sourceLayerId: o.sourceLayerId ?? null,
+      // AI clean state: whether a cleaned sibling track exists, and the
+      // clean-strength mix (update_audio_overlay's denoiseStrength, absent ⇒
+      // full clean). Absent cleaned track ⇒ the knob has no effect.
+      hasCleanedTrack: !!o.denoisedFilename,
+      denoiseStrength: o.denoiseStrength ?? null,
     })),
     layer_count: layerCount,
+    // Video lanes (time tracks) that group 2+ clips of one take laid
+    // end-to-end. Each clip also carries `lane_id` on its tree node; this lists
+    // only multi-clip lanes so an agent can see, e.g., that two split halves are
+    // the same track. Empty ⇒ every video clip is its own lane (the common case).
+    lanes,
     // Overview tree, top of z-stack first. Each node lists which properties are
     // animated but NOT the keyframes — call inspect_layers for those.
     tree,
@@ -2194,6 +2236,47 @@ const setTrackLoop: ToolDispatch<SetTrackLoopArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
+// Optional `block` on a headless add (add_image_layer / add_shape /
+// add_text_layer)
+// ---------------------------------------------------------------------------
+//
+// THE RULE, so the two surfaces can't drift by accident:
+//
+//   • EDITOR adds (drop an image, + shape, + text) always supply a block —
+//     `defaultBlockOnAdd(playhead, compFrames)` in editor/src/clip-snap.ts:
+//     one shared 5 s clip at the playhead, for every layer kind.
+//   • HEADLESS adds (MCP / HTTP / SDK) OMIT it by default and the layer is
+//     ALWAYS-PRESENT — an unbounded persistent overlay. That is an EXPLICIT,
+//     documented choice, not "whichever function happened to run": an agent
+//     has no playhead, and an agent-placed layer is usually a watermark /
+//     lower-third that should hold for the whole composition.
+//   • A headless caller that wants a clip passes `block: { start, duration }`.
+//
+// Returns the parsed block (or undefined when omitted), or an error string.
+const parseAddBlockArg = (
+  block: unknown,
+):
+  | { block: { start: number; duration: number } | undefined; error?: undefined }
+  | { block?: undefined; error: string } => {
+  if (block === undefined || block === null) return { block: undefined };
+  if (typeof block !== "object" || Array.isArray(block)) {
+    return { error: "block must be an object { start, duration }" };
+  }
+  const { start, duration } = block as { start?: unknown; duration?: unknown };
+  if (typeof start !== "number" || !Number.isFinite(start) || start < 0) {
+    return { error: `invalid block.start: ${String(start)}` };
+  }
+  if (
+    typeof duration !== "number" ||
+    !Number.isFinite(duration) ||
+    duration < 1
+  ) {
+    return { error: `invalid block.duration (must be ≥ 1): ${String(duration)}` };
+  }
+  return { block: { start: Math.round(start), duration: Math.round(duration) } };
+};
+
+// ---------------------------------------------------------------------------
 // add_image_layer
 // ---------------------------------------------------------------------------
 //
@@ -2207,6 +2290,7 @@ type AddImageLayerArgs = {
   y: number;
   width: number;
   height: number;
+  block?: unknown;
 };
 
 const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
@@ -2226,6 +2310,10 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   if (!Number.isFinite(height) || height <= 0) {
     return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
+  const parsedBlock = parseAddBlockArg(args.block);
+  if (parsedBlock.error) {
+    return { project, result: { ok: false, error: parsedBlock.error } };
+  }
   const next = cloneProject(project);
   const id = generateLayerId(next, "image");
   const layer: ImageLayer = {
@@ -2239,6 +2327,8 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
     pivotX: 0.5,
     pivotY: 0.5,
     fill: null,
+    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
+    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
   };
   next.image_layers = [...next.image_layers, layer];
   next.layer_order = [...next.layer_order, `image.${id}`];
@@ -2298,6 +2388,9 @@ const addVideoLayer: ToolDispatch<AddVideoLayerArgs> = (project, args) => {
     source_in_frame: 0,
     source_out_frame: null,
     timeline_start_frame: 0,
+    // A freshly-added clip is its own lane (track); a later split/cut shares this
+    // lane_id across the resulting pieces so they read as one take.
+    lane_id: id,
     fill: null,
   };
   next.video_layers = [...next.video_layers, layer];
@@ -2319,6 +2412,7 @@ type AddShapeArgs = {
   width?: number;
   height?: number;
   color?: string;
+  block?: unknown;
 };
 
 const DEFAULT_SHAPE_W = 320;
@@ -2357,6 +2451,10 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
   if (height !== undefined && (!Number.isFinite(height) || height <= 0)) {
     return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
+  const parsedBlock = parseAddBlockArg(args.block);
+  if (parsedBlock.error) {
+    return { project, result: { ok: false, error: parsedBlock.error } };
+  }
   const next = cloneProject(project);
   const id = generateLayerId(next, "shapes");
   const w = width ?? DEFAULT_SHAPE_W;
@@ -2374,6 +2472,8 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
     rotation: 0,
     pivotX: 0.5,
     pivotY: 0.5,
+    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
+    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
   };
   next.shapes = [...next.shapes, shape];
   next.layer_order = [...next.layer_order, `shapes.${id}`];
@@ -2531,6 +2631,19 @@ const duplicateInList = <
       height: Math.min(MAX_LAYER_DIMENSION, Math.max(1, src.height * scale)),
       rotation: (src.rotation ?? 0) + dr * i,
     };
+    // A duplicated VIDEO clip is a fresh take, not a keyframed sibling: per the
+    // tool contract ("styles are copied; animations are not") drop its animation
+    // + colour tracks and caption anchor, and give it its OWN lane so it lands on
+    // a new track instead of folding into the source's lane end-to-end (mirrors
+    // add_video_layer seeding lane_id to the new clip's id). Non-video leaves keep
+    // copying their per-element data (guarded by flatten-clone-regression.test).
+    if (kind === "video") {
+      const vc = copy as Record<string, unknown>;
+      delete vc.animations;
+      delete vc.color_tracks;
+      delete vc.caption_source;
+      vc.lane_id = id;
+    }
     list.push(copy);
     const newElementId = `${prefix}${id}`;
     newIds.push(newElementId);
@@ -2643,14 +2756,17 @@ const removeLayer: ToolDispatch<RemoveLayerArgs> = (project, args) => {
     }
     next.video_layers.splice(idx, 1);
     purgeElementId(next, elementId);
-    // Any overlay welded to this clip (its split-out audio) detaches back to
-    // a standalone track — an overlay pointing at a dead layer id would stay
-    // audible in preview/export but vanish from the Timeline (welded overlays
-    // render inside their source clip's row and are filtered out of the
-    // standalone rows).
-    for (const ov of next.audio_overlays ?? []) {
-      if (ov.sourceLayerId === elementId) delete ov.sourceLayerId;
-    }
+    // Clip audio is welded to its clip and has no standalone existence — a
+    // deleted clip takes its welded overlay(s) with it, same as the editor's
+    // delete path (there is no detach: a left-behind overlay would stay
+    // audible in preview/export while pointing at a dead clip). Welded
+    // captions go with the clip for the same reason — their windows are
+    // DERIVED from the clip's trim, so leaving them behind strands dangling
+    // anchors.
+    next.audio_overlays = (next.audio_overlays ?? []).filter(
+      (ov) => ov.sourceLayerId !== elementId,
+    );
+    removeWeldedCaptionLines(next, elementId);
     return { project: next, result: { ok: true } };
   }
   if (elementId.startsWith("text.")) {
@@ -3056,6 +3172,26 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
   if (merged.tintColor) clean.tintColor = merged.tintColor;
   if (merged.tintStrength != null && merged.tintStrength > 0) {
     clean.tintStrength = merged.tintStrength;
+  }
+  // Mirror flags — only persisted when true (mirrors editor/src/store.ts).
+  if (merged.flipX === true) clean.flipX = true;
+  if (merged.flipY === true) clean.flipY = true;
+  // CSS-style filter effects. Each field is dropped when it equals the no-op
+  // default (blur 0 / brightness 1 / contrast 1 / saturate 1 / hueRotate 0) so
+  // the JSON stays compact — and, crucially, an unrelated set_style patch must
+  // not silently strip an existing flip / blur / colour-filter off the layer.
+  if (merged.blur != null && merged.blur > 0) clean.blur = merged.blur;
+  if (merged.brightness != null && merged.brightness !== 1) {
+    clean.brightness = merged.brightness;
+  }
+  if (merged.contrast != null && merged.contrast !== 1) {
+    clean.contrast = merged.contrast;
+  }
+  if (merged.saturation != null && merged.saturation !== 1) {
+    clean.saturation = merged.saturation;
+  }
+  if (merged.hueRotate != null && merged.hueRotate !== 0) {
+    clean.hueRotate = merged.hueRotate;
   }
   if (merged.alphaMask) clean.alphaMask = merged.alphaMask;
   if (merged.chroma_key) clean.chroma_key = merged.chroma_key;
@@ -4276,6 +4412,9 @@ type UpdateAudioOverlayArgs = {
   // it (renders as a clip footer, drags with the clip); null clears the link
   // (Detach → standalone track). Undefined leaves it untouched.
   sourceLayerId?: string | null;
+  // Clean-strength wet/dry mix (0..1) while the AI-cleaned track is active;
+  // null clears the field (full clean). Undefined leaves it untouched.
+  denoiseStrength?: number | null;
 };
 
 const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
@@ -4291,6 +4430,7 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     endFrame,
     filename,
     sourceLayerId,
+    denoiseStrength,
   } = args;
   if (!id || typeof id !== "string") {
     return { project, result: { ok: false, error: "id is required" } };
@@ -4366,6 +4506,21 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
       result: { ok: false, error: "filename must be a non-empty string" },
     };
   }
+  if (
+    denoiseStrength !== undefined &&
+    denoiseStrength !== null &&
+    (!Number.isFinite(denoiseStrength) ||
+      denoiseStrength < 0 ||
+      denoiseStrength > 1)
+  ) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `denoiseStrength must be in [0, 1] or null: ${denoiseStrength}`,
+      },
+    };
+  }
   const next = cloneProject(project);
   const cur = next.audio_overlays[idx];
   const merged: AudioOverlay = {
@@ -4382,13 +4537,19 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
       ? { fadeOutFrames: Math.round(fadeOutFrames) }
       : {}),
   };
+  if (denoiseStrength === null) {
+    delete merged.denoiseStrength;
+  } else if (denoiseStrength !== undefined) {
+    merged.denoiseStrength = denoiseStrength;
+  }
   // Swapping the file (a "replace this track" edit) invalidates any AI-cleaned
   // companion of the OLD file: activeOverlayFilename would otherwise keep
-  // playing the stale denoisedFilename and shadow the replacement. Drop both so
-  // the new file plays as-is until it's (re)denoised.
+  // playing the stale denoisedFilename and shadow the replacement. Drop the
+  // denoise fields so the new file plays as-is until it's (re)denoised.
   if (filename !== undefined && filename !== cur.filename) {
     delete merged.denoisedFilename;
     delete merged.useDenoised;
+    delete merged.denoiseStrength;
   }
   if (endFrame === null) {
     delete merged.endFrame;
@@ -4396,6 +4557,31 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     merged.endFrame = Math.round(endFrame);
   }
   if (sourceLayerId === null) {
+    // Detach: while welded, the overlay's playback timing is DERIVED from
+    // its source clip (weldedAudioTiming) and the stored startFrame/endFrame
+    // may be stale. A standalone track plays purely from its stored fields,
+    // so materialize the derived timing into them now — unless no explicit
+    // startFrame/endFrame were passed alongside. The stored model can't
+    // express a negative file-time origin (head-trimmed clip at the comp
+    // start): clamp to 0, accepting that such a detach starts the audio at
+    // file time 0 (the un-representable head offset is the cost of leaving
+    // the weld).
+    const welded = weldedSourceLayer(cur, project.video_layers ?? []);
+    if (welded && cur.sourceLayerId) {
+      const timing = weldedAudioTiming(
+        cur,
+        project.video_layers ?? [],
+        () => undefined,
+      );
+      if (timing) {
+        if (startFrame === undefined) {
+          merged.startFrame = Math.max(0, timing.originFrame);
+        }
+        if (endFrame === undefined && timing.endFrame !== null) {
+          merged.endFrame = timing.endFrame;
+        }
+      }
+    }
     delete merged.sourceLayerId;
   } else if (sourceLayerId !== undefined) {
     merged.sourceLayerId = sourceLayerId;
@@ -4539,7 +4725,38 @@ const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
   }
   const next = cloneProject(project);
   const target = findLayerByElementId(next, elementId)!;
-  target.block = { start: Math.round(start), duration: Math.round(duration) };
+  const roundedStart = Math.round(start);
+  const roundedDuration = Math.round(duration);
+  // A welded caption line (carries a caption_source anchor) has no fixed block —
+  // its on-timeline window is derived from the clip it follows. Re-anchoring it
+  // must be expressed in the clip's SOURCE timeline, or the edit would write a
+  // block that blockOf ignores and silently no-op. Convert the requested
+  // composition-frame window back to source frames against the clip's trim so
+  // the line stays welded (and keeps following later trims). Falls through to a
+  // plain block write when the caption's clip is missing (dangling anchor).
+  const cs = target.caption_source;
+  if (cs) {
+    const clipId = cs.clip_element_id.startsWith("video.")
+      ? cs.clip_element_id.slice("video.".length)
+      : cs.clip_element_id;
+    const clip = next.video_layers.find((v) => v.id === clipId);
+    if (clip) {
+      const sourceStart = Math.max(
+        0,
+        roundedStart - Math.max(0, clip.timeline_start_frame) + Math.max(0, clip.source_in_frame),
+      );
+      target.caption_source = {
+        clip_element_id: cs.clip_element_id,
+        source_start_frame: sourceStart,
+        source_end_frame: sourceStart + roundedDuration,
+      };
+      return {
+        project: next,
+        result: { ok: true, data: { elementId, caption_source: target.caption_source } },
+      };
+    }
+  }
+  target.block = { start: roundedStart, duration: roundedDuration };
   return {
     project: next,
     result: { ok: true, data: { elementId, block: target.block } },
@@ -4796,14 +5013,85 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
     else delete layer.speed_keyframes;
   };
 
-  // 1. Non-video layers: numeric + colour keyframe tracks.
-  for (const layer of [
-    ...next.image_layers,
-    ...next.text_layers,
-    ...next.shapes,
-    ...next.groups,
-  ]) {
-    remapLayerTracks(layer, shiftKeyframes);
+  // A layer with a `block` rides the composition timeline at block.start, and its
+  // OWN keyframes are BLOCK-LOCAL — sampled at frame − block.start (see
+  // effectiveFrameOffset). So the ripple has to touch both: shift the block
+  // window like a timeline_start_frame, AND remap the local keyframes in the same
+  // frame space as everything else. Do it by lifting each local keyframe into an
+  // absolute composition frame (kf + block.start), running it through the SAME
+  // phi (drop inside the cut, shift the survivors), then rebasing onto the
+  // block's NEW start. The new window is what survives removing [start, end) from
+  // the block's absolute span; a block whose whole span is inside the cut
+  // collapses (returns "cull"). Uses block.start as the composition offset — for
+  // the rare layer nested under an embedded morpha band the true offset also
+  // includes the band origin, but that path is left as-was (no worse than before).
+  const remapBlockedLayer = (layer: {
+    block?: { start: number; duration: number };
+    animations?: ElementTracks;
+    color_tracks?: ElementColorTracks;
+  }): "kept" | "cull" => {
+    const block = layer.block!;
+    const bStart = block.start;
+    const bEnd = bStart + block.duration;
+    const survivingBefore = Math.max(0, Math.min(bEnd, start) - bStart);
+    const survivingAfter = Math.max(0, bEnd - Math.max(bStart, end));
+    const newDuration = survivingBefore + survivingAfter;
+    if (newDuration <= 0) return "cull";
+    const newStart = phi(bStart);
+    const rebase = <T extends { frame: number }>(arr: T[]): T[] =>
+      arr
+        .filter((kf) => {
+          const abs = kf.frame + bStart;
+          return !(abs >= start && abs < end);
+        })
+        .map((kf) => ({ ...kf, frame: phi(kf.frame + bStart) - newStart }));
+    remapLayerTracks(layer, rebase);
+    layer.block = { start: newStart, duration: newDuration };
+    return "kept";
+  };
+
+  // 1. Non-video layers: numeric + colour keyframe tracks. A stored-block layer
+  // (not a welded caption line, whose window is DERIVED from its clip and already
+  // retimed by the video pass) routes through the block-aware remap; a leaf whose
+  // whole block window falls inside the cut is culled. Groups keep at least a
+  // minimal window rather than orphan their children.
+  const culledBlockIds: string[] = [];
+  const remapNonVideoLayer = (
+    layer: {
+      id: string;
+      block?: { start: number; duration: number };
+      caption_source?: unknown;
+      animations?: ElementTracks;
+      color_tracks?: ElementColorTracks;
+    },
+    elementId: string,
+    cullable: boolean,
+  ): void => {
+    if (layer.block && !layer.caption_source) {
+      const blockStart = layer.block.start;
+      if (remapBlockedLayer(layer) === "cull") {
+        if (cullable) {
+          culledBlockIds.push(elementId);
+        } else {
+          // A group's whole window fell in the cut; keep a 1-frame window at the
+          // seam so the subtree stays structurally valid rather than orphaned.
+          layer.block = { start: phi(blockStart), duration: 1 };
+        }
+      }
+    } else {
+      remapLayerTracks(layer, shiftKeyframes);
+    }
+  };
+  for (const l of next.image_layers) remapNonVideoLayer(l, `image.${l.id}`, true);
+  for (const l of next.text_layers) remapNonVideoLayer(l, `text.${l.id}`, true);
+  for (const l of next.shapes) remapNonVideoLayer(l, `shapes.${l.id}`, true);
+  for (const g of next.groups) remapNonVideoLayer(g, `group.${g.id}`, false);
+  if (culledBlockIds.length > 0) {
+    const cull = new Set(culledBlockIds);
+    next.image_layers = next.image_layers.filter((l) => !cull.has(`image.${l.id}`));
+    next.text_layers = next.text_layers.filter((l) => !cull.has(`text.${l.id}`));
+    next.shapes = next.shapes.filter((s) => !cull.has(`shapes.${s.id}`));
+    for (const eid of culledBlockIds) purgeElementId(next, eid);
   }
 
   // 2. Markers: drop inside, shift survivors.
@@ -4874,7 +5162,10 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
       continue;
     }
     // Interior split: ws < start, end < we. Left keeps [ws, ovStart); right
-    // plays [ovEnd, we) at ovEnd-delta.
+    // plays [ovEnd, we) at ovEnd-delta. Both halves are pieces of ONE take, so
+    // they must share a lane_id: ensure the original carries one (mint from its
+    // id if absent), then the right half inherits it via the clone below.
+    if (!layer.lane_id) layer.lane_id = layer.id;
     const rightId = generateLayerId(next, "video");
     const right: VideoLayer = {
       ...structuredClone(layer),
@@ -4882,6 +5173,7 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
       source_in_frame: layer.source_in_frame + (ovEnd - ws),
       timeline_start_frame: ovEnd - delta,
       // source_out_frame inherited (may be null → keeps the natural end).
+      // lane_id inherited from the original clone → both halves = one lane.
     };
     remapLayerTracks(right, rightKeyframes);
     remapSpeedKeyframes(right, rightKeyframes);
@@ -4889,6 +5181,20 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
     layer.source_out_frame = layer.source_in_frame + (ovStart - ws);
     remapLayerTracks(layer, leftKeyframes);
     remapSpeedKeyframes(layer, leftKeyframes);
+    // Captions welded to this clip follow the interior split: a line whose
+    // source window begins at/after the right half's in-point belongs to the
+    // right half (leaving it on the left would cull it — the left's source_out
+    // now ends at the cut). Repoint those; earlier / straddling lines stay left.
+    for (const tl of next.text_layers) {
+      const cs = tl.caption_source;
+      if (
+        cs &&
+        cs.clip_element_id === `video.${layer.id}` &&
+        cs.source_start_frame >= right.source_in_frame
+      ) {
+        tl.caption_source = { ...cs, clip_element_id: `video.${rightId}` };
+      }
+    }
     next.video_layers.push(right);
     splitInserts.push({ after: `video.${layer.id}`, elementId: `video.${rightId}` });
     splitCount += 1;
@@ -5831,6 +6137,7 @@ type AddTextLayerArgs = {
   stroke_color?: unknown;
   text_shadow?: unknown;
   decorations?: unknown;
+  block?: unknown;
 };
 
 const DEFAULT_TEXT_W = 900;
@@ -5894,6 +6201,10 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
       };
     }
   }
+  const parsedBlock = parseAddBlockArg(args.block);
+  if (parsedBlock.error) {
+    return { project, result: { ok: false, error: parsedBlock.error } };
+  }
 
   const next = cloneProject(project);
   const id = generateLayerId(next, "text");
@@ -5932,6 +6243,8 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
     // would collapse to nothing.)
     text_autofit: "hug",
     fill: null,
+    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
+    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
   };
   const styleErr = applyTextStyleProps(layer, args as Record<string, unknown>);
   if (styleErr) {
@@ -5964,6 +6277,7 @@ type CaptionLineArg = {
   text?: unknown;
   startFrame?: unknown;
   endFrame?: unknown;
+  clip_element_id?: unknown;
 };
 type AddCaptionTrackArgs = {
   lines?: unknown;
@@ -5973,6 +6287,7 @@ type AddCaptionTrackArgs = {
   y?: unknown;
   width?: unknown;
   height?: unknown;
+  clip_element_id?: unknown;
 };
 
 export const CAPTION_STYLE_PRESETS: Record<string, Record<string, unknown>> = {
@@ -6014,7 +6329,12 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
       result: { ok: false, error: "lines must be a non-empty array" },
     };
   }
-  const lines: { text: string; startFrame: number; endFrame: number }[] = [];
+  const lines: {
+    text: string;
+    startFrame: number;
+    endFrame: number;
+    clipElementId?: string;
+  }[] = [];
   for (const raw of args.lines as CaptionLineArg[]) {
     if (!raw || typeof raw !== "object") {
       return {
@@ -6032,7 +6352,14 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
       typeof raw.endFrame === "number" && Number.isFinite(raw.endFrame)
         ? Math.round(raw.endFrame)
         : startFrame + 30;
-    lines.push({ text, startFrame, endFrame: Math.max(startFrame + 1, endRaw) });
+    const lineClip =
+      typeof raw.clip_element_id === "string" ? raw.clip_element_id : undefined;
+    lines.push({
+      text,
+      startFrame,
+      endFrame: Math.max(startFrame + 1, endRaw),
+      clipElementId: lineClip,
+    });
   }
   if (lines.length === 0) {
     return {
@@ -6047,6 +6374,44 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
       ? args.style
       : "classic";
   const stylePreset = CAPTION_STYLE_PRESETS[styleKey];
+
+  // Optional clip to WELD the caption lines to. When a line has a weld clip
+  // (its own `clip_element_id`, or the top-level default), its [startFrame,
+  // endFrame) is treated as the line's window in that clip's OWN (source)
+  // timeline and stored as a `caption_source` anchor instead of a fixed
+  // project-frame block — its on-timeline window is then derived live from the
+  // clip's trim (deriveCaptionWindow), so trimming/sliding the clip retimes the
+  // caption. Per-line clips let a montage (one source split into several lane
+  // clips) route each line onto the clip that actually shows its words. Every
+  // referenced clip must be an existing video layer.
+  const validClipEid = (eid: string): boolean =>
+    eid.startsWith("video.") &&
+    project.video_layers.some((v) => v.id === eid.slice("video.".length));
+  if (
+    args.clip_element_id !== undefined &&
+    args.clip_element_id !== null &&
+    (typeof args.clip_element_id !== "string" || !validClipEid(args.clip_element_id))
+  ) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `clip_element_id must be an existing "video.<id>": ${String(args.clip_element_id)}`,
+      },
+    };
+  }
+  const defaultClipElementId =
+    typeof args.clip_element_id === "string" ? args.clip_element_id : undefined;
+  for (const line of lines) {
+    const eff = line.clipElementId ?? defaultClipElementId;
+    if (eff !== undefined && !validClipEid(eff)) {
+      return {
+        project,
+        result: { ok: false, error: `clip_element_id not found: ${eff}` },
+      };
+    }
+    line.clipElementId = eff;
+  }
 
   const cw = project.canvas_width;
   const ch = project.canvas_height;
@@ -6094,6 +6459,19 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
     const tl = proj.text_layers.find((t) => t.id === id);
     if (tl) tl.block = block;
   };
+  const setCaptionSource = (
+    proj: Composition,
+    elementId: string,
+    source: {
+      clip_element_id: string;
+      source_start_frame: number;
+      source_end_frame: number;
+    },
+  ) => {
+    const id = elementId.slice("text.".length);
+    const tl = proj.text_layers.find((t) => t.id === id);
+    if (tl) tl.caption_source = source;
+  };
 
   if (mode === "static") {
     const out = addTextLayer(cur, {
@@ -6114,13 +6492,25 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
       const elementId = (out.result.data as { elementId: string }).elementId;
       setName(cur, elementId, `${CAPTION_LAYER_NAME} ${i + 1}`);
       created.push(elementId);
-      // The caption line's on-timeline window is a BLOCK: it exists only during
-      // [startFrame, endFrame). No opacity envelope — the block IS the
-      // visibility, so a 40-line track is 40 blocks, not 120 hold keyframes.
-      setBlock(cur, elementId, {
-        start: line.startFrame,
-        duration: Math.max(1, line.endFrame - line.startFrame),
-      });
+      if (line.clipElementId) {
+        // Welded to a clip: store the line's window in the clip's SOURCE
+        // timeline (line.startFrame/endFrame ARE source frames — Whisper word
+        // timings). Its on-timeline window is derived live from the clip's trim
+        // (deriveCaptionWindow), so no fixed block is written.
+        setCaptionSource(cur, elementId, {
+          clip_element_id: line.clipElementId,
+          source_start_frame: line.startFrame,
+          source_end_frame: Math.max(line.startFrame + 1, line.endFrame),
+        });
+      } else {
+        // Standalone: the line's on-timeline window is a BLOCK — it exists only
+        // during [startFrame, endFrame). No opacity envelope — the block IS the
+        // visibility, so a 40-line track is 40 blocks, not 120 hold keyframes.
+        setBlock(cur, elementId, {
+          start: line.startFrame,
+          duration: Math.max(1, line.endFrame - line.startFrame),
+        });
+      }
     }
   }
 
@@ -6130,7 +6520,10 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
   // a parent (the group_layers same-parent invariant holds). buildCaptionsForClip
   // consumes the returned groupElementId rather than grouping a second time.
   let groupElementId: string | undefined;
-  const grouped = groupLayers(cur, { elementIds: created, name: "captions" });
+  const grouped = groupLayers(cur, {
+    elementIds: created,
+    name: CAPTIONS_GROUP_NAME,
+  });
   if (grouped.result.ok) {
     cur = grouped.project;
     groupElementId = (grouped.result.data as { elementId: string }).elementId;
@@ -7062,6 +7455,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           y: { type: "number", description: "Centre y in 1920-tall base coords." },
           width: { type: "number", description: "Width in px (must be > 0)." },
           height: { type: "number", description: "Height in px (must be > 0)." },
+          block: {
+            type: "object",
+            description:
+              "OPTIONAL timeline window — {start, duration} in composition frames. OMIT IT (the default) and the layer is ALWAYS PRESENT: a persistent overlay that holds for the whole composition, which is what an agent-placed watermark / lower-third almost always wants. Pass it to place a bounded CLIP instead (what the editor's own add does: 5 s at the playhead). Keyframes on a blocked layer are sampled RELATIVE to `start`.",
+            properties: {
+              start: { type: "number", description: "First visible composition frame (≥ 0)." },
+              duration: { type: "number", description: "Length of the window in frames (≥ 1)." },
+            },
+            required: ["start", "duration"],
+          },
         },
         required: ["filename", "x", "y", "width", "height"],
       },
@@ -7108,6 +7511,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           width: { type: "number" },
           height: { type: "number" },
           color: { type: "string", description: "Fill colour as #rrggbb." },
+          block: {
+            type: "object",
+            description:
+              "OPTIONAL timeline window — {start, duration} in composition frames. OMIT IT (the default) and the layer is ALWAYS PRESENT: a persistent overlay that holds for the whole composition, which is what an agent-placed watermark / lower-third almost always wants. Pass it to place a bounded CLIP instead (what the editor's own add does: 5 s at the playhead). Keyframes on a blocked layer are sampled RELATIVE to `start`.",
+            properties: {
+              start: { type: "number", description: "First visible composition frame (≥ 0)." },
+              duration: { type: "number", description: "Length of the window in frames (≥ 1)." },
+            },
+            required: ["start", "duration"],
+          },
         },
         required: ["kind"],
       },
@@ -7751,6 +8164,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             description:
               "Weld the overlay to a video layer (\"video.<id>\") so it renders as a clip footer and drags with the clip, or null to detach it back into a standalone track.",
           },
+          denoiseStrength: {
+            type: ["number", "null"],
+            description:
+              "Clean-strength wet/dry mix 0..1 for an overlay with an AI-cleaned track: 1 = fully cleaned, 0 = fully original, between = blend. null clears it (full clean). Ignored while the Original track is selected.",
+          },
         },
         required: ["id"],
       },
@@ -8253,6 +8671,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
               },
             },
           },
+          block: {
+            type: "object",
+            description:
+              "OPTIONAL timeline window — {start, duration} in composition frames. OMIT IT (the default) and the layer is ALWAYS PRESENT: a persistent overlay that holds for the whole composition, which is what an agent-placed watermark / lower-third almost always wants. Pass it to place a bounded CLIP instead (what the editor's own add does: 5 s at the playhead). Keyframes on a blocked layer are sampled RELATIVE to `start`.",
+            properties: {
+              start: { type: "number", description: "First visible composition frame (≥ 0)." },
+              duration: { type: "number", description: "Length of the window in frames (≥ 1)." },
+            },
+            required: ["start", "duration"],
+          },
         },
         required: [],
       },
@@ -8284,6 +8712,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
                   description:
                     "Project frame the line disappears (defaults to startFrame + 30).",
                 },
+                clip_element_id: {
+                  type: "string",
+                  description:
+                    'Optional per-line weld clip ("video.<id>"), overriding the top-level clip_element_id. Routes THIS line onto a specific lane clip — used to spread one montage\'s lines across the several clips that a single source was split into, so each line rides the clip that shows its words.',
+                },
               },
               required: ["text", "startFrame"],
             },
@@ -8306,6 +8739,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           width: { type: "number", description: "Band width. Default ~86% of canvas width." },
           height: { type: "number", description: "Band height. Default ~16% of canvas height." },
+          clip_element_id: {
+            type: "string",
+            description:
+              'Optional "video.<id>" to WELD the caption lines to (line-sync mode). When set, each line\'s startFrame/endFrame are treated as its window in the clip\'s OWN source timeline and the on-timeline position is derived live from the clip\'s trim — so trimming or sliding the clip retimes/clips the captions, exactly like the clip\'s welded audio. Omit for fixed project-frame captions.',
+          },
         },
         required: ["lines"],
       },

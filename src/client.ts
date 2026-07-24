@@ -12,7 +12,7 @@
 // The catalog is the SAME superset MCP exposes: the pure mutation tools PLUS the
 // server tools (list/create/duplicate/rename/delete projects, save/list/restore/
 // rename/delete versions, upload clips + images, find public images, and the
-// OCR/objects/safe-zones/transcript readers). Every one is callable here, either
+// OCR/safe-zones/transcript readers). Every one is callable here, either
 // via the generic `callTool` or a typed convenience method below.
 
 import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
@@ -279,14 +279,13 @@ export interface MorphaClient {
     projectId: string,
     target: { clip: string } | { image: string },
   ): Promise<CacheReadResult>;
-  detectObjects(projectId: string, clip: string): Promise<CacheReadResult>;
   safeZones(
     projectId: string,
     opts: { clip: string; bandHeight?: number; occupancyThreshold?: number; minConfidence?: number },
   ): Promise<CacheReadResult>;
   transcribeClip(projectId: string, clip: string): Promise<CacheReadResult>;
   /** Whether a clip — or every video clip in the project, if `clip` is omitted —
-   *  has been processed (proxy / audio split / transcription / OCR / objects).
+   *  has been processed (proxy / audio split / transcription / OCR).
    *  Pure read; doesn't run anything. */
   clipProcessingStatus(
     projectId: string,
@@ -895,7 +894,6 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
 
     detectTextRegions: (projectId, target) =>
       cacheRead("detect_text_regions", projectId, { ...target }),
-    detectObjects: (projectId, clip) => cacheRead("detect_objects", projectId, { clip }),
     safeZones: (projectId, opts) => cacheRead("safe_zones", projectId, { ...opts }),
     transcribeClip: (projectId, clip) => cacheRead("transcribe_clip", projectId, { clip }),
     clipProcessingStatus: async (projectId, clip) =>

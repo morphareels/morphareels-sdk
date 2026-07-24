@@ -12,7 +12,11 @@
 // `set_duration` tool that used to write it have all been retired.
 
 import type { AnyLayer, Composition, VideoLayer, AudioOverlay } from "./schemas.ts";
-import { effectiveFrameOffset, videoWindow } from "./schemas.ts";
+import {
+  effectiveFrameOffset,
+  videoWindow,
+  weldedAudioTiming,
+} from "./schemas.ts";
 
 const FPS = 30;
 const DEFAULT_FLOOR_SECONDS = 1;
@@ -120,8 +124,32 @@ export const computeContentDurationFrames = (
   }
 
   // Audio overlays.
+  //
+  // A WELDED overlay IS its source clip's audio, so its extent is the clip's
+  // audible window — NEVER the raw audio-file length. Its knowable end is the
+  // weld timing's endFrame; when that's unknowable (clip source_out null AND
+  // its natural length not supplied) it contributes only the clip's start,
+  // exactly as a video layer with a null out-point does (videoEndFrames). This
+  // is the fix for the comp inflating with a silent tail past the picture: a
+  // welded overlay must not pin the comp at the full audio-file length when its
+  // clip is shorter (or when the clip's natural duration hasn't loaded yet).
+  // Any explicit stored endFrame still caps, never extends.
+  //
+  // A STANDALONE overlay (music / voiceover) keeps its own [startFrame,
+  // endFrame ?? natural] window.
   for (const overlay of project.audio_overlays ?? []) {
-    const end = audioEndFrames(overlay, opts.audioNaturalSeconds?.(overlay));
+    const timing = weldedAudioTiming(
+      overlay,
+      project.video_layers ?? [],
+      (layer) => opts.videoNaturalSeconds?.(layer),
+    );
+    let end: number;
+    if (timing) {
+      end = timing.endFrame ?? timing.startFrame;
+      if (overlay.endFrame !== undefined) end = Math.min(end, overlay.endFrame);
+    } else {
+      end = audioEndFrames(overlay, opts.audioNaturalSeconds?.(overlay));
+    }
     if (end > frames) frames = end;
   }
 

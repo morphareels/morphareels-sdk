@@ -8,7 +8,11 @@
 // I/O layer fetches it and passes the words in.
 
 import { dispatch, type ToolDispatch } from "./tools.ts";
-import { findParentGroup, type Composition } from "./schemas.ts";
+import {
+  findParentGroup,
+  isCaptionsGroup,
+  type Composition,
+} from "./schemas.ts";
 
 export interface CaptionLine {
   text: string;
@@ -114,9 +118,6 @@ export const transcriptToCaptionLines = (
   return lines.filter((l) => l.text.length > 0);
 };
 
-const clipStem = (filename: string): string =>
-  filename.replace(/\.[^.]+$/, "");
-
 export const videoElementIdForClip = (
   project: Composition,
   clip: string,
@@ -125,62 +126,76 @@ export const videoElementIdForClip = (
   return v ? `video.${v.id}` : null;
 };
 
-// True when this video already sits in a group that contains a "captions"
-// group — the idempotency guard so we never double-caption.
+// True when any caption line is already welded to a clip of this video's LANE
+// (its source split into one or more clips) — the idempotency guard so we never
+// double-caption. Keyed on the welded `caption_source` anchor, not on grouping:
+// captions are attached to their clip, not nested in a group with it.
 export const hasCaptionsForClip = (
   project: Composition,
   videoElementId: string,
 ): boolean => {
-  const parentId = findParentGroup(project, videoElementId);
-  if (!parentId) return false;
-  const parent = project.groups.find((g) => g.id === parentId);
-  if (!parent) return false;
-  return parent.children.some((cid) => {
-    if (!cid.startsWith("group.")) return false;
-    const g = project.groups.find((x) => x.id === cid.slice("group.".length));
-    return (g?.name ?? "").trim().toLowerCase() === "captions";
-  });
+  const v = project.video_layers.find((x) => `video.${x.id}` === videoElementId);
+  if (!v) return false;
+  const laneEids = new Set(
+    project.video_layers
+      .filter((x) => x.clip === v.clip)
+      .map((x) => `video.${x.id}`),
+  );
+  return (project.text_layers ?? []).some(
+    (t) => t.caption_source != null && laneEids.has(t.caption_source.clip_element_id),
+  );
 };
 
-// Remove the "captions" track for a clip: drop every text layer inside the
-// clip's "captions" group, then dissolve the now-empty group. Used by the
-// "restart captioning" path so a rebuild regenerates rather than no-op'ing on
-// the hasCaptionsForClip guard. No-op (ok: true, removed: 0) when the clip has
-// no captions. Pure — mirrors hasCaptionsForClip's lookup.
+// Remove the caption track welded to a clip's LANE: drop every caption line
+// anchored to any clip of that lane, then dissolve any now-empty "captions"
+// group. Used by the "restart captioning" / re-add path so a rebuild regenerates
+// rather than no-op'ing on the hasCaptionsForClip guard. No-op (ok: true,
+// removed: 0) when the lane has no captions. Pure — mirrors hasCaptionsForClip.
 export const removeCaptionsForClip = (
   project: Composition,
   videoElementId: string,
 ): { project: Composition; ok: boolean; removed: number } => {
-  const parentId = findParentGroup(project, videoElementId);
-  if (!parentId) return { project, ok: true, removed: 0 };
-  const parent = project.groups.find((g) => g.id === parentId);
-  if (!parent) return { project, ok: true, removed: 0 };
-  const capChildId = parent.children.find((cid) => {
-    if (!cid.startsWith("group.")) return false;
-    const g = project.groups.find((x) => x.id === cid.slice("group.".length));
-    return (g?.name ?? "").trim().toLowerCase() === "captions";
-  });
-  if (!capChildId) return { project, ok: true, removed: 0 };
+  const v = project.video_layers.find((x) => `video.${x.id}` === videoElementId);
+  if (!v) return { project, ok: true, removed: 0 };
+  const laneEids = new Set(
+    project.video_layers
+      .filter((x) => x.clip === v.clip)
+      .map((x) => `video.${x.id}`),
+  );
+  const targetEids = (project.text_layers ?? [])
+    .filter(
+      (t) => t.caption_source != null && laneEids.has(t.caption_source.clip_element_id),
+    )
+    .map((t) => `text.${t.id}`);
+  if (targetEids.length === 0) return { project, ok: true, removed: 0 };
 
-  const capGroupId = capChildId.slice("group.".length);
-  const capGroup = project.groups.find((g) => g.id === capGroupId);
-  const childIds = capGroup ? [...capGroup.children] : [];
+  // Note the groups these lines live in, so we can dissolve any left empty.
+  const parentGroupIds = new Set<string>();
+  for (const eid of targetEids) {
+    const gid = findParentGroup(project, eid);
+    if (gid) parentGroupIds.add(gid);
+  }
 
   const removeLayer = dispatch.remove_layer as ToolDispatch;
   const ungroupLayers = dispatch.ungroup_layers as ToolDispatch;
 
   let cur = project;
   let removed = 0;
-  for (const cid of childIds) {
-    const out = removeLayer(cur, { elementId: cid });
+  for (const eid of targetEids) {
+    const out = removeLayer(cur, { elementId: eid });
     if (out.result.ok) {
       cur = out.project;
       removed += 1;
     }
   }
-  // Dissolve the now-empty "captions" group (ungroup takes the bare id).
-  const un = ungroupLayers(cur, { groupId: capGroupId });
-  if (un.result.ok) cur = un.project;
+  // Dissolve any now-empty "captions" group (ungroup takes the bare id).
+  for (const gid of parentGroupIds) {
+    const g = cur.groups.find((x) => x.id === gid);
+    if (g && isCaptionsGroup(g) && g.children.length === 0) {
+      const un = ungroupLayers(cur, { groupId: gid });
+      if (un.result.ok) cur = un.project;
+    }
+  }
   return { project: cur, ok: true, removed };
 };
 
@@ -192,9 +207,18 @@ export interface BuildCaptionsResult {
   lineCount?: number;
 }
 
-// Add a caption track for `clip`, wrap the caption layers in a "captions"
-// group, and group that with the video layer. Idempotent + no-op when there's
-// nothing to caption. Returns the (possibly unchanged) project.
+// Weld a caption track to a clip's LANE — the caption analog of the clip's
+// welded audio. The clip may be a montage: one source split into several lane
+// clips laid end-to-end (each showing a different slice of the source). Each
+// caption line's [startFrame, endFrame) is a window in the SOURCE timeline
+// (Whisper word timings), so we route it onto whichever lane clip actually shows
+// those words (max source-window overlap) and store a `caption_source` anchor on
+// it; its on-timeline window then derives live from that clip's trim. Lines that
+// fall entirely in a cut GAP (no clip shows them) are dropped — those words
+// aren't spoken in the visible edit. The lines are wrapped in a "captions" group
+// for the layer list but are NOT nested with the video: they attach to the clip
+// via the anchor and the timeline draws them as a strip on the clip bar, never a
+// separate lane. Idempotent + no-op when there's nothing to caption.
 export const buildCaptionsForClip = (
   project: Composition,
   opts: { clip: string; lines: CaptionLine[]; style?: string },
@@ -202,25 +226,49 @@ export const buildCaptionsForClip = (
   const { clip, lines } = opts;
   const style = opts.style ?? "bold-outline";
 
-  const videoElementId = videoElementIdForClip(project, clip);
-  if (!videoElementId) {
+  const laneClips = project.video_layers.filter((v) => v.clip === clip);
+  if (laneClips.length === 0) {
     return { project, ok: false, error: `no video layer references clip ${clip}` };
   }
   if (lines.length === 0) {
     return { project, ok: false, error: "no caption lines" };
   }
-  if (hasCaptionsForClip(project, videoElementId)) {
+  if (hasCaptionsForClip(project, `video.${laneClips[0].id}`)) {
     return { project, ok: true, lineCount: 0 }; // already captioned — no-op
   }
 
-  const addCaptionTrack = dispatch.add_caption_track as ToolDispatch;
-  const groupLayers = dispatch.group_layers as ToolDispatch;
-  const reorderLayer = dispatch.reorder_layer as ToolDispatch;
+  // Route each line onto the lane clip whose SOURCE window overlaps it most;
+  // drop lines with no overlap (their words landed in a cut gap).
+  const assigned: (CaptionLine & { clip_element_id: string })[] = [];
+  for (const line of lines) {
+    let bestClipId: string | null = null;
+    let bestOverlap = 0;
+    for (const v of laneClips) {
+      const cin = Math.max(0, v.source_in_frame);
+      const cout = v.source_out_frame ?? Number.POSITIVE_INFINITY;
+      const overlap = Math.min(line.endFrame, cout) - Math.max(line.startFrame, cin);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestClipId = v.id;
+      }
+    }
+    if (bestClipId && bestOverlap > 0) {
+      assigned.push({ ...line, clip_element_id: `video.${bestClipId}` });
+    }
+  }
+  if (assigned.length === 0) {
+    return {
+      project,
+      ok: false,
+      error: "no caption lines fall within the clip's visible ranges",
+    };
+  }
 
-  // 1. caption text layers (line-sync, lower-third bold-outline by default).
-  // Wide band so the short lines render big (~80% of canvas width).
+  const addCaptionTrack = dispatch.add_caption_track as ToolDispatch;
+  // Wide band so the short lines render big (~80% of canvas width). Each line
+  // carries its own clip_element_id → welded to the right montage piece.
   const track = addCaptionTrack(project, {
-    lines,
+    lines: assigned,
     mode: "line-sync",
     style,
     width: Math.round(project.canvas_width * BAND_WIDTH_FRACTION),
@@ -232,32 +280,14 @@ export const buildCaptionsForClip = (
   if (captionIds.length === 0) {
     return { project, ok: false, error: "caption track produced no layers" };
   }
-  // 2. add_caption_track already wraps the caption layers in a "captions" group;
-  // reuse it rather than nesting a second "captions"-inside-"captions".
   const captionsGroupId = (track.result.data as { groupElementId?: string }).groupElementId;
-  if (!captionsGroupId) {
-    return { project, ok: false, error: "caption track produced no captions group" };
-  }
-  let cur = track.project;
-
-  // 3. group [video, captions] together — only when they share a parent (both
-  // freshly at root is the common case). If the video is already nested, leave
-  // the captions group adjacent rather than failing.
-  if (findParentGroup(cur, videoElementId) === findParentGroup(cur, captionsGroupId)) {
-    const video = cur.video_layers.find((v) => `video.${v.id}` === videoElementId);
-    const parentName = (video?.name && video.name.trim()) || clipStem(clip);
-    const parent = groupLayers(cur, {
-      elementIds: [videoElementId, captionsGroupId],
-      name: parentName,
-    });
-    if (parent.result.ok) cur = parent.project;
-  }
-
-  // Captions must sit ABOVE the video — reorder the video to the bottom of its
-  // parent so a full-frame clip never hides the captions (correct by
-  // construction; index 0 = bottom of the sibling stack).
-  const reorder = reorderLayer(cur, { elementId: videoElementId, newIndex: 0 });
-  if (reorder.result.ok) cur = reorder.project;
-
-  return { project: cur, ok: true, captionsGroupId, lineCount: lines.length };
+  // The "captions" group is created at root and floats to the top of the z-stack
+  // (unlisted layers render on top), so the caption text sits above the clip on
+  // the canvas — no explicit reorder needed.
+  return {
+    project: track.project,
+    ok: true,
+    captionsGroupId,
+    lineCount: assigned.length,
+  };
 };

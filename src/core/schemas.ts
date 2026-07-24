@@ -143,6 +143,24 @@ const perElementDataFields = {
       duration: z.number().int().positive(),
     })
     .optional(),
+  // Caption SOURCE ANCHOR — a caption line's timing tied to a clip's audio
+  // track, the caption analog of a welded audio overlay's `sourceLayerId`.
+  // `source_start_frame` / `source_end_frame` are the line's window in the
+  // referenced clip's OWN (source) timeline — i.e. the Whisper word timings the
+  // line was built from, independent of where/how the clip is placed or trimmed.
+  // When present, the layer's on-timeline `block` window is DERIVED LIVE from the
+  // clip's trim (`deriveCaptionWindow` → blockOf), so trimming or sliding the
+  // clip retimes/clips the caption with no stored bookkeeping — exactly like
+  // `weldedAudioTiming`. Any stored `block` is ignored while this is set (used
+  // only as a fallback when the referenced clip is missing). Only caption text
+  // layers carry it.
+  caption_source: z
+    .object({
+      clip_element_id: z.string().min(1),
+      source_start_frame: z.number().int().nonnegative(),
+      source_end_frame: z.number().int().positive(),
+    })
+    .optional(),
 };
 
 // One per image layer on the project. (x, y) is the CENTRE of the layer's
@@ -240,6 +258,17 @@ export const videoLayerSchema = z
     source_out_frame: z.number().int().nonnegative().nullable().default(null),
     // Project-timeline frame where this slice begins playing.
     timeline_start_frame: z.number().int().nonnegative().default(0),
+    // LANE (track) grouping. Video layers that share a `lane_id` are the same
+    // visual track — pieces of one take laid end-to-end (e.g. the two halves of
+    // a razor split, or the fragments cut_range leaves behind). A lane is a TIME
+    // track, NOT a z-order group: layers keep their independent place in
+    // `layer_order`, and lanes never reshape the layer tree. Optional so older
+    // projects (and hand-built fixtures) still parse; the schema migration
+    // backfills every clip lacking one with a lane of its own (lane_id = id), so
+    // today's 1-clip-per-lane behaviour is preserved exactly. Split / cut_range
+    // hand both resulting pieces the ORIGINAL clip's lane_id so they read as one
+    // track. Dormant for the UI/renderer until a later PR consumes it.
+    lane_id: z.string().optional(),
     // Optional backdrop fill painted behind the video pixels. Visible in
     // letterbox areas when fit=contain and as a fallback when the video
     // hasn't loaded. null (default) = legacy behaviour (black).
@@ -956,12 +985,22 @@ export const stylesSchema = z.record(z.string(), layerStyleSchema);
 // cleaned). Both are resolved through `activeOverlayFilename` — the single
 // source of truth so preview, export, and the timeline waveform never drift.
 //
+// `denoiseStrength` (0..1, absent ⇒ 1) is the clean-strength wet/dry mix:
+// while the cleaned track is active, playback blends strength × cleaned with
+// (1 − strength) × original. Both files come from the same decoded source
+// buffer (same encoder, latency-trimmed), so they are sample-aligned and the
+// blend is a plain per-source gain. `overlayPlaybackMix` is the resolver every
+// playback surface uses.
+//
 // `sourceLayerId` welds the overlay to the video layer it was split out of
 // (the element-id form, "video.<id>"). When set, the editor renders the
 // overlay as a waveform footer ON that clip instead of a standalone bottom
-// row, and drags it with the clip; clearing it (Detach) reverts the overlay
-// to an independent track. Absent on standalone audio (music / voiceover) and
-// on legacy split overlays created before the link existed.
+// row, and drags it with the clip. Clip audio is ALWAYS welded — there is no
+// detach: to silence a clip the user mutes it, and separate music / voiceover
+// tracks are the only overlays that stay standalone. Absent on those
+// standalone tracks; legacy split overlays created before the link existed are
+// healed back onto their clip on load (see migrateWeldClipAudio) so they never
+// resurface as a stray bottom lane.
 export const audioOverlaySchema = z
   .object({
     id: z.string().min(1),
@@ -975,6 +1014,7 @@ export const audioOverlaySchema = z
     soloed: z.boolean().optional(),
     denoisedFilename: z.string().min(1).optional(),
     useDenoised: z.boolean().optional(),
+    denoiseStrength: z.number().min(0).max(1).optional(),
     sourceLayerId: z.string().min(1).optional(),
   })
   .strict();
@@ -986,6 +1026,110 @@ export type AudioOverlay = z.infer<typeof audioOverlaySchema>;
 // the original. Legacy overlays (no `denoisedFilename`) resolve to `filename`.
 export const activeOverlayFilename = (o: AudioOverlay): string =>
   o.denoisedFilename && o.useDenoised !== false ? o.denoisedFilename : o.filename;
+
+// The file preview playback should actually use: the active choice, except
+// that a cleaned sibling KNOWN to be unfetchable (its asset is missing from
+// R2 — the player marks it after the bounded fetch/decode retries give up)
+// falls back to the ORIGINAL so audio keeps playing instead of going silent
+// while the session grinds 404s. Never falls back the other way: a missing
+// ORIGINAL has nothing better to offer.
+export const resolveOverlayPlaybackFilename = (
+  o: AudioOverlay,
+  missing: ReadonlySet<string>,
+): string => {
+  const active = activeOverlayFilename(o);
+  if (active !== o.filename && missing.has(active)) return o.filename;
+  return active;
+};
+
+// The clean strength newly-imported overlays get when a cleaned track is
+// attached: mostly clean, with a slice of the original blended back so the
+// denoiser's residual artifacts (musical noise, chopped quiet syllables) stay
+// masked and the voice keeps its air. ≈ −20 dB residual noise floor.
+export const DEFAULT_DENOISE_STRENGTH = 0.9;
+
+// One weighted source in an overlay's playback mix. Weights sum to 1.
+export type OverlayMixEntry = { filename: string; weight: number };
+
+// The weighted set of files an overlay actually plays — the wet/dry
+// clean-strength mix. While the cleaned track is active and 0 < strength < 1
+// this is two entries (cleaned at `strength`, original at the remainder);
+// strength 1 / absent, an inactive or missing cleaned sibling, and legacy
+// overlays all collapse to a single full-weight entry, preserving their exact
+// pre-mix behavior. Preview and export both resolve through this so they can
+// never drift.
+export const overlayPlaybackMix = (
+  o: AudioOverlay,
+  missing?: ReadonlySet<string>,
+): OverlayMixEntry[] => {
+  const active = missing
+    ? resolveOverlayPlaybackFilename(o, missing)
+    : activeOverlayFilename(o);
+  if (active === o.filename) return [{ filename: o.filename, weight: 1 }];
+  const strength = o.denoiseStrength ?? 1;
+  if (strength >= 1) return [{ filename: active, weight: 1 }];
+  if (strength <= 0) return [{ filename: o.filename, weight: 1 }];
+  return [
+    { filename: active, weight: strength },
+    { filename: o.filename, weight: 1 - strength },
+  ];
+};
+
+// The video layer a welded overlay was split out of, or null when the overlay
+// is standalone / the weld dangles (its source layer was re-id'd or removed).
+export const weldedSourceLayer = (
+  overlay: AudioOverlay,
+  videoLayers: readonly VideoLayer[],
+): VideoLayer | null => {
+  const src = overlay.sourceLayerId;
+  if (!src || !src.startsWith("video.")) return null;
+  const id = src.slice("video.".length);
+  return videoLayers.find((v) => v.id === id) ?? null;
+};
+
+// A welded overlay's playback timing is DERIVED from its source clip — the
+// audio IS the clip's audio, so trimming the clip (from the timeline, the
+// Inspector, or a headless tool call) retimes what's heard with no
+// stored-field bookkeeping. Returns null only when the overlay is standalone
+// or the weld dangles (source layer re-id'd / removed); otherwise:
+//
+//   - `originFrame` — the project frame where audio-FILE time 0 sits:
+//     timeline_start − source_in. The demuxed file starts at source frame 0,
+//     so this is the sync anchor for buffer offsets. MAY BE NEGATIVE (a clip
+//     at the comp head with its first frames trimmed off) — which is exactly
+//     why it's derived: the stored nonnegative `startFrame` can't express it.
+//   - `startFrame` — audible start: the clip's timeline start.
+//   - `endFrame` — audible end (exclusive), or null when unknowable (natural
+//     duration unknown AND source_out_frame null — capping there would
+//     silence real audio; callers fall back to the buffer's natural extent).
+//
+// `naturalSecondsOf` supplies the source's natural duration where the caller
+// knows it (loaded <video> metadata / a decoded buffer); return undefined
+// when it doesn't.
+export const weldedAudioTiming = (
+  overlay: AudioOverlay,
+  videoLayers: readonly VideoLayer[],
+  naturalSecondsOf: (layer: VideoLayer) => number | undefined,
+): { originFrame: number; startFrame: number; endFrame: number | null } | null => {
+  const layer = weldedSourceLayer(overlay, videoLayers);
+  if (!layer) return null;
+  const startFrame = Math.max(0, layer.timeline_start_frame);
+  const originFrame = startFrame - Math.max(0, layer.source_in_frame);
+  const natural = naturalSecondsOf(layer);
+  let sourceSeconds: number | null;
+  if (natural !== undefined && Number.isFinite(natural) && natural > 0) {
+    sourceSeconds = natural;
+  } else if (layer.source_out_frame !== null) {
+    // `videoWindow` clamps the out-point to the duration handed in, so the
+    // explicit out-point itself bounds the window exactly.
+    sourceSeconds = layer.source_out_frame / 30;
+  } else {
+    sourceSeconds = null;
+  }
+  if (sourceSeconds === null) return { originFrame, startFrame, endFrame: null };
+  const win = videoWindow(layer, sourceSeconds);
+  return { originFrame, startFrame: win.startFrame, endFrame: win.endFrame };
+};
 
 // A layer group. Holds an ordered list of children — each child is the
 // element id of an image layer ("image.<id>"), shape ("shapes.<id>"), or
@@ -1064,16 +1208,36 @@ export type Group = z.infer<typeof groupSchema>;
 export const isMorphaGroup = (group: Group): boolean =>
   typeof group.source_morpha_id === "string" && group.source_morpha_id.length > 0;
 
+// The literal name `add_caption_track` / `buildCaptionsForClip` give the group
+// they wrap caption lines in. The single marker every surface keys off — the
+// producer (tools/captions.ts) stamps it, the Timeline + Inspector fold on it,
+// and captions.ts keys idempotency off it — so it never drifts.
+export const CAPTIONS_GROUP_NAME = "captions";
+
+// True when a group is an auto-generated caption-track wrapper (the "captions"
+// group). Kept deliberately tight — matched by name only — so ordinary user
+// groups never fold into a caption lane. The single source of truth for "is
+// this a caption track" across the Timeline lane fold, the Inspector layer
+// list, and the captioning idempotency guard.
+export const isCaptionsGroup = (
+  group: { name?: string } | null | undefined,
+): boolean =>
+  (group?.name ?? "").trim().toLowerCase() === CAPTIONS_GROUP_NAME;
+
 // Schema version. Bumped when on-disk JSON gains a meaning that older
 // readers can't infer:
 //   1 = post-rev1-migration shape with top-left anchored x/y (legacy).
 //   2 = (x, y) on image_layers / shapes / clip_inset is the CENTRE of the
 //       bounding box. migrateProject converts < 2 → 2.
-//   3 = current. PAGES-ONLY model: a project is `{ …meta, canvas_width,
+//   3 = PAGES-ONLY model: a project is `{ …meta, canvas_width,
 //       canvas_height, active_index, pages[≥1] }`. The old top-level
 //       composition arrays + `mode` + `carousel` are gone — migrateToPages
 //       folds them into `pages`. See migrateToPages below.
-export const SCHEMA_VERSION = 3 as const;
+//   4 = current. Video layers carry a `lane_id` (track grouping). Clips that
+//       share a lane_id are one visual track laid end-to-end. migrateAssignLaneIds
+//       backfills every pre-v4 clip lacking one with its own lane (lane_id = id),
+//       so the migration is behaviour-preserving (1 clip = 1 lane). See below.
+export const SCHEMA_VERSION = 4 as const;
 
 // Strip deprecated clip_frame fields from raw input before validation. The
 // pre-refactor schema modelled the source video as a built-in singleton
@@ -2073,6 +2237,283 @@ const migrateToPages = (raw: unknown): unknown => {
   return r;
 };
 
+// Backfill `lane_id` on every video layer that lacks one (SCHEMA_VERSION 4).
+// A lane groups the clips of one visual track; a project written before v4 has
+// no lanes, so each existing clip becomes its OWN lane (lane_id = its own id) —
+// exactly today's 1-clip-per-lane world. Runs on the FINAL pages shape (after
+// migrateToPages), so it sees every page's own `video_layers`. Idempotent: a
+// layer that already carries a lane_id is left untouched, so re-parsing a v4
+// project is a no-op (and any clip added later without a lane heals on load).
+const migrateAssignLaneIds = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    if (!Array.isArray(page.video_layers)) continue;
+    for (const layerRaw of page.video_layers) {
+      if (!layerRaw || typeof layerRaw !== "object") continue;
+      const layer = layerRaw as Record<string, unknown>;
+      if (typeof layer.lane_id === "string" && layer.lane_id.length > 0) continue;
+      if (typeof layer.id === "string" && layer.id.length > 0) {
+        layer.lane_id = layer.id;
+      }
+    }
+  }
+  return r;
+};
+
+// Heal legacy clip-audio overlays into welded footers. Clip audio is always
+// welded to its clip (it renders as a waveform footer on the clip bar, drags
+// with it, and is muted/added-to, never detached). Before the weld existed,
+// importing a video demuxed its audio into a STANDALONE overlay (no
+// `sourceLayerId`) and muted the clip — which now shows as a stray bottom lane,
+// a bug. This reconciles those overlays back onto their clip on every load:
+// per page, a standalone overlay whose `filename` starts with a MUTED video
+// layer's clip stem (the demux signature — the clip is muted precisely because
+// its audio was split out) and whose clip has no overlay welded to it yet is
+// welded to that layer (sourceLayerId = "video.<id>"). Genuine music /
+// voiceover — no stem match, or an UNMUTED clip — is left standalone. Runs on
+// the FINAL pages shape (after migrateToPages), so it sees every page's own
+// arrays. Idempotent: an already-welded overlay is skipped, so re-parsing (and
+// new imports, welded on upload) is a no-op.
+const migrateWeldClipAudio = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    if (!Array.isArray(page.audio_overlays)) continue;
+    if (!Array.isArray(page.video_layers)) continue;
+    const overlays = page.audio_overlays as Record<string, unknown>[];
+    const layers = page.video_layers as Record<string, unknown>[];
+    // Clips that already own a welded overlay — never double-weld.
+    const weldedLayerIds = new Set<string>();
+    for (const ov of overlays) {
+      if (!ov || typeof ov !== "object") continue;
+      const src = ov.sourceLayerId;
+      if (typeof src === "string" && src.startsWith("video.")) {
+        weldedLayerIds.add(src.slice("video.".length));
+      }
+    }
+    for (const ov of overlays) {
+      if (!ov || typeof ov !== "object") continue;
+      // Only standalone overlays are candidates.
+      if (typeof ov.sourceLayerId === "string" && ov.sourceLayerId.length > 0) {
+        continue;
+      }
+      const filename = ov.filename;
+      if (typeof filename !== "string") continue;
+      const match = layers.find((layer) => {
+        if (!layer || typeof layer !== "object") return false;
+        if (layer.muted !== true) return false; // demux signature
+        const id = layer.id;
+        const clip = layer.clip;
+        if (typeof id !== "string" || id.length === 0) return false;
+        if (typeof clip !== "string" || clip.length === 0) return false;
+        if (weldedLayerIds.has(id)) return false;
+        const stem = clip.replace(/\.[^.]+$/, "");
+        return stem.length > 0 && filename.startsWith(stem);
+      });
+      if (match) {
+        const id = match.id as string;
+        ov.sourceLayerId = `video.${id}`;
+        weldedLayerIds.add(id);
+      }
+    }
+  }
+  return r;
+};
+
+// Retro-anchor legacy caption tracks onto the clip they follow. Before caption
+// welding, a caption line stored a FIXED project-frame `block`, so trimming the
+// clip left the captions behind. This heals those tracks on load: per page, for
+// each text layer inside a "captions" group that lacks a `caption_source`
+// anchor, find the clip the captions group was grouped with (buildCaptionsForClip
+// wraps [video, captions] in a common parent group) and invert the line's block
+// against that clip's CURRENT trim to recover the line's window in the clip's
+// SOURCE timeline (source_start = block.start − timeline_start + source_in).
+// After that the on-timeline window is derived live (deriveCaptionWindow), so
+// trimming/sliding the clip retimes the captions. Assumes the clip wasn't
+// retrimmed since captioning (the normal order: caption → then trim); the stored
+// block is kept as a fallback for a dangling anchor. Runs on the final pages
+// shape. Idempotent: a line that already has `caption_source` is skipped, so new
+// (welded-at-creation) tracks and re-parses are a no-op.
+//
+// A second pass then RE-ROUTES mis-anchored lines: an earlier build welded every
+// line of a montage to the lane's FIRST clip, so lines spoken in the later
+// pieces sat outside that clip's source window and were culled (invisible).
+// See the pass below for the exact rule.
+const migrateWeldCaptions = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    if (!Array.isArray(page.groups)) continue;
+    if (!Array.isArray(page.text_layers)) continue;
+    if (!Array.isArray(page.video_layers)) continue;
+    const groups = page.groups as Record<string, unknown>[];
+    const textLayers = page.text_layers as Record<string, unknown>[];
+    const videoLayers = page.video_layers as Record<string, unknown>[];
+    for (const grp of groups) {
+      if (!grp || typeof grp !== "object") continue;
+      const name = typeof grp.name === "string" ? grp.name.trim().toLowerCase() : "";
+      if (name !== CAPTIONS_GROUP_NAME) continue;
+      const capId = grp.id;
+      if (typeof capId !== "string" || !Array.isArray(grp.children)) continue;
+      // The clip is a video sibling of this captions group in its parent group.
+      const parent = groups.find(
+        (g) =>
+          g &&
+          typeof g === "object" &&
+          Array.isArray(g.children) &&
+          (g.children as unknown[]).includes(`group.${capId}`),
+      );
+      const clipEid = parent
+        ? ((parent.children as unknown[]).find(
+            (c) => typeof c === "string" && c.startsWith("video."),
+          ) as string | undefined)
+        : undefined;
+      if (!clipEid) continue;
+      const clip = videoLayers.find((v) => v && v.id === clipEid.slice("video.".length));
+      if (!clip) continue;
+      const tStart = typeof clip.timeline_start_frame === "number" ? clip.timeline_start_frame : 0;
+      const sourceIn = typeof clip.source_in_frame === "number" ? clip.source_in_frame : 0;
+      for (const childId of grp.children as unknown[]) {
+        if (typeof childId !== "string" || !childId.startsWith("text.")) continue;
+        const tl = textLayers.find((t) => t && t.id === childId.slice("text.".length));
+        if (!tl) continue;
+        if (tl.caption_source && typeof tl.caption_source === "object") continue; // already welded
+        const block = tl.block as { start?: unknown; duration?: unknown } | undefined;
+        if (!block || typeof block.start !== "number" || typeof block.duration !== "number") {
+          continue;
+        }
+        const sourceStart = Math.max(0, Math.round(block.start - tStart + sourceIn));
+        tl.caption_source = {
+          clip_element_id: clipEid,
+          source_start_frame: sourceStart,
+          source_end_frame: sourceStart + Math.max(1, Math.round(block.duration)),
+        };
+      }
+    }
+
+    // RE-ROUTE mis-anchored caption lines onto the lane clip that actually
+    // shows their words. A montage (one source split into several clips) used to
+    // get every line welded to the FIRST clip of the lane, so lines spoken in
+    // the later pieces fell outside that clip's source window and were culled —
+    // invisible captions. For each welded line whose anchor clip does NOT cover
+    // its source window, pick the sibling clip (same source file) with the
+    // greatest source-window overlap and re-anchor to it. Lines whose current
+    // anchor already covers them are left alone, so a deliberate user
+    // re-assignment is never overridden, and a line that no clip shows (words
+    // cut out of the edit) keeps its anchor and stays culled.
+    const coverage = (
+      v: Record<string, unknown>,
+      s: number,
+      e: number,
+    ): number => {
+      const cin = typeof v.source_in_frame === "number" ? Math.max(0, v.source_in_frame) : 0;
+      const cout =
+        typeof v.source_out_frame === "number" ? v.source_out_frame : Number.POSITIVE_INFINITY;
+      return Math.min(e, cout) - Math.max(s, cin);
+    };
+    for (const tl of textLayers) {
+      if (!tl || typeof tl !== "object") continue;
+      const cs = tl.caption_source as
+        | { clip_element_id?: unknown; source_start_frame?: unknown; source_end_frame?: unknown }
+        | undefined;
+      if (!cs || typeof cs.clip_element_id !== "string") continue;
+      if (
+        typeof cs.source_start_frame !== "number" ||
+        typeof cs.source_end_frame !== "number"
+      ) {
+        continue;
+      }
+      const anchorId = cs.clip_element_id.slice("video.".length);
+      const anchor = videoLayers.find((v) => v && v.id === anchorId);
+      if (!anchor) continue; // dangling anchor — leave for the block fallback
+      const s = cs.source_start_frame;
+      const e = cs.source_end_frame;
+      if (coverage(anchor, s, e) > 0) continue; // already on a clip that shows it
+      let best: Record<string, unknown> | null = null;
+      let bestOverlap = 0;
+      for (const v of videoLayers) {
+        if (!v || typeof v !== "object" || v.clip !== anchor.clip) continue;
+        const ov = coverage(v, s, e);
+        if (ov > bestOverlap) {
+          bestOverlap = ov;
+          best = v;
+        }
+      }
+      if (best && bestOverlap > 0) {
+        cs.clip_element_id = `video.${best.id as string}`;
+      }
+    }
+  }
+  return r;
+};
+
+// Convert legacy ALWAYS-PRESENT layers into real bounded clips where the author
+// already expressed a window through the layer's opacity FADE. Before the
+// clip/block model, a layer added to a project carried no `block` — the
+// "always-present" sentinel — so it spanned however long the video ever became.
+// A layer that fades DOWN to invisible (opacity ends at 0) has already told us
+// when it should end; `deriveLegacyBlockFromOpacity` turns that into a
+// `{ start: 0, duration }` block that bounds the growing TAIL while rendering
+// frame-for-frame identically (start stays 0, so nothing is re-timed; the culled
+// tail was already opacity-0). See that function for the full rationale and why
+// the head is deliberately left open.
+//
+// Deliberately conservative: touches ONLY layers with NO stored block (never
+// re-bounds a real clip), NEVER video (a clip's window IS its trim) and NEVER
+// groups (a group's `block.start` is a band time-origin with subtree-wide
+// effects). Skips caption lines (their window is DERIVED from the welded clip,
+// not a stored block). A layer whose opacity yields no window (open tail /
+// degenerate) is left untouched — unbounded already means "full length, and
+// keeps growing", exactly right for a persistent background / watermark.
+//
+// Runs on the FINAL pages shape (after migrateToPages), so it heals both legacy
+// flat projects (folded into pages upstream) and current pages-shaped ones on
+// load. Idempotent: once a block is written the layer is skipped on re-parse,
+// and a layer left unbounded re-derives null — so a second migration is a no-op.
+const migrateDeriveLegacyBlocks = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  // Leaf layer kinds only — NOT video_layers, NOT groups (see doc comment).
+  const arrays = ["image_layers", "text_layers", "shapes"];
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    for (const key of arrays) {
+      const arr = page[key];
+      if (!Array.isArray(arr)) continue;
+      for (const layerRaw of arr) {
+        if (!layerRaw || typeof layerRaw !== "object") continue;
+        const layer = layerRaw as Record<string, unknown>;
+        // Only ever bound an always-present layer; never re-bound a real clip.
+        if (layer.block !== undefined && layer.block !== null) continue;
+        // Captions derive their window from the clip they're welded to.
+        if (layer.caption_source !== undefined && layer.caption_source !== null) {
+          continue;
+        }
+        const derived = deriveLegacyBlockFromOpacity(
+          layer as {
+            animations?: { opacity?: { frame: number; value: number }[] };
+          },
+        );
+        if (!derived) continue;
+        layer.block = derived;
+      }
+    }
+  }
+  return r;
+};
+
 const preprocessProject = (raw: unknown): unknown => {
   const base = migrateFlattenPerElementMaps(
     migrateImageTextLayers(
@@ -2088,11 +2529,24 @@ const preprocessProject = (raw: unknown): unknown => {
     ),
   );
   // The per-element-map migrators run first (they flatten onto each layer).
-  // migrateToPages runs OUTERMOST — it folds the now-current flat composition
-  // (plus any carousel pages) into the v3 `pages` array.
-  return migrateToPages(
-    migrateGroupConstantTracksToBase(
-      migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+  // migrateToPages folds the now-current flat composition (plus any carousel
+  // pages) into the `pages` array; migrateAssignLaneIds and migrateWeldClipAudio
+  // run LAST, on that pages shape, so they see every page's video_layers +
+  // audio_overlays (lanes backfilled, legacy clip audio welded to its footer).
+  // migrateDeriveLegacyBlocks runs OUTERMOST — after migrateWeldCaptions has set
+  // every caption's `caption_source`, so its caption skip is reliable, and on the
+  // final pages shape so it reaches each page's own leaf layers.
+  return migrateDeriveLegacyBlocks(
+    migrateWeldCaptions(
+      migrateWeldClipAudio(
+        migrateAssignLaneIds(
+          migrateToPages(
+            migrateGroupConstantTracksToBase(
+              migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+            ),
+          ),
+        ),
+      ),
     ),
   );
 };
@@ -2577,6 +3031,90 @@ export const resolveLayerOrder = (project: Composition): string[] =>
 export const resolveLeafOrder = (project: Composition): string[] =>
   flattenTree(resolveLayerTree(project), true);
 
+// A LANE is a TIME track (NOT a z-order group): the video layers that share a
+// `lane_id` are the pieces of ONE take laid end-to-end — the two halves of a
+// razor split, or the fragments a `cut_range` leaves behind. `resolveLanes`
+// groups a composition's `video_layers` into lanes so every consumer — the
+// agent surface (`describe_video`), the Timeline, the Inspector — reads lane
+// membership from ONE place instead of re-deriving it three times.
+//
+// Within a lane, clips are ordered by `timeline_start_frame` (the order they
+// play). Lanes are ordered by their earliest clip's `timeline_start_frame`.
+// A video layer with no `lane_id` is defensively treated as its OWN lane keyed
+// by its id — post-migration every clip carries one (see migrateAssignLaneIds),
+// but callers must not assume it. Returns EVERY lane (including single-clip
+// ones) so UI callers can address each clip's lane; callers that want only the
+// lanes that actually group several clips use `resolveMultiClipLanes`.
+export type Lane = { lane_id: string; clips: VideoLayer[] };
+
+export const resolveLanes = (project: Composition): Lane[] => {
+  const byLane = new Map<string, VideoLayer[]>();
+  for (const v of project.video_layers) {
+    const laneId = v.lane_id && v.lane_id.length > 0 ? v.lane_id : v.id;
+    const bucket = byLane.get(laneId);
+    if (bucket) bucket.push(v);
+    else byLane.set(laneId, [v]);
+  }
+  return [...byLane.entries()]
+    .map(([lane_id, clips]) => ({
+      lane_id,
+      clips: [...clips].sort(
+        (a, b) => a.timeline_start_frame - b.timeline_start_frame,
+      ),
+    }))
+    .sort(
+      (a, b) =>
+        a.clips[0].timeline_start_frame - b.clips[0].timeline_start_frame,
+    );
+};
+
+// The multi-clip lanes only (2+ clips) — the "interesting" ones: a track that
+// actually laid several pieces of one take end-to-end. A thin filter over
+// `resolveLanes` so `describe_video` / a track UI don't re-derive the `> 1`
+// predicate. (A fallback lane, keyed by a unique layer id, is always
+// single-clip, so it never survives this filter.)
+export const resolveMultiClipLanes = (project: Composition): Lane[] =>
+  resolveLanes(project).filter((lane) => lane.clips.length > 1);
+
+// A collapsed lane reorders as ONE unit: its clips move together and stay a
+// contiguous block. `set_group_parent` only moves a single element (and removes
+// it BEFORE inserting), so a lane move is realised as a short sequence of
+// single-element moves — the first clip to the drop slot, then each remaining
+// clip packed immediately after the previous one. These two pure functions
+// compute each step's insertion index against a freshly-read siblings array
+// (`siblingIds` = the parent's children in `set_group_parent`'s coordinate
+// system), so the block always lands contiguous regardless of drop direction.
+// Shared by the store's batched `reorderLaneClips` action AND the Inspector /
+// Timeline drag surfaces that drive it, so all three agree on the index math.
+//
+// Step 1 — place the lane's first clip at `baseIndex` (the pre-removal target
+// slot). When that clip currently sits below the slot in the same parent, its
+// removal shifts the slot down by one (mirrors the single-element drop
+// adjustment).
+export const laneFirstInsertIndex = (
+  siblingIds: string[],
+  firstClipId: string,
+  baseIndex: number,
+): number => {
+  const cur = siblingIds.indexOf(firstClipId);
+  const idx = cur >= 0 && cur < baseIndex ? baseIndex - 1 : baseIndex;
+  return Math.max(0, idx);
+};
+
+// Steps 2..N — insert `movingId` immediately after `afterId` (the clip placed
+// on the previous step). If `movingId` currently sits below `afterId`, removing
+// it shifts `afterId` down one, so the post-removal "right after" slot is
+// `indexOf(afterId)` rather than `indexOf(afterId) + 1`.
+export const laneStepInsertIndex = (
+  siblingIds: string[],
+  afterId: string,
+  movingId: string,
+): number => {
+  const p = siblingIds.indexOf(afterId);
+  const q = siblingIds.indexOf(movingId);
+  return q > p ? p + 1 : p;
+};
+
 // The project's CURRENT root-level render order as an explicit `layer_order`
 // value: every non-pinned root id (leaves and groups, no descendants),
 // back-to-front exactly as resolveLayerTree renders them today. Ops that
@@ -2776,15 +3314,97 @@ export const layerOf = (
 // serialized — a stored block always has a finite positive duration.
 const ALWAYS_PRESENT_DURATION = Number.POSITIVE_INFINITY;
 
+// A caption line's source anchor (perElementDataFields.caption_source): the clip
+// it follows plus its window in that clip's OWN (source) timeline.
+export interface CaptionSourceAnchor {
+  clip_element_id: string;
+  source_start_frame: number;
+  source_end_frame: number;
+}
+
+// Derive a source-anchored caption line's on-timeline window from the clip it
+// follows — the caption analog of weldedAudioTiming/videoWindow. The line's
+// source range [source_start, source_end) is intersected with the clip's visible
+// source window [source_in, source_out) and mapped onto the composition timeline
+// via the clip's placement, so trimming the head/tail or sliding the clip
+// retimes/clips the caption with zero stored bookkeeping. No natural-duration
+// lookup is needed: a caption's own source_end is already ≤ the clip's real
+// length, so source_out (when set) bounds the tail and source_end bounds it
+// otherwise. Returns:
+//   - { start, duration } in composition frames (a caption never sits under an
+//     embedded morpha band, so its parent timeline == the composition timeline).
+//   - duration 0 when the line is fully trimmed off (culled: frameOutsideBlock
+//     never draws it; the Timeline skips its bar).
+//   - null when the referenced clip is missing (dangling anchor → caller falls
+//     back to any stored block).
+export const deriveCaptionWindow = (
+  project: Composition,
+  cs: CaptionSourceAnchor,
+): { start: number; duration: number } | null => {
+  const id = cs.clip_element_id.startsWith("video.")
+    ? cs.clip_element_id.slice("video.".length)
+    : cs.clip_element_id;
+  const clip = project.video_layers.find((v) => v.id === id);
+  if (!clip) return null;
+  const inFrame = Math.max(0, clip.source_in_frame);
+  const outFrame =
+    clip.source_out_frame === null ? Number.POSITIVE_INFINITY : clip.source_out_frame;
+  const clampWin = (f: number) => Math.min(Math.max(f, inFrame), outFrame);
+  const visStart = clampWin(cs.source_start_frame);
+  const visEnd = clampWin(cs.source_end_frame);
+  const tStart = Math.max(0, clip.timeline_start_frame);
+  return { start: tStart + (visStart - inFrame), duration: Math.max(0, visEnd - visStart) };
+};
+
 // The layer's on-timeline window in its PARENT's timeline, defaulting to the
-// always-present window when the layer has no stored block.
+// always-present window when the layer has no stored block. A caption line
+// (carries `caption_source`) overrides any stored block with a window DERIVED
+// live from the clip it follows (deriveCaptionWindow), so it tracks the clip's
+// trim; the stored block is used only as a fallback when the clip is missing.
 export const blockOf = (
   project: Composition,
   elementId: string,
 ): { start: number; duration: number } => {
-  const block = layerOf(project, elementId)?.block;
+  const layer = layerOf(project, elementId);
+  const cs = layer?.caption_source;
+  if (cs) {
+    const derived = deriveCaptionWindow(project, cs);
+    if (derived) return derived;
+    // Dangling anchor (clip removed) — fall through to any stored block. A
+    // welded caption has no stored block, and it must CULL, not become
+    // always-present: falling through to the blockless default plastered a
+    // deleted clip's captions over every frame of the composition.
+    if (!layer?.block) return { start: 0, duration: 0 };
+  }
+  const block = layer?.block;
   if (!block) return { start: 0, duration: ALWAYS_PRESENT_DURATION };
   return { start: block.start, duration: block.duration };
+};
+
+// Remove every caption line welded to `clipElementId` (its `caption_source`
+// anchor points at that clip), stripping their ids from `layer_order` and every
+// group's `children`. Deleting a clip takes its welded captions with it, exactly
+// like its welded audio overlay — a caption's window is DERIVED from the clip's
+// trim, so with the clip gone the line has nothing to play against. Shared by
+// the editor store and the pure remove_layer tool so the two surfaces can't
+// drift. Returns the removed `text.<id>` element ids.
+export const removeWeldedCaptionLines = (
+  project: Composition,
+  clipElementId: string,
+): string[] => {
+  const doomed = project.text_layers.filter(
+    (t) => t.caption_source?.clip_element_id === clipElementId,
+  );
+  if (doomed.length === 0) return [];
+  const ids = new Set(doomed.map((t) => `text.${t.id}`));
+  project.text_layers = project.text_layers.filter(
+    (t) => !ids.has(`text.${t.id}`),
+  );
+  project.layer_order = (project.layer_order ?? []).filter((x) => !ids.has(x));
+  for (const g of project.groups) {
+    g.children = g.children.filter((x) => !ids.has(x));
+  }
+  return [...ids];
 };
 
 // Sum of the TIME ORIGINS of every ANCESTOR embedded morpha band of `elementId`
@@ -2835,7 +3455,157 @@ export const frameOutsideBlock = (
 ): boolean => {
   const { start, duration } = blockOf(project, elementId);
   if (duration === ALWAYS_PRESENT_DURATION) return false;
+  // A fully-trimmed-off caption derives duration 0 — never drawn.
+  if (duration <= 0) return true;
   const parentFrame = frame - ancestorBandOriginSum(project, elementId);
   return parentFrame < start || parentFrame >= start + duration;
+};
+
+// A BLOCK MUST NEVER SILENTLY TRUNCATE AN AUTHORED KEYFRAME.
+//
+// The two effects of a block are coupled: it gates visibility AND it re-bases
+// the layer's keyframes to its `start`. So a keyframe authored at block-local
+// frame `f` is only ever SEEN while `f < block.duration` — past that the layer
+// is culled and the animation just vanishes, with nothing on screen to say why.
+// (Bounding every added layer by default, rather than only images, makes that
+// the DEFAULT trap rather than a corner case.)
+//
+// So: whenever a keyframe is AUTHORED (added / moved / pasted) at block-local
+// `authoredFrame`, grow the block just far enough to cover it. Deliberately
+// scoped to the frame the user just touched, NOT to the layer's whole track
+// extent — otherwise tweaking a keyframe near the start would resurrect a tail
+// the user had deliberately trimmed off, which is its own surprise.
+//
+// This runs at AUTHORING time only — never on load, never on a block edit — so:
+//   - it is non-destructive: nothing is deleted, moved or re-timed, and the
+//     user can still drag the block's right edge back in afterwards (an
+//     explicit trim IS allowed to hide a tail; only silence isn't).
+//   - it is invisible when correct: authoring inside the block, or on a
+//     blockless (always-present) layer, changes nothing.
+//   - nothing walks existing projects — a block-less layer stays block-less.
+// Skips caption lines, whose window is DERIVED from the clip they're welded to
+// (deriveCaptionWindow) and so can't be grown by writing a stored block.
+// FRAME SPACE — the authored frame is BLOCK-RELATIVE (the space keyframes are
+// stored in; see `effectiveFrameOffset`), which is why it's compared against
+// `block.duration` and not against an absolute timeline position. Passing an
+// absolute project frame here would over-grow every block on a layer that
+// doesn't start at 0. Callers holding a timeline frame must subtract
+// `effectiveFrameOffset(project, elementId)` first. This repo has shipped that
+// exact bug class before (block-offset editing surfaces), hence the loud note.
+//
+// Mutates `project` in place; returns true when the block actually changed.
+export const growBlockToCoverFrame = (
+  project: Composition,
+  elementId: string,
+  authoredBlockRelativeFrame: number,
+): boolean => {
+  if (!Number.isFinite(authoredBlockRelativeFrame)) return false;
+  const layer = findLayerByElementId(project, elementId);
+  if (!layer?.block) return false; // always-present ⇒ nothing to truncate
+  if (layer.caption_source) return false; // window derived from the clip
+  // HEAD case: a frame before the block start can't be covered by growing.
+  // Moving `start` earlier would re-time every OTHER keyframe on the layer
+  // (they're all block-relative), i.e. fix one hidden keyframe by silently
+  // moving the rest — strictly worse. The authoring surfaces clamp the
+  // playhead into the block, so this is unreachable in practice; if you ever
+  // make it reachable, clamp at the surface, don't grow the head here.
+  if (authoredBlockRelativeFrame < 0) return false;
+  const needed = Math.round(authoredBlockRelativeFrame) + 1;
+  if (needed <= layer.block.duration) return false;
+  layer.block = { start: layer.block.start, duration: needed };
+  return true;
+};
+
+// Derive a legacy ALWAYS-PRESENT layer's timeline BLOCK from its OWN opacity
+// animation — the shape the author already expressed. Legacy layers (added
+// before the clip/block model) carry no `block`, which is the "always-present"
+// sentinel: unbounded, so lengthening the composition later drags the layer out
+// to the new full length. Where the author faded the layer DOWN to invisible,
+// that window is already encoded in the opacity track, and we can bound the
+// layer to it render-identically. Returns `{ start, duration }` for a
+// bounded window, or `null` to leave the layer unbounded (the safe default).
+//
+// REPRESENTATION — why `start` is ALWAYS 0, and only the TAIL is bounded.
+// A block is NOT a passive visibility marker: `block.start` also RE-BASES every
+// one of the layer's animation tracks (see `effectiveFrameOffset` — the renderer
+// samples each track at `frame − block.start`). Writing `start = firstZeroFrame`
+// (the "bind the head" reading) would therefore silently slide the fade — and
+// any x/y/scale/rotation/fill track — LATER by that many frames, failing the
+// frame-for-frame render-identity requirement whenever the fade-in doesn't begin
+// at frame 0. Rewriting the keyframes to compensate is unsafe (a track authored
+// before the fade would shift to a negative frame, which the schema forbids),
+// and no block-CREATION path in the app re-bases keyframes anyway
+// (`set_layer_block` just stores the window). The only render-safe start is 0.
+//
+// That loses nothing that matters: the authored `opacity == 0` HEAD already
+// hides the layer before it appears, and the head is FIXED — it never grows with
+// the composition. Only the unbounded TAIL grows, so only the tail needs
+// bounding. Concretely, mapping the four cases in the derivation rule:
+//   - track ENDS at 0 (fade-out / trailing hidden keyframe) ⇒ the tail is
+//     authored-invisible, so cull it: block { start: 0, duration: lastFrame + 1 }.
+//     Covers BOTH the "starts-0 and ends-0" and the "ends-0 only" cases — a
+//     start of 0 already expresses the "head open" half of the latter, and is
+//     render-identical to the head bound of the former (the head is opacity-0
+//     either way). The window is [0, lastFrame] inclusive in the layer's parent
+//     timeline.
+//   - track does NOT end at 0 (open tail: "starts-0 only", or neither end at 0)
+//     ⇒ the layer is authored to stay visible to the end, however long that
+//     becomes, so it must remain unbounded. A finite block CANNOT represent an
+//     open tail without eventually truncating the layer when the comp is
+//     lengthened — the exact regression the migration must avoid — and a
+//     head-only layer's authored extent is merely its fade-IN end, so bounding
+//     there would cull it the instant it finishes appearing. ⇒ return null.
+// Degenerate opacity tracks (fewer than two keyframes, or all-zero — invisible
+// everywhere, no window to speak of) also return null: there's nothing to bound.
+//
+// PURE + node-testable; reads only the layer's own opacity track (no project /
+// I/O), so the migration and the editor's lazy block materialisation can share
+// it. Reads frame/value defensively so it works on both a parsed layer and a
+// raw pre-parse record.
+export const deriveLegacyBlockFromOpacity = (
+  layer:
+    | {
+        animations?:
+          | { opacity?: readonly { frame: number; value: number }[] }
+          | null;
+      }
+    | null
+    | undefined,
+): { start: number; duration: number } | null => {
+  const track = layer?.animations?.opacity;
+  if (!Array.isArray(track) || track.length < 2) return null;
+  const kfs: { frame: number; value: number }[] = [];
+  for (const kf of track) {
+    const f = (kf as { frame?: unknown })?.frame;
+    const v = (kf as { value?: unknown })?.value;
+    if (typeof f !== "number" || !Number.isFinite(f)) return null;
+    if (typeof v !== "number" || !Number.isFinite(v)) return null;
+    kfs.push({ frame: f, value: v });
+  }
+  kfs.sort((a, b) => a.frame - b.frame);
+  const last = kfs[kfs.length - 1];
+  // Open tail (last authored opacity ≠ exactly 0) ⇒ keep unbounded. Must be
+  // EXACTLY 0: a fade that ends at, say, 0.01 is still faintly visible, so
+  // culling there would NOT be render-identical.
+  if (last.value !== 0) return null;
+  // Bound to the FADE-OUT frame (the first 0 after the last visible keyframe),
+  // not the last keyframe overall — so a track that fades to 0 and then HOLDS 0
+  // for extra keyframes (`[{0,1},{100,0},{200,0}]`) yields a tight bar ending at
+  // 100, not an empty 100-frame tail out to 200. Trimming those trailing held-0
+  // keyframes is render-identical: opacity is 0 across the whole trimmed span,
+  // so culling there matches the opacity-0 exactly. The keyframe right after the
+  // last positive one is that fade-out 0 (everything past the last positive is
+  // ≤0 ⇒ 0, since opacity is never negative).
+  let lastPositiveIdx = -1;
+  for (let i = kfs.length - 1; i >= 0; i--) {
+    if (kfs[i].value > 0) {
+      lastPositiveIdx = i;
+      break;
+    }
+  }
+  // All-zero track ⇒ invisible everywhere, no visible window ⇒ leave alone.
+  if (lastPositiveIdx === -1) return null;
+  const fadeOutFrame = kfs[lastPositiveIdx + 1].frame;
+  return { start: 0, duration: fadeOutFrame + 1 };
 };
 

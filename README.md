@@ -47,13 +47,13 @@ projectSchema.parse(project); // it's a valid Morpha project, ready to save or r
 
 ## Add a video clip (upload **and** process)
 
-Clip ingest is npm-only: `addVideo` uploads the clip **and** runs the full processing pipeline — proxy build, audio split, transcription, OCR, object detection — so the clip is editor-ready and the `transcribeClip` / `detectTextRegions` / `detectObjects` readers light up. (Processing runs in a real local Chrome, like `renderFrame` — install Playwright + Chrome.)
+Clip ingest is npm-only: `addVideo` uploads the clip **and** runs the full processing pipeline — proxy build, audio split, transcription, OCR — so the clip is editor-ready and the `transcribeClip` / `detectTextRegions` readers light up. (Processing runs in a real local Chrome, like `renderFrame` — install Playwright + Chrome.)
 
 ```ts
 const morpha = createClient({ token: process.env.MORPHA_API_KEY });
 
 const { filename, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
-// processing.steps → { proxy, audio_split, transcript, text_regions, objects }
+// processing.steps → { proxy, audio_split, transcript, text_regions }
 // processing.reasons → per-step failure reason when a step didn't succeed
 await morpha.callTool(id, "add_video_layer", { clip: filename, x: 540, y: 960, width: 1080, height: 1920 });
 
