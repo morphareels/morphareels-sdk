@@ -180,7 +180,8 @@ export interface MorphaClient {
     assetsMoved: number;
     clipsMoved: number;
   }>;
-  /** Permanently delete a project (refuses to leave the workspace empty). */
+  /** Permanently delete a project. Requires edit access (owner, workspace
+   * editor+, or direct-share editor); deleting your last project is allowed. */
   deleteProject(projectId: string): Promise<{ projectId: string } & Record<string, unknown>>;
 
   // ── Versions ──────────────────────────────────────────────────────────────

@@ -35,11 +35,14 @@ import {
 } from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
+  blockOf,
   clampCurve,
   CAPTIONS_GROUP_NAME,
+  collectCaptionsRootIds,
   fillSchema,
   findLayerByElementId,
   findParentGroup,
+  isCaptionLineElement,
   getGroupDescendants,
   growBlockToCoverFrame,
   isMorphaGroup,
@@ -2814,6 +2817,17 @@ const reorderLayer: ToolDispatch<ReorderLayerArgs> = (project, args) => {
       };
     }
   }
+  // Root captions groups refuse reorder for the same reason at the other end
+  // of the stack: `resolveLayerTree` forces them to the TOP of root z.
+  if (collectCaptionsRootIds(project).includes(elementId)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `captions always render on top; cannot reorder: ${elementId}`,
+      },
+    };
+  }
   const next = cloneProject(project);
   normalizeRoot(next);
   const parentGid = findParentGroup(next, elementId);
@@ -4706,6 +4720,16 @@ type SetLayerBlockArgs = {
 // animation. Works on any leaf or group (for a group, `start` is also the time
 // origin for its subtree when it's an embedded band). Frames are in the layer's
 // parent timeline (composition frames at root; band-local inside a band).
+// COMP frame → a clip's SOURCE timeline, against its current trim. THE single
+// conversion for every caption-window write (set_layer_block's caption branch,
+// split_caption_line) — the inverse of deriveCaptionWindow's mapping. Keep it
+// in one place: a drifted copy here silently un-welds caption edits.
+const clipSourceFrameFromComp = (
+  clip: VideoLayer,
+  compFrame: number,
+): number =>
+  compFrame - Math.max(0, clip.timeline_start_frame) + Math.max(0, clip.source_in_frame);
+
 const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
   const { elementId, start, duration } = args;
   if (!findLayerByElementId(project, elementId)) {
@@ -4741,10 +4765,7 @@ const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
       : cs.clip_element_id;
     const clip = next.video_layers.find((v) => v.id === clipId);
     if (clip) {
-      const sourceStart = Math.max(
-        0,
-        roundedStart - Math.max(0, clip.timeline_start_frame) + Math.max(0, clip.source_in_frame),
-      );
+      const sourceStart = Math.max(0, clipSourceFrameFromComp(clip, roundedStart));
       target.caption_source = {
         clip_element_id: cs.clip_element_id,
         source_start_frame: sourceStart,
@@ -6539,6 +6560,269 @@ const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
+// split_caption_line / merge_caption_lines
+// ---------------------------------------------------------------------------
+
+// Divide caption text at the word gap nearest the time-proportional split
+// point. A single word (no interior whitespace) stays on the LEFT half and the
+// right half starts empty — the caller notes it so the user edits the new
+// line (the UI selects the right half, so it's immediately typeable).
+const splitCaptionText = (
+  text: string,
+  frac: number,
+): { left: string; right: string } => {
+  const target = Math.round(text.length * Math.min(1, Math.max(0, frac)));
+  let best = -1;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < text.length; i++) {
+    if (!/\s/.test(text[i])) continue;
+    const dist = Math.abs(i - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+  }
+  if (best === -1) return { left: text.trimEnd(), right: "" };
+  return { left: text.slice(0, best).trimEnd(), right: text.slice(best + 1).trimStart() };
+};
+
+type SplitCaptionLineArgs = { elementId?: unknown; atFrame?: unknown };
+
+// Split one caption line into two at a COMPOSITION frame (the playhead, in
+// the editor's gesture). The right half is a full clone of the line — style,
+// band geometry, name — so the split is invisible except for the boundary;
+// the text divides at the word gap nearest the split point. A welded line
+// converts the frame into the clip's SOURCE timeline (the same math as
+// set_layer_block's caption branch) so BOTH halves stay welded; a standalone
+// (block) line splits its block. The new layer registers next to the original
+// (captions-group children, or layer_order for an ungrouped line).
+const splitCaptionLine: ToolDispatch<SplitCaptionLineArgs> = (project, args) => {
+  const { elementId, atFrame } = args;
+  if (typeof elementId !== "string" || !elementId.startsWith("text.")) {
+    return {
+      project,
+      result: { ok: false, error: `elementId must be a "text.<id>": ${String(elementId)}` },
+    };
+  }
+  if (typeof atFrame !== "number" || !Number.isFinite(atFrame)) {
+    return { project, result: { ok: false, error: "atFrame must be a finite number" } };
+  }
+  const next = cloneProject(project);
+  const bare = elementId.slice("text.".length);
+  const tl = next.text_layers.find((t) => t.id === bare);
+  if (!tl) {
+    return { project, result: { ok: false, error: `text layer not found: ${elementId}` } };
+  }
+  if (!isCaptionLineElement(next, `text.${tl.id}`)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `${elementId} is not a caption line (no caption_source and not in a "captions" group)`,
+      },
+    };
+  }
+  const win = blockOf(next, elementId);
+  if (!Number.isFinite(win.duration) || win.duration <= 1) {
+    return {
+      project,
+      result: { ok: false, error: `line is too short to split (window ${win.duration} frames)` },
+    };
+  }
+  const frame = Math.round(atFrame);
+  if (!(frame > win.start && frame < win.start + win.duration)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `atFrame ${frame} must be strictly inside the line's window [${win.start}, ${win.start + win.duration})`,
+      },
+    };
+  }
+
+  const rightBare = generateLayerId(next, "text");
+  const clone = structuredClone(tl);
+  clone.id = rightBare;
+  const { left: leftText, right: rightText } = splitCaptionText(
+    tl.text ?? "",
+    (frame - win.start) / win.duration,
+  );
+  tl.text = leftText;
+  clone.text = rightText;
+
+  if (tl.caption_source) {
+    const cs = tl.caption_source;
+    const clipBare = cs.clip_element_id.startsWith("video.")
+      ? cs.clip_element_id.slice("video.".length)
+      : cs.clip_element_id;
+    const clip = next.video_layers.find((v) => v.id === clipBare);
+    if (!clip) {
+      return {
+        project,
+        result: { ok: false, error: `welded clip not found: ${cs.clip_element_id}` },
+      };
+    }
+    // COMP frame → the clip's SOURCE timeline, same conversion as
+    // set_layer_block's caption branch — both halves stay welded.
+    const sourceSplit = clipSourceFrameFromComp(clip, frame);
+    tl.caption_source = { ...cs, source_end_frame: sourceSplit };
+    clone.caption_source = { ...cs, source_start_frame: sourceSplit };
+  } else {
+    tl.block = { start: win.start, duration: frame - win.start };
+    clone.block = { start: frame, duration: win.start + win.duration - frame };
+  }
+
+  // Register the right half NEXT TO the original: inside the same captions
+  // group when grouped, else in layer_order (any leaf-creating root op must
+  // register there — unlisted ids float to the top of the z-stack).
+  const idx = next.text_layers.findIndex((t) => t.id === bare);
+  next.text_layers.splice(idx + 1, 0, clone);
+  const rightEid = `text.${rightBare}`;
+  const parentGid = findParentGroup(next, elementId);
+  if (parentGid) {
+    const g = next.groups.find((x) => x.id === parentGid)!;
+    const at = g.children.indexOf(elementId);
+    g.children.splice(at + 1, 0, rightEid);
+  } else {
+    materializeRootLayerOrder(next);
+    const at = next.layer_order.indexOf(elementId);
+    next.layer_order.splice(at >= 0 ? at + 1 : next.layer_order.length, 0, rightEid);
+  }
+
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        left: elementId,
+        right: rightEid,
+        splitFrame: frame,
+        ...(rightText.length === 0
+          ? { note: "single-word line: the right half's text is empty — set it with set_layer_text" }
+          : null),
+      },
+    },
+  };
+};
+
+type MergeCaptionLinesArgs = { elementIds?: unknown };
+
+// Merge two or more caption lines into one. The earliest line survives with
+// the union window and the time-ordered texts joined by spaces; the others
+// are removed (text_layers + group children + layer_order). All lines must be
+// the same flavour — every one welded to the SAME clip, or every one a
+// standalone block line — and no OTHER caption line on that track may sit
+// inside the merged span (it would end up buried under the merged window).
+const mergeCaptionLines: ToolDispatch<MergeCaptionLinesArgs> = (project, args) => {
+  const { elementIds } = args;
+  if (
+    !Array.isArray(elementIds) ||
+    elementIds.length < 2 ||
+    !elementIds.every((x) => typeof x === "string" && x.startsWith("text."))
+  ) {
+    return {
+      project,
+      result: { ok: false, error: 'elementIds must be ≥2 "text.<id>" strings' },
+    };
+  }
+  const ids = [...new Set(elementIds as string[])];
+  if (ids.length < 2) {
+    return { project, result: { ok: false, error: "elementIds must name ≥2 distinct lines" } };
+  }
+  const next = cloneProject(project);
+  const layers: TextLayer[] = [];
+  for (const eid of ids) {
+    const tl = next.text_layers.find((t) => t.id === eid.slice("text.".length));
+    if (!tl) {
+      return { project, result: { ok: false, error: `text layer not found: ${eid}` } };
+    }
+    if (!isCaptionLineElement(next, `text.${tl.id}`)) {
+      return { project, result: { ok: false, error: `${eid} is not a caption line` } };
+    }
+    layers.push(tl);
+  }
+  const weldClips = new Set(layers.map((t) => t.caption_source?.clip_element_id ?? null));
+  if (weldClips.size > 1) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: "lines must share one flavour: all welded to the SAME clip, or all standalone",
+      },
+    };
+  }
+
+  // Time-order by the on-timeline window; the earliest layer survives.
+  const withWin = layers
+    .map((tl) => ({ tl, win: blockOf(next, `text.${tl.id}`) }))
+    .sort((a, b) => a.win.start - b.win.start);
+  const spanStart = withWin[0].win.start;
+  const spanEnd = Math.max(...withWin.map((w) => w.win.start + w.win.duration));
+  const mergedIds = new Set(layers.map((t) => t.id));
+
+  // No bystander caption line inside the merged span.
+  for (const other of next.text_layers) {
+    if (mergedIds.has(other.id) || !isCaptionLineElement(next, `text.${other.id}`)) continue;
+    const sameTrack =
+      (weldClips.values().next().value ?? null) !== null
+        ? other.caption_source?.clip_element_id === weldClips.values().next().value
+        : findParentGroup(next, `text.${other.id}`) ===
+          findParentGroup(next, `text.${withWin[0].tl.id}`);
+    if (!sameTrack) continue;
+    const w = blockOf(next, `text.${other.id}`);
+    if (w.duration > 0 && w.start < spanEnd && w.start + w.duration > spanStart) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error: `another line ("${(other.text ?? "").slice(0, 24)}") sits inside the merged span — merge it too or move it first`,
+        },
+      };
+    }
+  }
+
+  const keep = withWin[0].tl;
+  keep.text = withWin
+    .map((w) => (w.tl.text ?? "").trim())
+    .filter((t) => t.length > 0)
+    .join(" ");
+  if (keep.caption_source) {
+    keep.caption_source = {
+      ...keep.caption_source,
+      source_start_frame: Math.min(
+        ...withWin.map((w) => w.tl.caption_source!.source_start_frame),
+      ),
+      source_end_frame: Math.max(
+        ...withWin.map((w) => w.tl.caption_source!.source_end_frame),
+      ),
+    };
+  } else {
+    keep.block = { start: spanStart, duration: Math.max(1, spanEnd - spanStart) };
+  }
+
+  const doomedEids = new Set(
+    withWin.slice(1).map((w) => `text.${w.tl.id}`),
+  );
+  next.text_layers = next.text_layers.filter((t) => !doomedEids.has(`text.${t.id}`));
+  next.layer_order = (next.layer_order ?? []).filter((x) => !doomedEids.has(x));
+  for (const g of next.groups) {
+    g.children = g.children.filter((x) => !doomedEids.has(x));
+  }
+
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        elementId: `text.${keep.id}`,
+        removed: [...doomedEids],
+        text: keep.text,
+      },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
 // rename_layer
 // ---------------------------------------------------------------------------
 //
@@ -7085,6 +7369,8 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   set_layer_text: setLayerText as ToolDispatch<never>,
   add_text_layer: addTextLayer as ToolDispatch<never>,
   add_caption_track: addCaptionTrack as ToolDispatch<never>,
+  split_caption_line: splitCaptionLine as ToolDispatch<never>,
+  merge_caption_lines: mergeCaptionLines as ToolDispatch<never>,
   rename_layer: renameLayer as ToolDispatch<never>,
   set_loop: setLoop as ToolDispatch<never>,
   set_image_filename: setImageFilename as ToolDispatch<never>,
@@ -8746,6 +9032,48 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
         },
         required: ["lines"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "split_caption_line",
+      description:
+        'Split one caption line into two at a COMPOSITION frame strictly inside its window (in the editor this is the playhead). The right half is a full clone — style, band geometry, weld — and the text divides at the word gap nearest the split point (a single-word line keeps its text on the left; the right half starts empty). A welded line stays welded on both halves (the frame converts to the clip\'s source timeline); a standalone line splits its block. Returns { left, right, splitFrame }. Retime the halves afterwards with set_layer_block; fix the wording with set_layer_text.',
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description: 'The caption line to split, "text.<id>".',
+          },
+          atFrame: {
+            type: "number",
+            description:
+              "Composition frame to split at — must be strictly inside the line's on-timeline window (see describe_video / inspect_layers for windows).",
+          },
+        },
+        required: ["elementId", "atFrame"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "merge_caption_lines",
+      description:
+        "Merge two or more caption lines into one. The earliest line survives with the union window and the time-ordered texts joined by spaces; the others are removed. All lines must share one flavour — every one welded to the SAME clip, or every one standalone — and no other caption line on that track may sit inside the merged span (move or include it first).",
+      parameters: {
+        type: "object",
+        properties: {
+          elementIds: {
+            type: "array",
+            items: { type: "string" },
+            description: 'Two or more caption lines, each "text.<id>".',
+          },
+        },
+        required: ["elementIds"],
       },
     },
   },

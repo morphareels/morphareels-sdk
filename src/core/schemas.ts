@@ -1224,6 +1224,26 @@ export const isCaptionsGroup = (
 ): boolean =>
   (group?.name ?? "").trim().toLowerCase() === CAPTIONS_GROUP_NAME;
 
+// True when `elementId` is a CAPTION LINE: a text layer carrying a weld
+// anchor (caption_source), or one living inside a "captions" group (the
+// standalone block flavour). The single source of truth for "is this element
+// a caption line" across the pure tools (split/merge), the editor's split
+// target resolution, and the clip-action surfaces.
+export const isCaptionLineElement = (
+  project: Composition,
+  elementId: string,
+): boolean => {
+  if (!elementId.startsWith("text.")) return false;
+  const bare = elementId.slice("text.".length);
+  const tl = project.text_layers.find((t) => t.id === bare);
+  if (!tl) return false;
+  if (tl.caption_source) return true;
+  for (const g of project.groups ?? []) {
+    if (g.children.includes(elementId)) return isCaptionsGroup(g);
+  }
+  return false;
+};
+
 // Schema version. Bumped when on-disk JSON gains a meaning that older
 // readers can't infer:
 //   1 = post-rev1-migration shape with top-left anchored x/y (legacy).
@@ -2514,6 +2534,60 @@ const migrateDeriveLegacyBlocks = (raw: unknown): unknown => {
   return r;
 };
 
+// Dissolve EMPTY captions groups on load. `removeCaptionLines` dissolves the
+// wrapper it empties, but interrupted re-captioning has left zero-child
+// "captions" groups behind — invisible on canvas yet surfacing as a phantom
+// (often duplicate) "Captions" entry in the UI. An empty captions wrapper
+// renders nothing by definition, so dropping it is pure cleanup: remove the
+// group record and every reference to it (layer_order, other groups'
+// children). Runs on the FINAL pages shape. Idempotent: a healed project has
+// no empty captions group to match on re-parse.
+const migrateDissolveEmptyCaptionsGroups = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    const groups = page.groups;
+    if (!Array.isArray(groups)) continue;
+    const emptyIds = new Set<string>();
+    for (const gRaw of groups) {
+      if (!gRaw || typeof gRaw !== "object") continue;
+      const g = gRaw as Record<string, unknown>;
+      if (!isCaptionsGroup(g as { name?: string })) continue;
+      const children = Array.isArray(g.children) ? g.children : [];
+      if (children.length === 0 && typeof g.id === "string") {
+        emptyIds.add(`group.${g.id}`);
+      }
+    }
+    if (emptyIds.size === 0) continue;
+    page.groups = groups.filter(
+      (gRaw) =>
+        !(
+          gRaw &&
+          typeof gRaw === "object" &&
+          emptyIds.has(`group.${(gRaw as Record<string, unknown>).id as string}`)
+        ),
+    );
+    if (Array.isArray(page.layer_order)) {
+      page.layer_order = page.layer_order.filter(
+        (id) => !(typeof id === "string" && emptyIds.has(id)),
+      );
+    }
+    for (const gRaw of page.groups as unknown[]) {
+      if (!gRaw || typeof gRaw !== "object") continue;
+      const g = gRaw as Record<string, unknown>;
+      if (Array.isArray(g.children)) {
+        g.children = g.children.filter(
+          (id) => !(typeof id === "string" && emptyIds.has(id)),
+        );
+      }
+    }
+  }
+  return r;
+};
+
 const preprocessProject = (raw: unknown): unknown => {
   const base = migrateFlattenPerElementMaps(
     migrateImageTextLayers(
@@ -2536,13 +2610,17 @@ const preprocessProject = (raw: unknown): unknown => {
   // migrateDeriveLegacyBlocks runs OUTERMOST — after migrateWeldCaptions has set
   // every caption's `caption_source`, so its caption skip is reliable, and on the
   // final pages shape so it reaches each page's own leaf layers.
+  // migrateDissolveEmptyCaptionsGroups sits just outside migrateWeldCaptions:
+  // welding never re-populates an empty wrapper, so dissolving after it is safe.
   return migrateDeriveLegacyBlocks(
-    migrateWeldCaptions(
-      migrateWeldClipAudio(
-        migrateAssignLaneIds(
-          migrateToPages(
-            migrateGroupConstantTracksToBase(
-              migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+    migrateDissolveEmptyCaptionsGroups(
+      migrateWeldCaptions(
+        migrateWeldClipAudio(
+          migrateAssignLaneIds(
+            migrateToPages(
+              migrateGroupConstantTracksToBase(
+                migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+              ),
             ),
           ),
         ),
@@ -2927,6 +3005,24 @@ export const collectPinnedRootIds = (project: Composition): string[] =>
     .filter((l) => l.pinned === true)
     .map((l) => `image.${l.id}`);
 
+// Root-level captions-group ids, in `groups` array order. The mirror of
+// `collectPinnedRootIds` at the other end of the stack: these are forced to
+// the TOP of the root z regardless of where `layer_order` mentions them
+// (which silently ignores them), so captions can never be buried by a
+// later-created group or layer. Only ROOT-level captions groups pin — one
+// nested inside a user group keeps its parent's stacking (legacy projects
+// wrapped [video, captions] in a shared parent; their transform/opacity
+// scoping must keep meaning what it meant).
+// Callers that already hold the grouped-id set (resolveLayerTree computes it
+// per call, per rendered frame) pass it in; standalone callers omit it.
+export const collectCaptionsRootIds = (
+  project: Composition,
+  grouped: Set<string> = collectGroupedIds(project),
+): string[] =>
+  (project.groups ?? [])
+    .filter((g) => isCaptionsGroup(g) && !grouped.has(`group.${g.id}`))
+    .map((g) => `group.${g.id}`);
+
 // Resolve the project's render tree. Each entry is a root-level id; group
 // nodes carry a nested `children` list. Same precedence rules as the old
 // flat resolver, just applied at root and recursed into each group:
@@ -2938,6 +3034,9 @@ export const collectPinnedRootIds = (project: Composition): string[] =>
 //   - PINNED image layers are pre-pended at root (= bottom of z) regardless
 //     of layer_order; non-pinned layers sit above them. Render order in
 //     the tree is back-to-front, so the pinned layer paints first.
+//   - CAPTIONS groups at root are appended last (= top of z) regardless of
+//     layer_order — the top-side mirror of the pinned backdrop. Grouping or
+//     adding layers after captioning can never bury the captions.
 // A given element id appears at most once in the whole tree.
 export const resolveLayerTree = (project: Composition): LayerNode[] => {
   const present = collectPresentIds(project);
@@ -2945,6 +3044,8 @@ export const resolveLayerTree = (project: Composition): LayerNode[] => {
   const groupById = new Map<string, Group>();
   for (const g of project.groups ?? []) groupById.set(g.id, g);
   const pinnedRoot = new Set(collectPinnedRootIds(project));
+  const captionsRoot = collectCaptionsRootIds(project, grouped);
+  const captionsRootSet = new Set(captionsRoot);
 
   const seen = new Set<string>();
   const buildNode = (id: string): LayerNode | null => {
@@ -2971,6 +3072,7 @@ export const resolveLayerTree = (project: Composition): LayerNode[] => {
     if (grouped.has(id)) return;
     if (!present.has(id)) return;
     if (pinnedRoot.has(id)) return;
+    if (captionsRootSet.has(id)) return;
     seenRoot.add(id);
     rootIds.push(id);
   };
@@ -2995,6 +3097,12 @@ export const resolveLayerTree = (project: Composition): LayerNode[] => {
     if (node) out.push(node);
   }
   for (const id of rootIds) {
+    const node = buildNode(id);
+    if (node) out.push(node);
+  }
+  // Captions groups come LAST in tree order (= top of z, painted over
+  // everything). Relative order among several tracks follows groups[].
+  for (const id of captionsRoot) {
     const node = buildNode(id);
     if (node) out.push(node);
   }
