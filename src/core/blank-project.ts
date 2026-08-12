@@ -7,8 +7,8 @@ import { blankPage } from "./carousel.ts";
 // both come from here — so the empty starting state is defined in exactly one
 // place.
 //
-// A project is a pages-only structure: an ordered list of full compositions
-// sharing the project's canvas dims. A blank project is a single blank PAGE (see
+// A project is a pages-only structure: an ordered list of full compositions,
+// each with its own canvas dims. A blank project is a single blank PAGE (see
 // blankPage in carousel.ts) — one pinned `is_background` image_layer and empty
 // collections for everything else.
 
@@ -28,8 +28,6 @@ export const blankProject = (opts: BlankProjectOpts): Project => {
     project_id: opts.projectId,
     ...(opts.name ? { name: opts.name } : {}),
     schema_version: SCHEMA_VERSION,
-    canvas_width: canvasWidth,
-    canvas_height: canvasHeight,
     active_index: 0,
     pages: [blankPage(canvasWidth, canvasHeight, opts.name ?? undefined)],
     collection: [],

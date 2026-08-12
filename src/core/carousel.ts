@@ -4,10 +4,10 @@ import type { Composition, PageComposition, Project } from "./schemas.ts";
 // Pure conversions between a project's PAGES and the flat single-composition
 // VIEW the renderer and the pure tools operate on.
 //
-// A project is pages-only: `{ …meta, canvas_width, canvas_height, active_index,
-// pages[≥1] }`. To render or mutate ONE page we PROJECT it into a `Composition`
-// (compositionForPage) — the page's composition plus the project-level render
-// context (id, canvas dims, fonts, collection, embed) — and fold the result
+// A project is pages-only: `{ …meta, active_index, pages[≥1] }`, and each page
+// carries its own canvas dims. To render or mutate ONE page we PROJECT it into
+// a `Composition` (compositionForPage) — the page's composition plus the
+// project-level render context (id, fonts, collection, embed) — and fold the result
 // back (writeCompositionBack). These are pure selectors, NOT stored state:
 // there is exactly one canonical Project and one save path. (This replaces the
 // old stateful pageToProject/projectToPage projection, which kept a second
@@ -29,8 +29,6 @@ export const compositionForPage = (
     ...(project.name !== undefined ? { name: project.name } : {}),
     ...(project.org_id !== undefined ? { org_id: project.org_id } : {}),
     schema_version: project.schema_version,
-    canvas_width: project.canvas_width,
-    canvas_height: project.canvas_height,
     custom_fonts: project.custom_fonts,
     collection: project.collection,
     embed_origins: project.embed_origins,
@@ -39,6 +37,8 @@ export const compositionForPage = (
     shared_with_editors: project.shared_with_editors,
     current_version_id: project.current_version_id,
     last_modified_at: project.last_modified_at,
+    canvas_width: page.canvas_width,
+    canvas_height: page.canvas_height,
     image_layers: page.image_layers,
     video_layers: page.video_layers,
     text_layers: page.text_layers,
@@ -68,8 +68,6 @@ export const singlePageProject = (comp: Composition): Project => ({
   ...(comp.name !== undefined ? { name: comp.name } : {}),
   ...(comp.org_id !== undefined ? { org_id: comp.org_id } : {}),
   schema_version: comp.schema_version,
-  canvas_width: comp.canvas_width,
-  canvas_height: comp.canvas_height,
   custom_fonts: comp.custom_fonts,
   collection: comp.collection,
   embed_origins: comp.embed_origins,
@@ -83,6 +81,8 @@ export const singlePageProject = (comp: Composition): Project => ({
     {
       id: crypto.randomUUID(),
       ...(comp.name !== undefined ? { name: comp.name } : {}),
+      canvas_width: comp.canvas_width,
+      canvas_height: comp.canvas_height,
       image_layers: comp.image_layers,
       video_layers: comp.video_layers,
       text_layers: comp.text_layers,
@@ -103,8 +103,11 @@ export const singlePageProject = (comp: Composition): Project => ({
 
 // Fold an edited Composition back into `pages[index]`, carrying the project-
 // level fields a content tool may legitimately mutate (collection / embed /
-// public_properties / custom_fonts). Canvas dims, name, sharing, and versions
-// stay project-authoritative — their own tools/endpoints own them.
+// public_properties / custom_fonts). Name, sharing, and versions stay
+// project-authoritative — their own tools/endpoints own them. The page's canvas
+// dims ride along on the `...prev` spread: only set_canvas_size resizes a page,
+// and it writes the page directly, so a content tool can never resize by
+// round-tripping a stale composition.
 export const writeCompositionBack = (
   project: Project,
   index: number,
@@ -151,6 +154,8 @@ export const blankPage = (
   pageCompositionSchema.parse({
     id: crypto.randomUUID(),
     ...(name ? { name } : {}),
+    canvas_width: canvasWidth,
+    canvas_height: canvasHeight,
     image_layers: [
       {
         id: "background",

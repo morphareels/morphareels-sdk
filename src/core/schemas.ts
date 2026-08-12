@@ -143,6 +143,25 @@ const perElementDataFields = {
       duration: z.number().int().positive(),
     })
     .optional(),
+  // EDGE TRANSITIONS — how the layer enters at the start of its window and
+  // leaves at the end, instead of popping. Both are EDGE-RELATIVE: they store
+  // a length (and a look), never an absolute frame, so they ride the edge when
+  // the layer is re-trimmed, slid, or (for a welded caption) retimed by the
+  // clip it follows. That is the whole reason they are not keyframes —
+  // `fade_layer` / `apply_preset` write opacity keyframes at ABSOLUTE frames,
+  // which strand themselves the moment the edge moves.
+  //
+  // The window they resolve against is `effectiveWindowOf`, not `block`:
+  // video layers carry no block at all (their window comes from the trim), so
+  // hanging these off `block` would fix the layer pop and leave the clip pop.
+  //
+  // Applied as MULTIPLIERS over the layer's own sampled transform (see
+  // src/transitions.ts `edgeTransitionAt`, applied in renderer.ts `evalStyle`),
+  // never as a replacement — a user's own opacity keyframes survive underneath.
+  // An unbounded (always-present) window has no edges, so a transition on such
+  // a layer is inert; this is what keeps the field backward-compatible.
+  transition_in: z.lazy(() => edgeTransitionSchema).optional(),
+  transition_out: z.lazy(() => edgeTransitionSchema).optional(),
   // Caption SOURCE ANCHOR — a caption line's timing tied to a clip's audio
   // track, the caption analog of a welded audio overlay's `sourceLayerId`.
   // `source_start_frame` / `source_end_frame` are the line's window in the
@@ -285,6 +304,41 @@ export const videoLayerSchema = z
     // EXCEPT where the source is opaque — a knock-out / punch-through. Honored
     // on leaf hosts (the canvas matte path); ignored on group hosts for now.
     matte_inverted: z.boolean().optional(),
+    // CONSTANT playback rate for the clip — the simple "play this slower /
+    // faster" control. 1 = source speed, 0.5 = half speed, 2 = double. This is
+    // the whole retime story for most clips; `speed_keyframes` below is the
+    // power-user ramp layered ON TOP (the effective rate at a timeline frame is
+    // `speed × ramp(frame)` — see `layerRateAtFrame`).
+    //
+    // Speed RETIMES the clip: the trimmed source span is fixed, so a slower
+    // rate makes the clip occupy MORE timeline frames and a faster one fewer.
+    // `videoWindow` derives `windowFrames` from the rate curve — nothing stores
+    // the retimed length, so speed and trim compose without bookkeeping.
+    speed: z.number().min(0.1).max(8).default(1),
+    // Speed RAMP — a rate curve for when the speed must CHANGE across the clip.
+    // Multiplies the constant `speed` above (`layerRateAtFrame` = speed × ramp).
+    //
+    // `frame` is CLIP-RELATIVE: 0 is the clip's first frame, NOT a project
+    // frame. That is load-bearing, not a detail. The clip's on-timeline length
+    // is derived by integrating this curve, so if the curve were anchored to
+    // absolute project frames, sliding a clip would slide the curve underneath
+    // it and CHANGE ITS DURATION — and every op that moves a clip would have to
+    // remember to remap the keyframes (cut_range did; move_band, shift_group
+    // and the clip drag did not). Clip-relative removes the chance to forget.
+    // The `add_speed_keyframe` / `remove_speed_keyframe` TOOLS still take a
+    // project frame, because that is what a caller with a playhead has; they
+    // convert on the way in — and report project frames back out, as does
+    // `inspect_layers`, so the round trip closes.
+    //
+    // The offsets are in the clip's TIMELINE space, not its source space. So a
+    // MOVE carries the curve (the point of this), while a HEAD TRIM slides the
+    // footage underneath a stationary curve — trimming 10 frames off the front
+    // leaves the ramp where it was and different content arrives under it.
+    // That is the opposite of `caption_source`, which anchors in SOURCE space
+    // and therefore survives a trim. Timeline space is the right choice here
+    // because the length integral is over timeline frames; if a future change
+    // wants trim-stable ramps, it has to re-anchor deliberately, not by
+    // accident. Recorded so the next person has an answer rather than a guess.
     speed_keyframes: z
       .array(
         z
@@ -467,6 +521,14 @@ export const curveIsActive = (v: number | undefined | null): boolean =>
 // [sourceInSeconds, sourceOutSeconds). Single source of truth for the
 // renderer, preview, export, and timeline UI — every call site should
 // route through this rather than re-deriving the math.
+//
+// SPEED: `windowFrames` is the RETIMED on-timeline length — the number of
+// project frames it takes to play the trimmed source span at the layer's rate
+// curve — so it is NOT `outFrame - inFrame` once the clip is retimed. The
+// source span is unchanged by speed (that's `sourceSpanFrames`); what changes
+// is how long it takes. Because every call site already routes through here,
+// making this speed-aware retimes the clip bar, the renderer's window test,
+// trim/snap, welded audio and the comp duration in one move.
 export const videoWindow = (
   layer: VideoLayer,
   sourceDurationSeconds: number,
@@ -476,6 +538,7 @@ export const videoWindow = (
   sourceInSeconds: number;
   sourceOutSeconds: number;
   windowFrames: number;
+  sourceSpanFrames: number;
 } => {
   const FPS = 30;
   const sourceDurationFrames = Math.max(
@@ -492,7 +555,8 @@ export const videoWindow = (
     inFrame,
     Math.min(sourceDurationFrames, rawOut),
   );
-  const windowFrames = Math.max(0, outFrame - inFrame);
+  const sourceSpanFrames = Math.max(0, outFrame - inFrame);
+  const windowFrames = retimedWindowFrames(layer, sourceSpanFrames);
   const startFrame = Math.max(0, layer.timeline_start_frame);
   return {
     startFrame,
@@ -500,8 +564,46 @@ export const videoWindow = (
     sourceInSeconds: inFrame / FPS,
     sourceOutSeconds: outFrame / FPS,
     windowFrames,
+    sourceSpanFrames,
   };
 };
+
+export type VideoWindow = ReturnType<typeof videoWindow>;
+
+// Half-open membership in a resolved clip window: `[startFrame, endFrame)`.
+// Trivial, and that is the point — this comparison was hand-written at ten call
+// sites (renderer, export, seek math, the preview's play/pause + loop-wrap
+// reconciliation) and every one of them had to independently get the closed/open
+// ends the right way round. One of them being an off-by-one is a clip that
+// paints a frame past its neighbour, or drops its first.
+export const frameInVideoWindow = (win: VideoWindow, frame: number): boolean =>
+  frame >= win.startFrame && frame < win.endFrame;
+
+// "Is this clip OFF at `frame`" — the visibility gate for a video layer, and the
+// clip-side counterpart to `frameOutsideBlock` below.
+//
+// A clip carries no `block` (no add path writes one), so the block resolvers
+// read every clip as always-present. Its real on-timeline window is the TRIM,
+// and this is the single home for the gate: `drawVideoLayer` culls the painted
+// pixels with it and the canvas hit-test culls the selection rect with it, so
+// the two cannot drift into disagreeing about which frames a clip occupies.
+//
+// `sourceDurationSeconds` is the source's natural (decoded) length — from the
+// loaded HTMLVideoElement in the browser, or a probe headlessly. Pass 0 when it
+// isn't known yet, which enforces the LOWER bound only. That asymmetry is
+// deliberate: clamping a set `source_out_frame` against duration 0 collapses the
+// window to `[start, start)` and culls at EVERY frame, so a clip whose source
+// failed to load would silently vanish instead of painting its black fallback.
+// Callers that genuinely want the collapse (headless export, where a missing
+// duration means a missing source) should use `frameInVideoWindow` directly.
+export const frameOutsideClipWindow = (
+  layer: VideoLayer,
+  frame: number,
+  sourceDurationSeconds: number,
+): boolean =>
+  sourceDurationSeconds > 0
+    ? !frameInVideoWindow(videoWindow(layer, sourceDurationSeconds), frame)
+    : frame < Math.max(0, layer.timeline_start_frame);
 
 // Normalise a video layer's speed-ramp keyframes for evaluation: deduped on
 // `frame`, sorted, clamped to the legal rate range [0.1, 8]. Returns an
@@ -524,6 +626,138 @@ export const resolveSpeedKeyframes = (
   return list;
 };
 
+// Legal bounds for a playback rate, shared by the scalar `speed`, the ramp
+// keyframes, and every clamp below. A rate of 0 would consume no source at all
+// (an infinitely long clip), so the floor is deliberately > 0.
+export const MIN_SPEED = 0.1;
+export const MAX_SPEED = 8;
+export const clampSpeed = (v: number | undefined | null): number =>
+  !Number.isFinite(v ?? 1)
+    ? 1
+    : Math.max(MIN_SPEED, Math.min(MAX_SPEED, v ?? 1));
+
+// The layer's CONSTANT speed multiplier (the "play slower / faster" control).
+export const layerSpeed = (layer: VideoLayer): number => clampSpeed(layer.speed);
+
+// True when the layer plays at anything other than 1:1 — a non-unit constant
+// speed, a ramp, or both. Call sites that used to gate remapping on
+// `speed_keyframes.length > 0` MUST use this instead, or a constant-speed clip
+// silently falls back to the 1:1 path.
+export const isRetimed = (layer: VideoLayer): boolean =>
+  layerSpeed(layer) !== 1 || resolveSpeedKeyframes(layer).length > 0;
+
+// The EFFECTIVE playback rate at an absolute project-timeline frame: the
+// constant `speed` multiplied by the ramp curve (which is 1 everywhere when the
+// layer has no speed keyframes). Ramp keyframe `frame` values are CLIP-RELATIVE
+// offsets, so this converts the incoming project frame before evaluating.
+export const layerRateAtFrame = (
+  layer: VideoLayer,
+  timelineFrame: number,
+): number =>
+  rateAtOffsetWithRamp(
+    layer,
+    resolveSpeedKeyframes(layer),
+    timelineFrame - Math.max(0, layer.timeline_start_frame),
+  );
+
+// The same evaluation with the ramp ALREADY resolved. `resolveSpeedKeyframes`
+// allocates a Map, an array and a sort, so calling `layerRateAtFrame` inside a
+// per-frame integration loop is quadratic in the window length — which is
+// exactly where the two integrators below spend their time. They hoist the
+// ramp once and call this.
+const rateAtOffsetWithRamp = (
+  layer: VideoLayer,
+  ramp: Array<{ frame: number; rate: number }>,
+  offset: number,
+): number =>
+  clampSpeed(layerSpeed(layer) * rateAtClipOffset(ramp, offset));
+
+// The smallest effective rate the layer can reach, used to bound the window
+// integrator's loop. Hold-extrapolation means the curve never leaves the
+// [min, max] of its keyframes, so this is exact rather than conservative.
+const minEffectiveRate = (layer: VideoLayer): number => {
+  const ramp = resolveSpeedKeyframes(layer);
+  const speed = layerSpeed(layer);
+  if (ramp.length === 0) return speed;
+  let min = Infinity;
+  for (const kf of ramp) min = Math.min(min, kf.rate);
+  return Math.max(MIN_SPEED * MIN_SPEED, speed * min);
+};
+
+// `videoWindow` runs per-layer per-frame in the render/preview loops, and the
+// ramped branch of `retimedWindowFrames` integrates a curve. Memoize on the
+// layer OBJECT: store mutations `structuredClone` the project, so a new object
+// identity is exactly the invalidation signal we want — no manual busting.
+const retimedWindowCache = new WeakMap<VideoLayer, Map<number, number>>();
+
+// How many PROJECT frames it takes to play `sourceSpanFrames` of source at this
+// layer's rate curve — the retimed on-timeline length of the clip.
+//
+// Constant rate is the closed form `span / speed`. A ramp is integrated with
+// the SAME trapezoid `buildSourceFrameTable` uses, stepping until the
+// accumulated source advance covers the span; sharing the integrator is what
+// keeps the window's last frame and the table's last entry on the same source
+// frame (a mismatch shows up as a frozen or clipped tail).
+export const retimedWindowFrames = (
+  layer: VideoLayer,
+  sourceSpanFrames: number,
+): number => {
+  // A non-empty span always occupies at least one frame — a clip you can't see
+  // is not a clip. That floor is a WINDOW rule and must not leak into the
+  // offset inverse, which is why `timelineOffsetForSourceFrame` has its own
+  // un-floored form (a floored offset made short captions on a fast clip
+  // collapse to zero length).
+  const raw = retimedOffsetFrames(layer, sourceSpanFrames);
+  return sourceSpanFrames > 0 ? Math.max(1, raw) : 0;
+};
+
+// The un-floored core of `retimedWindowFrames`: how many project frames it
+// takes to consume `sourceSpanFrames` of source, rounded but NOT floored to 1.
+// Callers wanting a clip LENGTH want the floored `retimedWindowFrames`;
+// callers converting a source position to a timeline offset want this.
+const retimedOffsetFrames = (
+  layer: VideoLayer,
+  sourceSpanFrames: number,
+): number => {
+  if (!(sourceSpanFrames > 0)) return 0;
+  const ramp = resolveSpeedKeyframes(layer);
+  const speed = layerSpeed(layer);
+  if (ramp.length === 0) {
+    return Math.round(sourceSpanFrames / speed);
+  }
+  const cached = retimedWindowCache.get(layer)?.get(sourceSpanFrames);
+  if (cached !== undefined) return cached;
+  // Integrated over CLIP-RELATIVE offsets, so `timeline_start_frame` does not
+  // appear: a clip's length cannot depend on where it sits. Absolute keyframe
+  // frames made sliding a ramped clip slide the curve underneath it and change
+  // its duration (+33% over a 60-frame move), and every clip-mover would have
+  // had to remember to remap. Clip-relative makes that unrepresentable.
+  // Terminates: each step adds at least `minEffectiveRate` to `acc`.
+  const bound = Math.ceil(sourceSpanFrames / minEffectiveRate(layer)) + 2;
+  let acc = 0;
+  let out = bound;
+  for (let i = 1; i <= bound; i++) {
+    const ra = rateAtOffsetWithRamp(layer, ramp, i - 1);
+    const rb = rateAtOffsetWithRamp(layer, ramp, i);
+    const step = (ra + rb) / 2;
+    if (acc + step >= sourceSpanFrames) {
+      // Land on the fractional frame where the span is exactly consumed, then
+      // round so the window is a whole number of frames.
+      const frac = step > 0 ? (sourceSpanFrames - acc) / step : 0;
+      out = Math.max(1, Math.round(i - 1 + frac));
+      break;
+    }
+    acc += step;
+  }
+  let bySpan = retimedWindowCache.get(layer);
+  if (!bySpan) {
+    bySpan = new Map();
+    retimedWindowCache.set(layer, bySpan);
+  }
+  bySpan.set(sourceSpanFrames, out);
+  return out;
+};
+
 // Build a frame-indexed table `srcFrame[i]` of the source-frame the playback
 // should be at when the project timeline is at `timeline_start_frame + i`.
 // Implements the standard trapezoidal integration of the rate curve, with
@@ -535,68 +769,136 @@ export const resolveSpeedKeyframes = (
 // project-frames) so the renderer can hit any frame inside the window via a
 // single table lookup. Callers that need a value past the table's tail
 // re-apply the constant boundary rate themselves (`sourceFrameFor`).
+// `sourceSecondsForLayer` rebuilds a table on EVERY call — once per composition
+// frame per layer during export and once per scrub tick in preview — so a
+// ramped clip would re-integrate its whole window thousands of times. Memoized
+// on the layer OBJECT for the same reason as `retimedWindowCache`: store
+// mutations `structuredClone`, so a new identity is the invalidation signal.
+const sourceFrameTableCache = new WeakMap<VideoLayer, Map<number, number[]>>();
+
 export const buildSourceFrameTable = (
   layer: VideoLayer,
   maxLength: number,
 ): number[] => {
+  const hit = sourceFrameTableCache.get(layer)?.get(maxLength);
+  if (hit) return hit;
+  const built = computeSourceFrameTable(layer, maxLength);
+  let byLen = sourceFrameTableCache.get(layer);
+  if (!byLen) {
+    byLen = new Map();
+    sourceFrameTableCache.set(layer, byLen);
+  }
+  byLen.set(maxLength, built);
+  return built;
+};
+
+const computeSourceFrameTable = (
+  layer: VideoLayer,
+  maxLength: number,
+): number[] => {
   const ramp = resolveSpeedKeyframes(layer);
+  const speed = layerSpeed(layer);
   const out: number[] = [];
   if (maxLength <= 0) return out;
   const sourceIn = layer.source_in_frame ?? 0;
   if (ramp.length === 0) {
-    // Constant rate 1: source advances 1:1 with the timeline.
-    for (let i = 0; i < maxLength; i++) out.push(sourceIn + i);
+    // No ramp: the effective rate is the constant `speed` everywhere, so the
+    // source advances by `speed` per project frame (1:1 at speed 1).
+    for (let i = 0; i < maxLength; i++) out.push(sourceIn + i * speed);
     return out;
   }
-  const tStart = layer.timeline_start_frame ?? 0;
   let acc = 0;
   for (let i = 0; i < maxLength; i++) {
     if (i === 0) {
       out.push(sourceIn);
       continue;
     }
-    // Trapezoid: average of rate at timeline-frame (tStart + i - 1) and
-    // (tStart + i), each evaluated by linear interpolation of the rate
-    // curve with `hold` outside the first/last keyframe.
-    const ra = rateAtTimelineFrame(ramp, tStart + i - 1);
-    const rb = rateAtTimelineFrame(ramp, tStart + i);
+    // Trapezoid: average of the EFFECTIVE rate (speed × ramp) at CLIP OFFSETS
+    // (i - 1) and i, each evaluated by linear interpolation of the rate curve
+    // with `hold` outside the first/last keyframe. Offsets, not absolute
+    // frames — see the note in retimedOffsetFrames.
+    const ra = rateAtOffsetWithRamp(layer, ramp, i - 1);
+    const rb = rateAtOffsetWithRamp(layer, ramp, i);
     acc += (ra + rb) / 2;
     out.push(sourceIn + acc);
   }
   return out;
 };
 
-// Linear-interp the rate curve at a given timeline frame, with `hold`
-// outside the first/last keyframe. Used by `buildSourceFrameTable`'s
-// trapezoidal integrator and by `sourceFrameFor`'s extrapolation tail.
-const rateAtTimelineFrame = (
+// Linear-interp the rate curve at a CLIP-RELATIVE offset (0 = the clip's first
+// frame), with `hold` outside the first/last keyframe. Used by
+// `buildSourceFrameTable`'s trapezoidal integrator and by `sourceFrameFor`'s
+// extrapolation tail.
+const rateAtClipOffset = (
   ramp: Array<{ frame: number; rate: number }>,
-  timelineFrame: number,
+  offset: number,
 ): number => {
   if (ramp.length === 0) return 1;
-  if (timelineFrame <= ramp[0].frame) return ramp[0].rate;
-  if (timelineFrame >= ramp[ramp.length - 1].frame) {
+  if (offset <= ramp[0].frame) return ramp[0].rate;
+  if (offset >= ramp[ramp.length - 1].frame) {
     return ramp[ramp.length - 1].rate;
   }
   for (let i = 1; i < ramp.length; i++) {
     const a = ramp[i - 1];
     const b = ramp[i];
-    if (timelineFrame <= b.frame) {
+    if (offset <= b.frame) {
       const span = b.frame - a.frame;
       if (span <= 0) return b.rate;
-      const t = (timelineFrame - a.frame) / span;
+      const t = (offset - a.frame) / span;
       return a.rate + (b.rate - a.rate) * t;
     }
   }
   return ramp[ramp.length - 1].rate;
 };
 
+// Rebase a rate curve onto a NEW ORIGIN, preserving the rate the curve actually
+// had there. This is the one correct way to re-anchor a ramp — used when a
+// split hands the right half its own start, and when the v5→v6 migration moves
+// absolute frames onto the clip's start.
+//
+// The naive version (filter to keyframes at/after the origin, subtract) is
+// WRONG in two ways, both silent:
+//   • every keyframe before the origin ⇒ an EMPTY ramp, and an empty ramp is
+//     rate 1, not the held tail. A clip ramped into slow motion, split after
+//     the ramp, lost its slow motion entirely and its length collapsed.
+//   • a keyframe straddling the origin ⇒ the first survivor's rate holds
+//     BACKWARDS to the origin, so the curve starts at the wrong rate and the
+//     seam jumps.
+// Seeding offset 0 with the interpolated rate at the origin fixes both, and is
+// exactly behaviour-preserving: the curve is unchanged, only its coordinates.
+export const rebaseRamp = (
+  ramp: ReadonlyArray<{ frame: number; rate: number }>,
+  originFrame: number,
+): Array<{ frame: number; rate: number }> => {
+  if (ramp.length === 0) return [];
+  // SORT before sampling. `rateAtClipOffset` indexes ramp[0] / ramp[last] and
+  // so requires sorted input — every other consumer gets that from
+  // `resolveSpeedKeyframes`, and this is the one sampler that doesn't. The
+  // schema puts no ordering constraint on the stored array, so an externally
+  // written project can arrive unsorted; sampling it raw reintroduces exactly
+  // the seam-jump this function exists to prevent.
+  const sorted = [...ramp].sort((a, b) => a.frame - b.frame);
+  const after = sorted
+    .filter((kf) => kf.frame > originFrame)
+    .map((kf) => ({ frame: Math.round(kf.frame - originFrame), rate: kf.rate }));
+  // When the origin is at or before the curve's start the leading rate already
+  // holds backwards, so a seed would only add a keyframe the user never wrote.
+  if (originFrame <= sorted[0].frame) {
+    return [
+      { frame: Math.max(0, Math.round(sorted[0].frame - originFrame)), rate: sorted[0].rate },
+      ...after.filter((kf) => kf.frame > Math.round(sorted[0].frame - originFrame)),
+    ];
+  }
+  // A keyframe landing exactly ON the origin is represented by the seed.
+  return [{ frame: 0, rate: rateAtClipOffset(sorted, originFrame) }, ...after];
+};
+
 // Map a project-timeline frame to the source-frame for a given video layer,
-// honouring `speed_keyframes` when present. `table` is the cached output of
-// `buildSourceFrameTable(layer, …)`; supply null to fall back to the legacy
-// 1:1 mapping (used when the layer has no speed keyframes, or the caller
-// hasn't built a table). Returns a float source-frame; callers convert to
-// seconds via `/ FPS` (or to an integer via Math.floor / round).
+// honouring the layer's rate curve (constant `speed` and/or `speed_keyframes`).
+// `table` is the cached output of `buildSourceFrameTable(layer, …)`; supply
+// null to fall back to the closed-form constant-rate mapping (correct whenever
+// the layer has no ramp, including at speed ≠ 1). Returns a float source-frame;
+// callers convert to seconds via `/ FPS` (or to an integer via Math.floor).
 export const sourceFrameFor = (
   layer: VideoLayer,
   timelineFrame: number,
@@ -606,30 +908,65 @@ export const sourceFrameFor = (
   const idx = timelineFrame - tStart;
   if (idx < 0) return layer.source_in_frame ?? 0;
   if (!table || table.length === 0) {
-    return (layer.source_in_frame ?? 0) + idx;
+    return (layer.source_in_frame ?? 0) + idx * layerSpeed(layer);
   }
   if (idx < table.length) return table[idx];
-  // Past the table — constant-rate extrapolate from the last entry.
-  const ramp = resolveSpeedKeyframes(layer);
-  const tailRate = ramp.length > 0 ? ramp[ramp.length - 1].rate : 1;
+  // Past the table — extrapolate at the curve's (held) tail rate.
   const last = table[table.length - 1];
+  const tailRate = layerRateAtFrame(layer, tStart + table.length - 1);
   return last + (idx - (table.length - 1)) * tailRate;
+};
+
+// Inverse of `sourceFrameFor`: how many PROJECT frames into the clip a given
+// SOURCE frame plays. Consuming `n` source frames takes exactly as long as a
+// clip whose trimmed span is `n` — so this shares `retimedWindowFrames`'
+// integrator, which keeps the inverse consistent with the window by
+// construction (a separately derived inverse would drift on ramps and misplace
+// captions). Un-floored, unlike the window: an offset of 0 is meaningful.
+export const timelineOffsetForSourceFrame = (
+  layer: VideoLayer,
+  sourceFrame: number,
+): number => {
+  const advance = sourceFrame - (layer.source_in_frame ?? 0);
+  if (!(advance > 0)) return 0;
+  return retimedOffsetFrames(layer, advance);
+};
+
+// The OTHER direction, and the one every editing operation needs: the SOURCE
+// frame playing `offsetFrames` into the clip's on-timeline window.
+//
+// This is the conversion that must be used whenever a timeline delta (a cut
+// point, a split point, a caption chip's committed position, a trim drag) is
+// written into `source_in_frame` / `source_out_frame`. Doing it 1:1 is only
+// correct at speed 1 — at 2x a one-frame move on the timeline is TWO source
+// frames — and getting it wrong silently corrupts the clip rather than
+// failing, which is why every such site routes through here.
+// `test/source-timeline-mapping-call-sites.test.ts` budgets the exceptions.
+export const sourceFrameAtTimelineOffset = (
+  layer: VideoLayer,
+  offsetFrames: number,
+): number => {
+  const sourceIn = layer.source_in_frame ?? 0;
+  if (!(offsetFrames > 0)) return sourceIn;
+  const ramp = resolveSpeedKeyframes(layer);
+  if (ramp.length === 0) {
+    return Math.round(sourceIn + offsetFrames * layerSpeed(layer));
+  }
+  const table = buildSourceFrameTable(layer, Math.ceil(offsetFrames) + 1);
+  return Math.round(sourceFrameFor(layer, (layer.timeline_start_frame ?? 0) + offsetFrames, table));
 };
 
 // Inverse of `sourceFrameFor` for a moment in the clip's SOURCE timeline given
 // in seconds (e.g. a transcript word's `start`): the PROJECT-timeline frame
-// where that moment plays, honouring the layer's trim (`source_in_frame`) and
-// placement (`timeline_start_frame`). Constant-rate — `speed_keyframes` are
-// intentionally ignored here (transcript navigation targets talking-head clips
-// that don't ramp; ramped-clip captions are a follow-up).
+// where that moment plays, honouring the layer's trim (`source_in_frame`), its
+// placement (`timeline_start_frame`) and its rate curve.
 export const projectFrameForSourceSeconds = (
   layer: VideoLayer,
   seconds: number,
   fps = 30,
 ): number => {
-  const sourceIn = layer.source_in_frame ?? 0;
   const tStart = layer.timeline_start_frame ?? 0;
-  return Math.round(tStart + (seconds * fps - sourceIn));
+  return Math.round(tStart + timelineOffsetForSourceFrame(layer, seconds * fps));
 };
 
 // Whether a SOURCE-seconds moment falls inside the layer's trimmed window — i.e.
@@ -715,6 +1052,46 @@ export const easingSchema = z.enum([
   // / FCP "Hold" interpolation.
   "hold",
 ]);
+
+// ───────────────────────────────────────────────────────────────────────────
+// EDGE TRANSITIONS
+//
+// One end of a layer's on-timeline window: how it enters (`transition_in`) or
+// leaves (`transition_out`). See `perElementDataFields.transition_in` for why
+// this is edge-relative data rather than keyframes, and src/transitions.ts for
+// the evaluation.
+//
+// `frames` is the RAMP LENGTH, and it is a REQUEST, not a guarantee: when the
+// window is shorter than in + out the two are squeezed proportionally at
+// sample time (`resolveEdgeFrames`) and the stored values are left alone — so
+// trimming a layer down and back out restores the transition the user asked
+// for instead of quietly destroying it.
+//
+// `kind: "cut"` (or `frames: 0`) is the hard cut — the historical behavior, and
+// the default for video clips, where a hard cut is the grammar of the format
+// rather than a defect.
+// ───────────────────────────────────────────────────────────────────────────
+export const transitionKindSchema = z.enum(["cut", "fade", "slide", "pop"]);
+export type TransitionKind = z.infer<typeof transitionKindSchema>;
+
+// Where a "slide" travels. On the IN edge this is where the layer comes FROM;
+// on the OUT edge, where it goes TO — so "left" reads the same way in both
+// rows of the Inspector.
+export const transitionDirectionSchema = z.enum(["left", "right", "up", "down"]);
+export type TransitionDirection = z.infer<typeof transitionDirectionSchema>;
+
+export const edgeTransitionSchema = z
+  .object({
+    kind: transitionKindSchema,
+    frames: z.number().int().nonnegative(),
+    // Shaping curve over the ramp. Omitted ⇒ the per-kind default in
+    // src/transitions.ts (DEFAULT_CURVE_IN / DEFAULT_CURVE_OUT).
+    curve: easingSchema.optional(),
+    // "slide" only; ignored by every other kind.
+    direction: transitionDirectionSchema.optional(),
+  })
+  .strict();
+export type EdgeTransition = z.infer<typeof edgeTransitionSchema>;
 
 export const keyframeSchema = z
   .object({
@@ -1253,11 +1630,24 @@ export const isCaptionLineElement = (
 //       canvas_height, active_index, pages[≥1] }`. The old top-level
 //       composition arrays + `mode` + `carousel` are gone — migrateToPages
 //       folds them into `pages`. See migrateToPages below.
-//   4 = current. Video layers carry a `lane_id` (track grouping). Clips that
+//   4 = Video layers carry a `lane_id` (track grouping). Clips that
 //       share a lane_id are one visual track laid end-to-end. migrateAssignLaneIds
 //       backfills every pre-v4 clip lacking one with its own lane (lane_id = id),
 //       so the migration is behaviour-preserving (1 clip = 1 lane). See below.
-export const SCHEMA_VERSION = 4 as const;
+//   5 = Video layers carry `speed` (constant playback rate, default 1).
+//       No data migration is needed — `.default(1)` fills it on parse and 1 is
+//       the previous behaviour exactly — but the bump is NOT optional: the
+//       schema is `.strict()`, so once a v4 project is loaded and saved it
+//       carries the new key, and v4 code would reject it as unknown. Bumping
+//       makes that visible instead of letting the version number lie. As with
+//       v3→v4, this is ROLL-FORWARD-ONLY on prod (see dev-docs/editor-gotchas.md).
+//   6 = current. `speed_keyframes[].frame` is CLIP-RELATIVE (0 = the clip's
+//       first frame) instead of an absolute project frame, so a ramped clip's
+//       derived length no longer depends on where the clip sits.
+//       migrateSpeedKeyframesToClipRelative subtracts `timeline_start_frame`
+//       from each keyframe, which preserves behaviour for every project as it
+//       stands. ROLL-FORWARD-ONLY, like every bump (dev-docs/editor-gotchas.md).
+export const SCHEMA_VERSION = 6 as const;
 
 // Strip deprecated clip_frame fields from raw input before validation. The
 // pre-refactor schema modelled the source video as a built-in singleton
@@ -2180,6 +2570,20 @@ const makePage = (
   return page;
 };
 
+// Stamp the fallback canvas onto a page that carries no dims of its own — a
+// page written before canvas size moved from the project onto the page. A page
+// that already has its own size keeps it.
+const sizePage = (
+  page: Record<string, unknown>,
+  fallbackW: number,
+  fallbackH: number,
+): void => {
+  if (typeof page.canvas_width !== "number" || page.canvas_width <= 0)
+    page.canvas_width = fallbackW;
+  if (typeof page.canvas_height !== "number" || page.canvas_height <= 0)
+    page.canvas_height = fallbackH;
+};
+
 const migrateToPages = (raw: unknown): unknown => {
   if (!raw || typeof raw !== "object") return raw;
   const r = { ...(raw as Record<string, unknown>) };
@@ -2191,11 +2595,18 @@ const migrateToPages = (raw: unknown): unknown => {
       ? r.canvas_height
       : 1920;
 
-  // Already v3 — normalise (drop any lingering legacy keys, ensure active_index).
+  // Already v3 — normalise (drop any lingering legacy keys, ensure
+  // active_index) and push the project canvas down onto any page that predates
+  // per-page sizing.
   if (Array.isArray(r.pages)) {
     for (const f of PAGE_COMP_FIELDS) delete r[f];
     delete r.mode;
     delete r.carousel;
+    for (const pg of r.pages) {
+      if (pg && typeof pg === "object") sizePage(pg as Record<string, unknown>, canvasW, canvasH);
+    }
+    delete r.canvas_width;
+    delete r.canvas_height;
     if (typeof r.active_index !== "number" || r.active_index < 0)
       r.active_index = 0;
     r.schema_version = SCHEMA_VERSION;
@@ -2238,19 +2649,23 @@ const migrateToPages = (raw: unknown): unknown => {
     activeIndex = 0;
   }
 
-  // Fit any page whose backdrop diverges from the project canvas.
+  // Fit any page whose backdrop diverges from the project canvas, then give
+  // every page that project canvas as its own. Pre-pages projects had exactly
+  // one shared size, so folding it onto each page is appearance-preserving —
+  // the pages only diverge once a user resizes one.
   for (const pg of pages) {
     const implied = impliedCanvasOf(pg);
     if (implied && (implied.w !== canvasW || implied.h !== canvasH)) {
       reflowCompositionLayers(pg, implied.w, implied.h, canvasW, canvasH);
     }
+    sizePage(pg, canvasW, canvasH);
   }
 
   for (const f of PAGE_COMP_FIELDS) delete r[f];
   delete r.mode;
   delete r.carousel;
-  r.canvas_width = canvasW;
-  r.canvas_height = canvasH;
+  delete r.canvas_width;
+  delete r.canvas_height;
   r.pages = pages;
   r.active_index = activeIndex;
   r.schema_version = SCHEMA_VERSION;
@@ -2279,6 +2694,62 @@ const migrateAssignLaneIds = (raw: unknown): unknown => {
       if (typeof layer.id === "string" && layer.id.length > 0) {
         layer.lane_id = layer.id;
       }
+    }
+  }
+  return r;
+};
+
+// v5→v6: rebase speed-ramp keyframes from ABSOLUTE project frames onto
+// CLIP-RELATIVE offsets. v5 stored them absolute, which made a ramped clip's
+// derived length depend on where it sat (see the field comment). Subtracting
+// `timeline_start_frame` preserves each keyframe's meaning exactly for a clip
+// at its current position, so the migration is behaviour-preserving for every
+// project as it stands; only a LATER move behaves differently (correctly).
+//
+// Idempotent by construction? No — subtracting twice would be wrong, so it is
+// gated on the record's stored `schema_version`. Runs on the FINAL pages shape.
+const migrateSpeedKeyframesToClipRelative = (
+  raw: unknown,
+  fromVersion: number,
+): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  // Gated on the version of the RECORD AS IT ARRIVED, captured before the
+  // chain runs — `migrateToPages` stamps `schema_version` to current on its way
+  // through, so reading the field here would always say "already v6" and the
+  // rebase would silently never happen.
+  if (fromVersion >= 6) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    if (!Array.isArray(page.video_layers)) continue;
+    for (const layerRaw of page.video_layers) {
+      if (!layerRaw || typeof layerRaw !== "object") continue;
+      const layer = layerRaw as Record<string, unknown>;
+      if (!Array.isArray(layer.speed_keyframes)) continue;
+      const tStart =
+        typeof layer.timeline_start_frame === "number"
+          ? Math.max(0, layer.timeline_start_frame)
+          : 0;
+      if (tStart === 0) continue; // already equivalent
+      // REBASE, don't clamp. Subtracting and clamping at 0 collapses every
+      // pre-start keyframe onto offset 0, so a curve that STRADDLES the clip's
+      // start (reachable: v5's add_speed_keyframe took any project frame, and
+      // moving a ramped clip right left its keyframes behind) began at the
+      // wrong rate — measured a 39% duration change on first load. `rebaseRamp`
+      // seeds offset 0 with the rate the curve actually had at the clip's
+      // start, which IS behaviour-preserving.
+      const parsed = layer.speed_keyframes
+        .filter((k): k is { frame: number; rate: number } =>
+          !!k && typeof k === "object" &&
+          typeof (k as { frame?: unknown }).frame === "number" &&
+          typeof (k as { rate?: unknown }).rate === "number",
+        )
+        .map((k) => ({ frame: k.frame, rate: k.rate }))
+        .sort((x, y) => x.frame - y.frame);
+      if (parsed.length === 0) continue;
+      layer.speed_keyframes = rebaseRamp(parsed, tStart);
     }
   }
   return r;
@@ -2588,7 +3059,71 @@ const migrateDissolveEmptyCaptionsGroups = (raw: unknown): unknown => {
   return r;
 };
 
+// Prune DANGLING child references on load — ids in a group's `children` that
+// name a layer no longer in the project.
+//
+// A group's `children` is a list of ids, so it is a foreign key with nothing
+// enforcing it. Any code path that removes a layer record has to also strip it
+// from every group's `children`, and `replaceBand` didn't: re-pinning an
+// embedded band to a newer version stripped the old band group and minted a new
+// id, leaving the parent group pointing at an id that no longer resolved.
+//
+// The damage is worse than a cosmetic stale entry, because "this child cannot be
+// resolved" is indistinguishable from "this child spans the whole composition"
+// unless callers are careful (see deriveGroupWindow). A group whose only child
+// was dangling read as always-present, which is why it lost its timeline
+// handles. Prune the references so the group is honestly empty instead of
+// mysteriously unbounded.
+//
+// Runs on the FINAL pages shape, and is idempotent: a healed project has no
+// unresolvable id left to match. Deliberately prunes the REFERENCE only — it
+// never deletes a group, because an emptied group may still carry the
+// animation the user authored on it.
+const migratePruneDanglingChildren = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.pages)) return r;
+  for (const pageRaw of r.pages) {
+    if (!pageRaw || typeof pageRaw !== "object") continue;
+    const page = pageRaw as Record<string, unknown>;
+    if (!Array.isArray(page.groups)) continue;
+    // Every element id the page actually contains.
+    const present = new Set<string>();
+    for (const [kind, key] of [
+      ["image", "image_layers"],
+      ["video", "video_layers"],
+      ["text", "text_layers"],
+      ["shapes", "shapes"],
+      ["group", "groups"],
+    ] as const) {
+      const arr = page[key];
+      if (!Array.isArray(arr)) continue;
+      for (const l of arr) {
+        if (l && typeof l === "object") {
+          const id = (l as Record<string, unknown>).id;
+          if (typeof id === "string") present.add(`${kind}.${id}`);
+        }
+      }
+    }
+    for (const gRaw of page.groups) {
+      if (!gRaw || typeof gRaw !== "object") continue;
+      const g = gRaw as Record<string, unknown>;
+      if (!Array.isArray(g.children)) continue;
+      g.children = g.children.filter(
+        (id) => typeof id === "string" && present.has(id),
+      );
+    }
+  }
+  return r;
+};
+
 const preprocessProject = (raw: unknown): unknown => {
+  // The incoming record's version, read BEFORE any migration rewrites it.
+  const incomingVersion =
+    raw && typeof raw === "object" && !Array.isArray(raw) &&
+    typeof (raw as Record<string, unknown>).schema_version === "number"
+      ? ((raw as Record<string, unknown>).schema_version as number)
+      : 0;
   const base = migrateFlattenPerElementMaps(
     migrateImageTextLayers(
       migrateBackgroundToImageLayer(
@@ -2612,15 +3147,23 @@ const preprocessProject = (raw: unknown): unknown => {
   // final pages shape so it reaches each page's own leaf layers.
   // migrateDissolveEmptyCaptionsGroups sits just outside migrateWeldCaptions:
   // welding never re-populates an empty wrapper, so dissolving after it is safe.
-  return migrateDeriveLegacyBlocks(
-    migrateDissolveEmptyCaptionsGroups(
-      migrateWeldCaptions(
-        migrateWeldClipAudio(
-          migrateAssignLaneIds(
-            migrateToPages(
-              migrateGroupConstantTracksToBase(
-                migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+  // migratePruneDanglingChildren runs OUTSIDE the caption heals: dissolving an
+  // empty captions group removes a group record, so pruning must come after it
+  // to catch the references that removal leaves behind.
+  return migratePruneDanglingChildren(
+    migrateDeriveLegacyBlocks(
+      migrateDissolveEmptyCaptionsGroups(
+        migrateWeldCaptions(
+          migrateWeldClipAudio(
+            migrateSpeedKeyframesToClipRelative(
+            migrateAssignLaneIds(
+              migrateToPages(
+                migrateGroupConstantTracksToBase(
+                  migrateSharedGroupsToCollection(migrateLayersToBlocks(base)),
+                ),
               ),
+            ),
+            incomingVersion,
             ),
           ),
         ),
@@ -2720,13 +3263,20 @@ export type Marker = z.infer<typeof markerSchema>;
 // top-level project does (video_layers / audio_overlays / duration / start_at /
 // loop region / markers) so a video page's timeline works identically; the
 // still-only pages saved before this widening still parse because every new
-// field defaults. Canvas dims come from the parent project's own
-// `canvas_width`/`canvas_height` (changeable like any video), and uploaded
-// assets resolve against the parent carousel's project id (one asset bucket).
+// field defaults. Canvas dims are the PAGE's own — a project can hold a
+// 1080×1920 story next to a 1920×1080 cut of the same idea — while uploaded
+// assets resolve against the parent project id (one asset bucket).
 export const pageCompositionSchema = z
   .object({
     id: z.string().min(1),
     name: z.string().optional(),
+    // This page's canvas dimensions in pixels. Drives the renderer, export,
+    // and embed render size for THIS page only; resizing one page never
+    // touches its siblings. Defaults to 1080×1920 (vertical 9:16). Projects
+    // saved before per-page sizing carried these at the top level —
+    // migrateToPages pushes them down onto every page.
+    canvas_width: z.number().int().positive().default(1080),
+    canvas_height: z.number().int().positive().default(1920),
     image_layers: z.array(imageLayerSchema).default([]),
     video_layers: z.array(videoLayerSchema).default([]),
     text_layers: z.array(textLayerSchema).default([]),
@@ -2781,10 +3331,10 @@ export const projectSchema = z.preprocess(
       // compositions (≥1); a single-page project is a plain "video", a
       // multi-page one is what used to be a "carousel". Each page (see
       // pageCompositionSchema) is a complete composition — its own layers,
-      // timeline, and duration — that can be a still OR a video. All pages share
-      // the project's `canvas_width`/`canvas_height`. There is no `mode` and no
-      // separate top-level composition: the editor always edits
-      // `pages[active_index]`, and every render/export path targets a page.
+      // timeline, duration, AND canvas dimensions — that can be a still OR a
+      // video. There is no `mode` and no separate top-level composition: the
+      // editor always edits `pages[active_index]`, and every render/export
+      // path targets a page.
       pages: z.array(pageCompositionSchema).min(1),
       // Index of the page currently open in the editor. Persisted so reopening a
       // project lands on the same page; clamped into range on load.
@@ -2798,11 +3348,12 @@ export const projectSchema = z.preprocess(
       // collected; ids whose layer was later deleted are simply skipped when the
       // collection is read. Default [] so existing projects parse unchanged.
       collection: z.array(z.string()).default([]),
-      // NOTE: composition timeline fields — duration_seconds, duration_authored,
-      // start_at, audio_overlays, markers, loop, loop_start_frame,
-      // loop_end_frame — live on each PAGE now (see pageCompositionSchema), not
-      // on the project. The project only carries what's shared across pages
-      // (canvas dims, fonts) plus per-project metadata.
+      // NOTE: composition fields — canvas_width, canvas_height,
+      // duration_seconds, duration_authored, start_at, audio_overlays,
+      // markers, loop, loop_start_frame, loop_end_frame — live on each PAGE
+      // (see pageCompositionSchema), not on the project. The project only
+      // carries what's genuinely shared across pages (fonts, collection,
+      // embed) plus per-project metadata.
       //
       // The version this project state is checkpointed against. null when
       // no version exists yet (brand-new project or pre-versions JSON).
@@ -2838,12 +3389,6 @@ export const projectSchema = z.preprocess(
       // customFontSchema. Text layers reference them by family name via
       // font_family. Default [] so older projects parse cleanly.
       custom_fonts: z.array(customFontSchema).default([]),
-      // Composition canvas dimensions in pixels. Drives renderer, export, and
-      // embed render size. Defaults to 1080×1920 (vertical 9:16) so existing
-      // R2 projects parse unchanged. Picker in PlayerPanel exposes three
-      // platform presets + a Pro-gated Custom row.
-      canvas_width: z.number().int().positive().default(1080),
-      canvas_height: z.number().int().positive().default(1920),
     })
     .strict(),
 );
@@ -3411,16 +3956,38 @@ export const layerOf = (
 //
 // Every layer optionally carries a `block` ({start, duration}); absent means
 // "always present" (a block spanning the whole comp, keyframes sampled at
-// absolute frames). These four resolvers are the SINGLE source of truth for the
+// absolute frames). These five resolvers are the SINGLE source of truth for the
 // block model — the renderer, DOM sync, content-duration, and tools all route
 // through them so canvas and DOM stay frame-for-frame identical. Never re-derive
 // the offset/gate inline.
+//
+// TWO VISIBILITY GATES, AND WHICH ONE YOU WANT.
+//   `frameOutsideBlock`     — the DEFAULT. Culls when the element's own window
+//                             OR any ANCESTOR group's excludes the frame. Any
+//                             code asking about ONE element in isolation wants
+//                             this: hit-testing, selection, a per-leaf probe.
+//   `frameOutsideOwnBlock`  — own window ONLY. Correct exclusively for a
+//                             TOP-DOWN walk that has already culled the
+//                             ancestors on its way in (drawNode's recursion,
+//                             the DOM sync's nested wrappers). Its call sites
+//                             are pinned by test/block-gate-call-sites.test.ts.
+// The plain name is the safe one on purpose: guessing gets you the correct
+// answer, and the fast path has to be asked for. Note `hidden` and `locked`
+// inherit down the same way (isElementHidden / isElementLocked in
+// CanvasOverlay) — a block window is not special.
+//
+// A VIDEO LAYER IS THE EXCEPTION, and neither gate above covers it. No add path
+// writes a `block` onto a clip, so both read it as always-present; its window is
+// the TRIM. `frameOutsideClipWindow` (above, beside `videoWindow`) is that
+// third gate, and any code asking "is this element painted at frame f" about a
+// clip needs it as well as the block gate — the renderer and the canvas
+// hit-test both call it.
 // ───────────────────────────────────────────────────────────────────────────
 
 // Sentinel duration for an absent (always-present) block: unbounded, so the
 // visibility gate never culls and sampling is at absolute frames. Never
 // serialized — a stored block always has a finite positive duration.
-const ALWAYS_PRESENT_DURATION = Number.POSITIVE_INFINITY;
+export const ALWAYS_PRESENT_DURATION = Number.POSITIVE_INFINITY;
 
 // A caption line's source anchor (perElementDataFields.caption_source): the clip
 // it follows plus its window in that clip's OWN (source) timeline.
@@ -3461,7 +4028,15 @@ export const deriveCaptionWindow = (
   const visStart = clampWin(cs.source_start_frame);
   const visEnd = clampWin(cs.source_end_frame);
   const tStart = Math.max(0, clip.timeline_start_frame);
-  return { start: tStart + (visStart - inFrame), duration: Math.max(0, visEnd - visStart) };
+  // Map both ends through the clip's rate curve, so a retimed clip stretches
+  // (or compresses) its captions with it instead of leaving them behind at
+  // 1:1 offsets. At speed 1 with no ramp this is the identity it always was.
+  const startOffset = timelineOffsetForSourceFrame(clip, visStart);
+  const endOffset = timelineOffsetForSourceFrame(clip, visEnd);
+  return {
+    start: tStart + startOffset,
+    duration: Math.max(0, endOffset - startOffset),
+  };
 };
 
 // The layer's on-timeline window in its PARENT's timeline, defaulting to the
@@ -3488,6 +4063,336 @@ export const blockOf = (
   if (!block) return { start: 0, duration: ALWAYS_PRESENT_DURATION };
   return { start: block.start, duration: block.duration };
 };
+
+// The layer's on-timeline window for EDGE PURPOSES — the one place that knows
+// a project has two different sources of "when does this layer exist".
+//
+// `blockOf` answers for everything that stores a block, and derives it live for
+// a welded caption. But a VIDEO layer carries no block at all: its window comes
+// from the trim (timeline_start + source_in/source_out), which is why
+// `blockOf` on a video row would fabricate an Infinity duration. Anything
+// reasoning about a layer's EDGES — where it starts, where it ends — has to ask
+// here, or it silently handles every layer class except the one the user is
+// most likely to be trimming.
+//
+// Deliberately PURE, so it works in the worker / SDK with no decoded media:
+// when `source_out_frame` is null (clip runs to its natural end, a length that
+// lives in the bytes and not in the JSON) the window is taken to the
+// composition end. That matches the fallback `clipBarWindow` already draws the
+// bar with, so the Timeline and the renderer agree about where the edge is.
+//
+// KEEP IN STEP WITH `clipBarWindow` (editor/src/clip-snap.ts). This is NOT a
+// rival source of truth: it is the same question asked where no media has been
+// decoded, so it can only implement clipBarWindow's no-duration branch. The one
+// place they can diverge is a clip with `source_out_frame: null` whose real
+// footage is SHORTER than the composition — the bar and this both run the
+// window to the comp end, so an out-transition anchors there rather than at the
+// last decoded frame. Set an explicit `source_out_frame` (every trim does) and
+// they agree exactly. If you change either fallback, change both.
+//
+// An unbounded result (ALWAYS_PRESENT_DURATION) means "no edges" — the caller
+// must treat edge behaviour as inert rather than pinning it to frame 0.
+export const effectiveWindowOf = (
+  project: Composition,
+  elementId: string,
+): { start: number; duration: number } => {
+  if (!elementId.startsWith("video.")) return blockOf(project, elementId);
+  const id = elementId.slice("video.".length);
+  const layer = project.video_layers.find((v) => v.id === id);
+  if (!layer) return { start: 0, duration: 0 };
+  const start = Math.max(0, layer.timeline_start_frame);
+  if (layer.source_out_frame === null) {
+    // Same 30 fps the rest of the project timeline runs at (see videoWindow).
+    const compFrames = Math.round((project.duration_seconds ?? 0) * 30);
+    return { start, duration: Math.max(0, compFrames - start) };
+  }
+  const inFrame = Math.max(0, layer.source_in_frame);
+  // Retimed exactly as `videoWindow`/`clipBarWindow` do — a fade handle placed
+  // from this window must land where the (retimed) clip bar actually reaches.
+  return {
+    start,
+    duration: retimedWindowFrames(
+      layer,
+      Math.max(0, layer.source_out_frame - inFrame),
+    ),
+  };
+};
+
+// The window a GROUP occupies on its parent timeline, DERIVED as the hull of
+// its children's windows.
+//
+// A group is a CONTAINER, not a clip: it holds no media and has no intrinsic
+// extent, so "no stored block" must not read as "always present" — it means
+// "for as long as whatever is inside it". Deriving the hull, rather than
+// stamping a block when the group is created or migrating one onto existing
+// groups, keeps that honest two ways: it can never go stale as children are
+// added, moved or trimmed, and it writes nothing, so the standing rule that a
+// layer's absent block is never retroactively bound still holds.
+//
+// SCOPE — this feeds the TIMELINE BAR (and the group drag that rides on it).
+// It is deliberately NOT wired into `blockOf`, and so not into
+// `effectiveFrameOffset` (which would rebase the group's OWN keyframes by the
+// hull start — a silent retime of every animated group in every project) nor
+// `frameOutsideBlock` (children already gate themselves; a derived gate could
+// only ever cull something it shouldn't). A group's RENDER semantics are
+// unchanged by this function — it is a description of where the contents sit,
+// not a new authority over them.
+//
+// Returns null when the hull is genuinely unbounded — an empty group, or one
+// holding an always-present (blockless) descendant — so the caller falls back
+// to the full-lane blockless bar and keeps telling the truth.
+// How a group's contents are measured. `videoNaturalSeconds` is the same
+// injected lookup `computeContentDurationFrames` and `weldedAudioTiming` take:
+// a CLIP's end is only knowable from the decoded source when it plays to its
+// natural end, so the caller that has those lengths (the editor store's
+// `videoDurations`) hands them in, and a headless caller simply doesn't. Passing
+// it is what turns an "open" hull into a measured one — never guess an extent.
+export interface GroupWindowOptions {
+  videoNaturalSeconds?: (layer: VideoLayer) => number | undefined;
+}
+
+// What one walk of a group's contents establishes. Two questions with two
+// different answers, deliberately resolved together so they can never drift:
+//   `start`  — WHERE the contents begin. Null only when nothing inside carries
+//              a position (an empty group, or an always-present descendant).
+//   `window` — how far they run as well. Null whenever any part of the extent
+//              is unknown, which is strictly more often than `start` is null.
+type GroupExtent = {
+  start: number | null;
+  window: { start: number; duration: number } | null;
+};
+const UNPLACED: GroupExtent = { start: null, window: null };
+
+// The memo is per (project, options) — two callers measuring the same project
+// with different clip lengths must not read each other's answers. Callers that
+// re-render (the Timeline) should hold their options object stable.
+const NO_GROUP_WINDOW_OPTIONS: GroupWindowOptions = {};
+const groupExtentCache = new WeakMap<
+  Composition,
+  WeakMap<GroupWindowOptions, Map<string, GroupExtent>>
+>();
+
+const groupExtent = (
+  project: Composition,
+  elementId: string,
+  opts: GroupWindowOptions,
+): GroupExtent => {
+  let byOpts = groupExtentCache.get(project);
+  if (!byOpts) {
+    byOpts = new WeakMap();
+    groupExtentCache.set(project, byOpts);
+  }
+  let cache = byOpts.get(opts);
+  if (!cache) {
+    cache = new Map();
+    byOpts.set(opts, cache);
+  }
+  const hit = cache.get(elementId);
+  if (hit !== undefined) return hit;
+  // Seed the memo BEFORE recursing so a malformed `children` cycle resolves to
+  // "unplaced" instead of blowing the stack.
+  cache.set(elementId, UNPLACED);
+  const group = layerOf(project, elementId);
+  const children: string[] =
+    group && Array.isArray((group as Group).children)
+      ? (group as Group).children
+      : [];
+  let lo = Number.POSITIVE_INFINITY;
+  let hi = Number.NEGATIVE_INFINITY;
+  let anyOpen = false;
+  for (const childId of children) {
+    const win = childTimelineWindow(project, childId, opts);
+    // An id that doesn't resolve contributes nothing — skip it. It must NOT be
+    // read as unbounded, or one stale reference would strip the whole group of
+    // its timeline window.
+    if (win.kind === "absent") continue;
+    // A genuinely always-present child has neither a start nor an end, so the
+    // group has neither either — say so rather than inventing an extent that
+    // would visually clip its own contents.
+    if (win.kind === "unbounded") {
+      cache.set(elementId, UNPLACED);
+      return UNPLACED;
+    }
+    // Placed, but its end is unmeasurable (a clip playing to its natural end
+    // with no source length to hand). It still pins the start; it can only
+    // spoil the extent.
+    if (win.kind === "open") {
+      anyOpen = true;
+      lo = Math.min(lo, win.start);
+      continue;
+    }
+    // A fully-trimmed-off caption (duration 0) is culled — it contributes no
+    // extent, exactly as it contributes no pixels.
+    if (win.duration <= 0) continue;
+    lo = Math.min(lo, win.start);
+    hi = Math.max(hi, win.start + win.duration);
+  }
+  const start = Number.isFinite(lo) ? lo : null;
+  const out: GroupExtent = {
+    start,
+    window:
+      !anyOpen && start !== null && Number.isFinite(hi) && hi > start
+        ? { start, duration: hi - start }
+        : null,
+  };
+  cache.set(elementId, out);
+  return out;
+};
+
+export const deriveGroupWindow = (
+  project: Composition,
+  elementId: string,
+  opts: GroupWindowOptions = NO_GROUP_WINDOW_OPTIONS,
+): { start: number; duration: number } | null =>
+  groupExtent(project, elementId, opts).window;
+
+// WHERE a group's contents begin — a strictly weaker question than how long
+// they run, and the only one a MOVE has to answer.
+//
+// `shift_group` resolves an absolute target against the group's current
+// position, so it needs a start and nothing else. Asking deriveGroupWindow for
+// a whole bounded hull is what made a group holding an untrimmed clip
+// unmovable: the clip's end isn't measurable headlessly, so the hull came back
+// null and the move was refused over an extent it never used.
+export const deriveGroupStart = (
+  project: Composition,
+  elementId: string,
+  opts: GroupWindowOptions = NO_GROUP_WINDOW_OPTIONS,
+): number | null => groupExtent(project, elementId, opts).start;
+
+// True when `elementId` is a plain group — a container, as opposed to an
+// embedded morpha band, which is its own time origin and behaves like a clip.
+// The single predicate for "does the container treatment apply", so the Timeline,
+// the resolvers below and the tools can't disagree about it.
+export const isContainerGroup = (
+  project: Composition,
+  elementId: string,
+): boolean => {
+  if (!elementId.startsWith("group.")) return false;
+  const g = layerOf(project, elementId);
+  return !!g && !isMorphaGroup(g as Group);
+};
+
+// The composition frame a layer's TIMELINE BAR starts at.
+//
+// For every ordinary layer this is just `effectiveFrameOffset` — the bar and the
+// row's keyframe dots share one origin. A container group on a DERIVED window is
+// the sole exception, and it needs its own resolver rather than an inline
+// calculation at the call site: the group stays blockless, so its own keyframes
+// are still sampled at absolute frames and their dots must keep drawing at
+// `effectiveFrameOffset`, while the BAR has to sit at the hull of its contents.
+// Using effectiveFrameOffset for both would pin the bar to frame 0 at the hull's
+// width — right length, wrong place.
+export const blockBarOriginFrame = (
+  project: Composition,
+  elementId: string,
+  opts: GroupWindowOptions = NO_GROUP_WINDOW_OPTIONS,
+): number => {
+  const base = effectiveFrameOffset(project, elementId);
+  const layer = layerOf(project, elementId);
+  if (layer?.block || !isContainerGroup(project, elementId)) return base;
+  // Falls back to `base` when the hull is unmeasurable — the SAME condition
+  // under which the bar has no stored window and renders full-lane from the
+  // row's own origin, so the bar's left edge and this origin can't disagree.
+  return base + (deriveGroupWindow(project, elementId, opts)?.start ?? 0);
+};
+
+// One child's window expressed in ITS PARENT's timeline — the space the hull is
+// summed in. A nested plain group has no window of its own, so it recurses; a
+// morpha band does (its `block` places the band on this timeline, and its
+// descendants are band-LOCAL, so folding them in here would double-count the
+// band origin). Null ⇒ unbounded.
+// "absent" ⇒ the id doesn't resolve to a layer at all, so it contributes NOTHING
+// and must be skipped. "unbounded" ⇒ a real child that spans the whole
+// composition, which genuinely makes the hull unbounded. Collapsing these two
+// into a bare null is a bug that has already bitten: a group whose only child
+// was a dangling id (left by a band re-pin) read as always-present and lost its
+// timeline handles. `children` is an unenforced foreign key, so absent ids WILL
+// occur — migratePruneDanglingChildren cleans them on load, but this must not
+// depend on that having run.
+// "absent"    ⇒ the id doesn't resolve to a layer at all: contributes NOTHING.
+// "unbounded" ⇒ a real child that spans the whole composition and has no start
+//               to speak of, which genuinely makes the hull unbounded.
+// "open"      ⇒ PLACED, but how far it runs can't be measured here — a clip
+//               playing to its natural end with no source length to hand. It
+//               has a start (a move can use it) and no end (a hull can't).
+type ChildWindow =
+  | { kind: "window"; start: number; duration: number }
+  | { kind: "open"; start: number }
+  | { kind: "unbounded" }
+  | { kind: "absent" };
+
+// A CLIP's window on its parent timeline. A video layer is the one leaf whose
+// placement does NOT live in `block` — `timeline_start_frame` positions it and
+// the source in/out points give its length — so `blockOf` reports it as
+// always-present and it would poison every hull it sits in. It is never
+// genuinely always-present: it starts where it is placed and stops when its
+// source runs out.
+//
+// The length goes through `videoWindow`, the one home for trim math, resolving
+// the source length by the SAME ladder `computeContentDurationFrames` uses:
+// the caller's measured length, else an explicit out-point (which bounds the
+// window by itself), else unmeasurable — in which case the clip is "open"
+// rather than assigned an invented extent.
+const clipTimelineWindow = (
+  layer: VideoLayer,
+  opts: GroupWindowOptions,
+): ChildWindow => {
+  const FPS = 30;
+  const natural = opts.videoNaturalSeconds?.(layer);
+  const sourceSeconds =
+    natural !== undefined && Number.isFinite(natural) && natural > 0
+      ? natural
+      : layer.source_out_frame !== null
+        ? layer.source_out_frame / FPS
+        : null;
+  if (sourceSeconds === null) {
+    return { kind: "open", start: Math.max(0, layer.timeline_start_frame) };
+  }
+  const win = videoWindow(layer, sourceSeconds);
+  return { kind: "window", start: win.startFrame, duration: win.windowFrames };
+};
+
+const childTimelineWindow = (
+  project: Composition,
+  childId: string,
+  opts: GroupWindowOptions,
+): ChildWindow => {
+  const layer = layerOf(project, childId);
+  if (!layer) return { kind: "absent" };
+  // An explicit block on a clip GATES it — the layer is drawn only inside that
+  // window regardless of where its footage sits — so the block IS its window.
+  // Both readers come through here, so the hull and the move can't disagree
+  // about which field is authoritative for a given clip.
+  if (childId.startsWith("video.") && !layer.block) {
+    return clipTimelineWindow(layer as VideoLayer, opts);
+  }
+  if (
+    childId.startsWith("group.") &&
+    !layer.block &&
+    !isMorphaGroup(layer as Group)
+  ) {
+    // One walk answers both halves. A nested group with no hull is empty,
+    // unbounded, or merely unmeasurable — and only an unbounded child may
+    // poison the parent, so the weaker question tells them apart:
+    //   window ⇒ measured
+    //   start only ⇒ placed but open (a clip inside whose end is unmeasurable)
+    //   neither, but resolvable content ⇒ genuinely unbounded
+    //   nothing resolvable ⇒ absent (skip; a stale id must not strip the
+    //     parent of its window)
+    const nested = groupExtent(project, childId, opts);
+    if (nested.window) return { kind: "window", ...nested.window };
+    if (nested.start !== null) return { kind: "open", start: nested.start };
+    const g = layer as Group;
+    const hasContent = (g.children ?? []).some((c) => layerOf(project, c) !== null);
+    return hasContent ? { kind: "unbounded" } : { kind: "absent" };
+  }
+  const win = blockOf(project, childId);
+  return Number.isFinite(win.duration)
+    ? { kind: "window", start: win.start, duration: win.duration }
+    : { kind: "unbounded" };
+};
+
 
 // Remove every caption line welded to `clipElementId` (its `caption_source`
 // anchor points at that clip), stripping their ids from `layer_order` and every
@@ -3523,7 +4428,7 @@ export const removeWeldedCaptionLines = (
 // render loop doesn't re-walk the ancestor chain 5× per layer — same
 // invalidate-on-clone contract as elementIndex.
 const bandOriginSumCache = new WeakMap<Composition, Map<string, number>>();
-const ancestorBandOriginSum = (project: Composition, elementId: string): number => {
+export const ancestorBandOriginSum = (project: Composition, elementId: string): number => {
   let cache = bandOriginSumCache.get(project);
   if (!cache) {
     cache = new Map();
@@ -3551,12 +4456,20 @@ export const effectiveFrameOffset = (
 ): number =>
   ancestorBandOriginSum(project, elementId) + blockOf(project, elementId).start;
 
-// True when the layer is NOT drawn at `frame` (frame outside its block window).
-// `frame` is the raw composition frame; the layer's block window is expressed in
-// its PARENT timeline, so ancestor band origins are subtracted first. Always
-// false for an always-present (blockless) layer. The one gate the canvas
-// (drawNode) and the DOM sync both call.
-export const frameOutsideBlock = (
+// True when the layer's OWN block window excludes `frame` — ancestors NOT
+// considered. `frame` is the raw composition frame; the layer's block window is
+// expressed in its PARENT timeline, so ancestor band origins are subtracted
+// first. Always false for an always-present (blockless) layer.
+//
+// ONLY for a top-down walk that culls ancestors before it reaches this node:
+// the canvas (`drawNode` returns early on a group, so the subtree is never
+// visited) and the DOM sync (hiding a group wrapper hides its nested children
+// via CSS). Both would get the same answer from the ancestor-aware
+// `frameOutsideBlock` below — they use this to avoid re-walking a chain their
+// recursion has already covered, which is the ONLY reason to reach for it.
+// Anything asking about one element in isolation must use `frameOutsideBlock`.
+// New call sites need an entry in test/block-gate-call-sites.test.ts.
+export const frameOutsideOwnBlock = (
   project: Composition,
   elementId: string,
   frame: number,
@@ -3567,6 +4480,33 @@ export const frameOutsideBlock = (
   if (duration <= 0) return true;
   const parentFrame = frame - ancestorBandOriginSum(project, elementId);
   return parentFrame < start || parentFrame >= start + duration;
+};
+
+// True when NOTHING of this element reaches the screen at `frame` — its own
+// block window excludes the frame, OR any ANCESTOR group's does. THE DEFAULT
+// GATE: use this unless you are a top-down walk (see frameOutsideOwnBlock).
+//
+// The ancestor half is the whole point. `drawNode` culls a group whose window
+// excludes the frame BEFORE recursing, so the entire subtree paints nothing —
+// but each child's own block says nothing about that, and a BLOCKLESS child
+// (the always-present sentinel every legacy and embedded layer carries) reports
+// "visible" at every frame unconditionally, so only the ancestor walk can catch
+// it. Asking per-leaf instead left every child of a not-yet-started band with a
+// live hit-box: dashed outlines over footage the band hadn't reached, each rect
+// swallowing clicks meant for what IS visible beneath.
+export const frameOutsideBlock = (
+  project: Composition,
+  elementId: string,
+  frame: number,
+): boolean => {
+  if (frameOutsideOwnBlock(project, elementId, frame)) return true;
+  // Each ancestor resolves against ITS parent timeline (frameOutsideOwnBlock
+  // subtracts that group's own band-origin sum), so the raw composition frame
+  // is the right argument at every level.
+  for (const gid of getAncestorGroupChain(project, elementId)) {
+    if (frameOutsideOwnBlock(project, `group.${gid}`, frame)) return true;
+  }
+  return false;
 };
 
 // A BLOCK MUST NEVER SILENTLY TRUNCATE AN AUTHORED KEYFRAME.

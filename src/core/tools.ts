@@ -35,6 +35,10 @@ import {
 } from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
+  DEFAULT_OVERLAY_TRANSITION_FRAMES,
+  bornLayerDefaults,
+} from "./transitions.ts";
+import {
   blockOf,
   clampCurve,
   CAPTIONS_GROUP_NAME,
@@ -43,9 +47,12 @@ import {
   findLayerByElementId,
   findParentGroup,
   isCaptionLineElement,
+  layerOf,
+  deriveGroupStart,
   getGroupDescendants,
   growBlockToCoverFrame,
   isMorphaGroup,
+  type AnyLayer,
   materializeRootLayerOrder,
   projectSchema,
   reflowCompositionLayers,
@@ -53,12 +60,16 @@ import {
   resolveDefaultTextSize,
   resolveLayerTree,
   resolveMultiClipLanes,
+  videoWindow,
   weldedAudioTiming,
   weldedSourceLayer,
   type AudioOverlay,
   type Composition,
   type ColorKeyframe,
   type Easing,
+  type EdgeTransition,
+  type TransitionDirection,
+  type TransitionKind,
   type ElementColorTracks,
   type ElementTracks,
   type Fill,
@@ -66,6 +77,10 @@ import {
   type ImageLayer,
   type Keyframe,
   type LayerStyle,
+  MIN_SPEED,
+  MAX_SPEED,
+  layerSpeed,
+  sourceFrameAtTimelineOffset,
   type LoopPass,
   type PageComposition,
   type Project,
@@ -554,6 +569,31 @@ export const rekeyElementId = (
       if (pp.layer_id === oldElementId) pp.layer_id = newElementId;
     }
   }
+
+  // 8. The two WELDS onto a clip — a caption line's `caption_source
+  // .clip_element_id` and an audio overlay's `sourceLayerId`. Both hold a
+  // `video.<id>` and both derive their timing LIVE from the clip they name
+  // (deriveCaptionWindow / weldedAudioTiming), so a weld left pointing at the
+  // old id doesn't merely go stale — the line or overlay re-times against a
+  // DIFFERENT clip, or falls back to a stored block that was only ever meant to
+  // cover a missing clip. `remove_layer` already treats both as references (it
+  // takes them with the clip); they were simply never mirrored here, so a
+  // pasted subtree kept its captions anchored to the clip they were copied FROM.
+  // `audio_overlays` is optional on the standalone composition pasteSubtree
+  // re-keys against, hence the guard.
+  if (oldKind === "video") {
+    for (const t of project.text_layers) {
+      const cs = t.caption_source;
+      if (cs && cs.clip_element_id === oldElementId) {
+        t.caption_source = { ...cs, clip_element_id: newElementId };
+      }
+    }
+    if (project.audio_overlays) {
+      for (const ov of project.audio_overlays) {
+        if (ov.sourceLayerId === oldElementId) ov.sourceLayerId = newElementId;
+      }
+    }
+  }
 };
 
 // Drop every dangling reference to `elementId` once its primary layer object
@@ -562,6 +602,15 @@ export const rekeyElementId = (
 // is the caller's splice, which also carries off its per-element animations /
 // style / track_loops / color_tracks). When a reference site is added to
 // rekeyElementId, add it here too.
+//
+// Site 8 (the caption / audio WELDS onto a clip) is the one deliberate
+// exception, and it is not an omission: a welded caption line and a welded
+// audio overlay have no standalone existence, so deleting a clip DELETES them
+// rather than un-welding them — `remove_layer`'s video branch does that at the
+// call site (removeWeldedCaptionLines + the sourceLayerId filter), before
+// anything here could observe an orphan. Clearing the weld here instead would
+// leave a caption line stranded with a fallback block, which is the state that
+// exists for a MISSING clip, not a deleted one.
 const purgeElementId = (project: Composition, elementId: string): void => {
   // 2. layer_order
   project.layer_order = project.layer_order.filter((id) => id !== elementId);
@@ -922,6 +971,36 @@ export const collectSubtree = (
   return bundle;
 };
 
+// Put freshly-pasted clips on their OWN lanes, in place. `lane_id` buckets
+// clips into ONE timeline row (`resolveLanes`), and it is not an element id, so
+// nothing in the re-key path rewrites it: a pasted clip carrying the source's
+// lane_id folds straight back into the original's row, and — pasting keeps
+// `timeline_start_frame` — lands exactly on top of the clip it was copied from.
+// The copy is then invisible in the timeline and can't be grabbed, which reads
+// as "paste did nothing". Same rule `duplicate_layer` already applies ("a
+// duplicated clip is a fresh take, not a keyframed sibling").
+//
+// Each DISTINCT source lane maps to one fresh lane, so a folded multi-clip take
+// copied whole stays one lane end-to-end instead of exploding into a row per
+// clip. A clip with no lane_id needs nothing: `resolveLanes` falls back to its
+// id, which the re-key already made unique. Call AFTER the copies have their
+// destination ids — the first clip of each lane donates its new id as the lane
+// id, mirroring `add_video_layer`.
+export const relaneClipCopies = (clips: VideoLayer[]): void => {
+  const remapped = new Map<string, string>();
+  for (const clip of clips) {
+    const sourceLane = clip.lane_id;
+    if (!sourceLane) continue;
+    const already = remapped.get(sourceLane);
+    if (already !== undefined) {
+      clip.lane_id = already;
+    } else {
+      remapped.set(sourceLane, clip.id);
+      clip.lane_id = clip.id;
+    }
+  }
+};
+
 // Add `delta` to a group's frame-0 x/y translation (groups have no static base
 // position, so a paste offset lives on the translation track). Mirrors the
 // store's group-nudge so a pasted group can be dragged clear of the original.
@@ -996,6 +1075,9 @@ export const pasteSubtree = (
   rekeyAll("text", sub.text_layers);
   rekeyAll("shapes", sub.shapes);
   rekeyAll("group", sub.groups);
+  // `lane_id` is not an element id, so rekeyElementId leaves it pointing at the
+  // SOURCE lane — see relaneClipCopies for why that hides the paste.
+  relaneClipCopies(sub.video_layers);
 
   // rekeyElementId rewrote sub.layer_order, so its sole entry is the new root.
   const rootElementId = sub.layer_order[0];
@@ -1108,6 +1190,16 @@ export const replaceBand = (
   }
   const oldEid = `group.${bandGroupId}`;
   const oldIdx = host.layer_order.indexOf(oldEid);
+  // Where the band SITS IN THE TREE, captured before anything is stripped. A
+  // nested band lives in its parent group's `children`, not in the root
+  // `layer_order`, and re-pinning mints a NEW group id — so restoring only the
+  // layer_order slot (as this used to) left the parent pointing at an id that no
+  // longer resolved AND floated the fresh band up to the root. The parent's
+  // `children` is an unenforced list of ids, so nothing caught it.
+  const parentGroup = host.groups.find((g) => g.children.includes(oldEid));
+  const parentChildIdx = parentGroup
+    ? parentGroup.children.indexOf(oldEid)
+    : -1;
 
   // Strip the old band + every descendant.
   const stripped = cloneProject(host);
@@ -1129,7 +1221,15 @@ export const replaceBand = (
   stripped.text_layers = stripped.text_layers.filter((l) => !removeBare.text.has(l.id));
   stripped.shapes = stripped.shapes.filter((l) => !removeBare.shapes.has(l.id));
   stripped.groups = stripped.groups.filter((g) => !removeBare.group.has(g.id));
-  stripped.layer_order = stripped.layer_order.filter((id) => !toRemove.has(id));
+  // Removing the RECORDS is only half of a removal — every id that pointed at
+  // them has to go too, and there are seven such places (layer_order, group
+  // children, matte_source_id, mask fills, loop overrides, public_properties).
+  // purgeElementId is the single remover that knows all of them, and every other
+  // deletion path in the codebase calls it. This one used to hand-roll a
+  // layer_order filter and nothing else, which is why re-pinning a NESTED band
+  // left its parent pointing at an id that no longer resolved — and would have
+  // left a dangling matte source or mask fill just as silently.
+  for (const eid of toRemove) purgeElementId(stripped, eid);
 
   const { project: inlined, result } = inlineMorpha(stripped, freshSource, pin);
   if (!result.ok) return { project: host, result };
@@ -1148,10 +1248,31 @@ export const replaceBand = (
     // where the user dropped it — re-pin-safe by construction.
     if (old.block) newBand.block = { ...old.block };
   }
-  // Restore the band's original z-order slot (inlineMorpha appended it at end).
+  // Restore the band's original position in the tree. inlineMorpha always appends
+  // the fresh band to the root layer_order, so drop that first and then put it
+  // back where the OLD one actually was — which is the parent group's `children`
+  // for a nested band (z-order inside a group comes from that array) and the root
+  // `layer_order` otherwise. The two are mutually exclusive: a nested band in
+  // layer_order would be drawn twice, a root band in neither would vanish.
+  // purgeElementId already removed oldEid from the parent's children, so the slot
+  // index captured up front is what puts it back in the same place.
   inlined.layer_order = inlined.layer_order.filter((id) => id !== data.elementId);
-  const idx = oldIdx >= 0 ? Math.min(oldIdx, inlined.layer_order.length) : inlined.layer_order.length;
-  inlined.layer_order.splice(idx, 0, data.elementId);
+  const parent = parentGroup
+    ? inlined.groups.find((g) => g.id === parentGroup.id)
+    : undefined;
+  if (parent) {
+    parent.children.splice(
+      Math.min(parentChildIdx, parent.children.length),
+      0,
+      data.elementId,
+    );
+  } else {
+    const idx =
+      oldIdx >= 0
+        ? Math.min(oldIdx, inlined.layer_order.length)
+        : inlined.layer_order.length;
+    inlined.layer_order.splice(idx, 0, data.elementId);
+  }
 
   return { project: inlined, result };
 };
@@ -1333,6 +1454,11 @@ const overviewNode = (
       source_in_frame: v.source_in_frame,
       source_out_frame: v.source_out_frame,
       timeline_start_frame: v.timeline_start_frame,
+      // Reported only when retimed, so the common 1x clip stays terse — but it
+      // MUST be reported when set: the clip's length on the timeline is derived
+      // from it, so an agent reasoning about duration from the trim alone would
+      // be wrong by a factor of `speed`. describe-before-mutate needs it.
+      ...(layerSpeed(v) !== 1 ? { speed: layerSpeed(v) } : {}),
       ...(v.lane_id !== undefined ? { lane_id: v.lane_id } : {}),
       ...animField,
     };
@@ -1512,10 +1638,23 @@ const fullLayerRecord = (
       break;
   }
   if (!layer) return null;
+  // Speed keyframes are STORED clip-relative (so a clip's length can't change
+  // when it moves), but every frame number an agent sees or sends elsewhere is
+  // a PROJECT frame — including the ones add/remove_speed_keyframe take. Report
+  // them in project frames so the round trip closes; leaking the raw offsets
+  // made a caller delete the wrong keyframe with the number it had just read.
+  const speedKfs =
+    type === "video" && (layer as VideoLayer).speed_keyframes
+      ? (layer as VideoLayer).speed_keyframes!.map((kf) => ({
+          ...kf,
+          frame: kf.frame + Math.max(0, (layer as VideoLayer).timeline_start_frame),
+        }))
+      : undefined;
   return {
     elementId,
     type,
     ...layer,
+    ...(speedKfs ? { speed_keyframes: speedKfs } : {}),
     animations: layer.animations ?? null,
     color_tracks: layer.color_tracks ?? null,
     track_loops: layer.track_loops ?? null,
@@ -2330,8 +2469,10 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
     pivotX: 0.5,
     pivotY: 0.5,
     fill: null,
-    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
-    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
+    // Window AND edge transitions together — a bounded overlay is born with a
+    // short fade at each edge, an omitted block means always-present (where a
+    // transition would be inert). See bornLayerDefaults.
+    ...bornLayerDefaults(parsedBlock.block),
   };
   next.image_layers = [...next.image_layers, layer];
   next.layer_order = [...next.layer_order, `image.${id}`];
@@ -2391,6 +2532,8 @@ const addVideoLayer: ToolDispatch<AddVideoLayerArgs> = (project, args) => {
     source_in_frame: 0,
     source_out_frame: null,
     timeline_start_frame: 0,
+    // Source speed until the user retimes it (set_clip_speed / the Inspector).
+    speed: 1,
     // A freshly-added clip is its own lane (track); a later split/cut shares this
     // lane_id across the resulting pieces so they read as one take.
     lane_id: id,
@@ -2475,8 +2618,8 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
     rotation: 0,
     pivotX: 0.5,
     pivotY: 0.5,
-    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
-    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
+    // Window AND edge transitions together — see bornLayerDefaults.
+    ...bornLayerDefaults(parsedBlock.block),
   };
   next.shapes = [...next.shapes, shape];
   next.layer_order = [...next.layer_order, `shapes.${id}`];
@@ -4728,7 +4871,10 @@ const clipSourceFrameFromComp = (
   clip: VideoLayer,
   compFrame: number,
 ): number =>
-  compFrame - Math.max(0, clip.timeline_start_frame) + Math.max(0, clip.source_in_frame);
+  sourceFrameAtTimelineOffset(
+    clip,
+    compFrame - Math.max(0, clip.timeline_start_frame),
+  );
 
 const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
   const { elementId, start, duration } = args;
@@ -4765,11 +4911,19 @@ const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
       : cs.clip_element_id;
     const clip = next.video_layers.find((v) => v.id === clipId);
     if (clip) {
+      // BOTH ends convert through the clip's rate. Adding the composition
+      // duration to the source start would be a source/timeline unit mix-up —
+      // right only at speed 1, and a factor of `speed` wrong otherwise (a 2x
+      // clip's caption halved on every commit).
       const sourceStart = Math.max(0, clipSourceFrameFromComp(clip, roundedStart));
+      const sourceEnd = Math.max(
+        sourceStart,
+        clipSourceFrameFromComp(clip, roundedStart + roundedDuration),
+      );
       target.caption_source = {
         clip_element_id: cs.clip_element_id,
         source_start_frame: sourceStart,
-        source_end_frame: sourceStart + roundedDuration,
+        source_end_frame: sourceEnd,
       };
       return {
         project: next,
@@ -4781,6 +4935,87 @@ const setLayerBlock: ToolDispatch<SetLayerBlockArgs> = (project, args) => {
   return {
     project: next,
     result: { ok: true, data: { elementId, block: target.block } },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// set_layer_transition
+// ---------------------------------------------------------------------------
+
+type SetLayerTransitionArgs = {
+  elementId: string;
+  edge: "in" | "out" | "both";
+  kind: TransitionKind;
+  frames?: number;
+  curve?: Easing;
+  direction?: TransitionDirection;
+};
+
+// Set how a layer enters / leaves at the edges of its on-timeline window.
+//
+// Edge-relative by construction: only a LENGTH and a look are stored, so the
+// transition rides the edge through every later trim or slide. This is the
+// difference from `fade_layer` / `apply_preset`, which write opacity keyframes
+// at absolute frames and strand themselves the moment the edge moves — prefer
+// this tool whenever the intent is "enters/leaves nicely" rather than "a
+// specific opacity at a specific frame".
+//
+// `kind: "cut"` clears the edge back to a hard cut (the field is removed rather
+// than stored as a cut, so a layer with no transitions carries no keys).
+const setLayerTransition: ToolDispatch<SetLayerTransitionArgs> = (project, args) => {
+  const { elementId, edge, kind, frames, curve, direction } = args;
+  if (!findLayerByElementId(project, elementId)) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+  }
+  if (edge !== "in" && edge !== "out" && edge !== "both") {
+    return {
+      project,
+      result: { ok: false, error: `invalid edge: ${edge} (valid: in, out, both)` },
+    };
+  }
+  const validKinds: TransitionKind[] = ["cut", "fade", "slide", "pop"];
+  if (!validKinds.includes(kind)) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `invalid kind: ${kind} (valid: ${validKinds.join(", ")})`,
+      },
+    };
+  }
+  const requested = frames ?? DEFAULT_OVERLAY_TRANSITION_FRAMES;
+  if (!Number.isFinite(requested) || requested < 0) {
+    return { project, result: { ok: false, error: `invalid frames: ${frames}` } };
+  }
+  const next = cloneProject(project);
+  const target = findLayerByElementId(next, elementId)!;
+  const value: EdgeTransition | null =
+    kind === "cut"
+      ? null
+      : {
+          kind,
+          frames: Math.round(requested),
+          ...(curve ? { curve } : {}),
+          ...(kind === "slide" ? { direction: direction ?? "left" } : {}),
+        };
+  if (edge === "in" || edge === "both") {
+    if (value) target.transition_in = value;
+    else delete target.transition_in;
+  }
+  if (edge === "out" || edge === "both") {
+    if (value) target.transition_out = value;
+    else delete target.transition_out;
+  }
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        elementId,
+        transition_in: target.transition_in ?? null,
+        transition_out: target.transition_out ?? null,
+      },
+    },
   };
 };
 
@@ -4821,6 +5056,275 @@ const moveBand: ToolDispatch<MoveBandArgs> = (project, args) => {
     result: {
       ok: true,
       data: { elementId: `group.${bare}`, block: target.block },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// shift_group / set_group_window — a group as a relative CONTAINER
+//
+// A plain group holds no media, so it has no window of its own: the timeline
+// shows it spanning the hull of its contents (`deriveGroupWindow`). These are
+// the two things you can then do to it, and they mean different things because
+// a container and a clip differ:
+//   shift_group      — MOVE it: the whole subtree slides, keeping its shape.
+//   set_group_window — TRIM it: the group's own visible window narrows, and the
+//                      contents are left exactly where they are.
+// A morpha band is excluded from both: its block already IS its subtree's time
+// origin, so `set_layer_block` / `move_band` already move it as a unit.
+// ---------------------------------------------------------------------------
+
+type ShiftGroupArgs = { elementId: string; start: number };
+
+// Every element inside `elementId` (and the group itself) that CARRIES time,
+// plus the earliest frame any of them occupies. Which field carries the time
+// follows from how the block model samples:
+//   - a VIDEO layer: its `timeline_start_frame`. A clip is the one leaf whose
+//     placement doesn't live in `block`, and moving the block instead would
+//     leave the footage exactly where it was — the whole reason a group
+//     holding a clip used to move everything EXCEPT the clip.
+//   - a layer WITH a stored block: its `block.start` (keyframes are
+//     block-relative, so they ride along when the block moves).
+//   - a layer WITHOUT one: its keyframes, which are absolute.
+// A morpha band is a mover but is never recursed into — moving the band's block
+// moves its descendants band-locally, so touching them too would double-move
+// them. Welded captions are skipped: they anchor to their clip's source timeline
+// and are speech-timed, so they must stay on their words.
+type FrameTrack = ReadonlyArray<{ frame: number }>;
+const numericTracks = (layer: AnyLayer): FrameTrack[] => [
+  ...Object.values((layer.animations ?? {}) as Record<string, FrameTrack>),
+  ...Object.values((layer.color_tracks ?? {}) as Record<string, FrameTrack>),
+];
+
+// A clip carries its time in `timeline_start_frame` — unless it also holds an
+// explicit block, which gates it and so owns its window (childTimelineWindow
+// reads it the same way, so the hull and the move can't disagree).
+const isClipMover = (eid: string, layer: AnyLayer): boolean =>
+  eid.startsWith("video.") && !layer.block;
+
+const groupTimeCarriers = (
+  project: Composition,
+  elementId: string,
+): { movers: string[]; earliest: number } => {
+  const movers: string[] = [];
+  let earliest = Number.POSITIVE_INFINITY;
+  const noteKeyframeFloor = (layer: AnyLayer): void => {
+    for (const track of numericTracks(layer)) {
+      for (const kf of track) earliest = Math.min(earliest, kf.frame);
+    }
+  };
+  const visit = (eid: string, isRoot: boolean): void => {
+    const layer = layerOf(project, eid);
+    if (!layer) return;
+    if (!isRoot && isCaptionLineElement(project, eid)) return;
+    movers.push(eid);
+    if (isClipMover(eid, layer)) {
+      earliest = Math.min(earliest, (layer as VideoLayer).timeline_start_frame);
+    } else if (layer.block) {
+      earliest = Math.min(earliest, layer.block.start);
+    } else {
+      noteKeyframeFloor(layer);
+    }
+    if (eid.startsWith("group.") && (isRoot || !isMorphaGroup(layer as Group))) {
+      for (const child of (layer as Group).children ?? []) visit(child, false);
+    }
+  };
+  visit(elementId, true);
+  return { movers, earliest };
+};
+
+// Slide a group and everything inside it along the timeline.
+//
+// `start` is where the group's window should END UP in its parent timeline — not
+// a delta — and the shift is resolved against the group's CURRENT window every
+// call. That makes it idempotent, so an editor drag can fire it once per
+// pointermove with the same target and the second call is a no-op, with no
+// per-gesture bookkeeping to get wrong.
+//
+// The subtree moves as ONE RIGID BODY: the delta is clamped so the earliest
+// thing inside lands no earlier than frame 0. The clamp is applied to the DELTA,
+// never to individual frames — clamping per-frame would collapse keyframes onto
+// 0 and silently destroy the shape of the animation.
+const shiftGroup: ToolDispatch<ShiftGroupArgs> = (project, args) => {
+  const { elementId, start } = args;
+  const root = layerOf(project, elementId);
+  if (!root) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+  }
+  if (!elementId.startsWith("group.")) {
+    return {
+      project,
+      result: { ok: false, error: `not a group: ${elementId}` },
+    };
+  }
+  if (!Number.isFinite(start) || start < 0) {
+    return { project, result: { ok: false, error: `invalid start: ${start}` } };
+  }
+  // A move needs a POSITION, not an extent: `start` is absolute, so the delta
+  // is resolved against where the group currently begins. Asking for a whole
+  // bounded hull here is what made a group holding an untrimmed clip unmovable —
+  // the clip's end isn't measurable headlessly, so the hull was null and the
+  // move was refused over a duration it never used.
+  const currentStart = root.block?.start ?? deriveGroupStart(project, elementId);
+  if (currentStart === null) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error:
+          `${elementId} has no position to move from: it is empty, or something ` +
+          `inside it is always-present (spans the whole composition). Give the ` +
+          `always-present child a block first, or set one on the group.`,
+      },
+    };
+  }
+  const { movers, earliest } = groupTimeCarriers(project, elementId);
+  const requested = Math.round(start) - currentStart;
+  const delta = Number.isFinite(earliest)
+    ? Math.max(requested, -earliest)
+    : requested;
+  if (delta === 0) {
+    return {
+      project,
+      result: { ok: true, data: { elementId, start: currentStart, delta: 0, moved: 0 } },
+    };
+  }
+  const next = cloneProject(project);
+  for (const eid of movers) {
+    const target = layerOf(next, eid);
+    if (!target) continue;
+    if (isClipMover(eid, target)) {
+      const clip = target as VideoLayer;
+      // Source in/out are untouched — the clip slides, it is not retrimmed. Its
+      // welded audio overlay and caption lines DERIVE their timing from this
+      // field (weldedAudioTiming / deriveCaptionWindow), so they follow with no
+      // bookkeeping here. Its speed RAMP follows too, for a different reason:
+      // `speed_keyframes` are stored clip-relative precisely so a move can't
+      // change the clip's derived length.
+      //
+      // Its `animations` / `color_tracks` keyframes deliberately do NOT follow
+      // (see the note below) — a video layer is blockless, so those sample at
+      // absolute project frames. That asymmetry is intended: the ramp is the
+      // only per-layer curve the clip's LENGTH is derived from, so anchoring it
+      // to the clip is a correctness requirement, not a convenience.
+      //
+      // Its own KEYFRAMES deliberately stay where they are, unlike a blockless
+      // shape's. A clip is blockless, so its tracks sample at absolute frames —
+      // and dragging the clip's OWN bar (set_video_layer_trim, the everyday
+      // gesture) leaves them absolute too. Moving them only here would make
+      // "move the group by N" differ from "move the only clip in it by N", and
+      // would silently retime animations in projects that never asked for it.
+      // The two gestures agree instead; a clip's animation is absolute either
+      // way. (It also keeps a keyframe at frame 0 from pinning the whole group
+      // against ever moving left.)
+      clip.timeline_start_frame = clip.timeline_start_frame + delta;
+      continue;
+    }
+    if (target.block) {
+      target.block = { start: target.block.start + delta, duration: target.block.duration };
+      continue;
+    }
+    for (const track of numericTracks(target)) {
+      for (const kf of track) (kf as { frame: number }).frame += delta;
+    }
+  }
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { elementId, start: currentStart + delta, delta, moved: movers.length },
+    },
+  };
+};
+
+type SetGroupWindowArgs = {
+  elementId: string;
+  start: number;
+  duration: number;
+};
+
+// The last frame the layer's OWN tracks author, block-relative. Used to stop a
+// window write from hiding an authored keyframe.
+const ownKeyframeExtent = (layer: AnyLayer): number => {
+  let last = -1;
+  for (const track of numericTracks(layer)) {
+    for (const kf of track) last = Math.max(last, kf.frame);
+  }
+  return last;
+};
+
+// Trim a group's own visible window — the counterpart to shift_group's move.
+// Writes an explicit block on the group, which from then on overrides its derived
+// contents-hull. The CONTENTS ARE NOT TOUCHED: trimming a container clips what
+// is shown of it, it does not retime or destroy children.
+//
+// Two corrections make the write safe, and both exist because a block does two
+// coupled things — it gates visibility AND re-bases the layer's own keyframes to
+// its start (effectiveFrameOffset):
+//   1. Writing a start onto a previously blockless group would jump its own
+//      animation forward by the whole start. So its keyframes are compensated by
+//      the same amount in the opposite direction and the animation stays put.
+//      The compensation is clamped as a WHOLE (the shift is reduced so the
+//      earliest keyframe lands at 0) — never per-frame, which would collapse
+//      keyframes together and destroy the animation's shape.
+//   2. The duration is grown if needed to cover the group's own keyframe extent,
+//      so a trim can never silently truncate an authored keyframe (the invariant
+//      growBlockToCoverFrame protects at authoring time). Trimming the CONTENTS
+//      out of view is still allowed — that's what a visibility window is for.
+const setGroupWindow: ToolDispatch<SetGroupWindowArgs> = (project, args) => {
+  const { elementId, start, duration } = args;
+  const layer = layerOf(project, elementId);
+  if (!layer) {
+    return { project, result: { ok: false, error: `layer not found: ${elementId}` } };
+  }
+  if (!elementId.startsWith("group.")) {
+    return { project, result: { ok: false, error: `not a group: ${elementId}` } };
+  }
+  if (!Number.isFinite(start) || start < 0) {
+    return { project, result: { ok: false, error: `invalid start: ${start}` } };
+  }
+  if (!Number.isFinite(duration) || duration < 1) {
+    return {
+      project,
+      result: { ok: false, error: `invalid duration (must be ≥ 1): ${duration}` },
+    };
+  }
+  const nextStart = Math.round(start);
+  const prevStart = layer.block?.start ?? 0;
+  // Reduce the compensation rather than clipping frames, so relative timing is
+  // preserved even when the group's animation starts near 0.
+  const earliestOwn = (() => {
+    let lo = Number.POSITIVE_INFINITY;
+    for (const track of numericTracks(layer)) {
+      for (const kf of track) lo = Math.min(lo, kf.frame);
+    }
+    return lo;
+  })();
+  const wantShift = nextStart - prevStart;
+  const shift = Number.isFinite(earliestOwn)
+    ? Math.min(wantShift, earliestOwn)
+    : wantShift;
+
+  const next = cloneProject(project);
+  const target = layerOf(next, elementId)!;
+  if (shift !== 0) {
+    for (const track of numericTracks(target)) {
+      for (const kf of track) (kf as { frame: number }).frame -= shift;
+    }
+  }
+  const extent = ownKeyframeExtent(target);
+  const nextDuration = Math.max(Math.round(duration), extent + 1, 1);
+  target.block = { start: nextStart, duration: nextDuration };
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        elementId,
+        block: target.block,
+        keyframesCompensatedBy: -shift,
+        grownToCoverKeyframes: nextDuration !== Math.round(duration),
+      },
     },
   };
 };
@@ -4947,13 +5451,25 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
   // earlier by `delta`.
   const phi = (f: number): number => (f < start ? f : f < end ? start : f - delta);
 
-  // Timeline window [ws, we) a video layer occupies. we = Infinity for a
-  // null (natural-end) out-point — its real length is unmeasurable headless.
-  const videoWs = (l: VideoLayer): number => l.timeline_start_frame;
+  // Timeline window [ws, we) a video layer occupies, resolved through
+  // `videoWindow` — the declared one home for the trim math. Re-deriving
+  // `out - in` here was a fourth copy of it, and copies of this particular sum
+  // do not stay merely redundant: the moment a clip's on-timeline length stops
+  // being its raw source span (a playback rate makes a 0.5× clip occupy twice
+  // the timeline), a hand-rolled `we` silently under-reports the span and the
+  // ripple cuts through footage it thinks it missed. Routing through the
+  // resolver means this follows whatever `videoWindow` decides a clip occupies.
+  //
+  // we = Infinity for a null (natural-end) out-point: the real length needs the
+  // decoded source, which is unmeasurable headless. Feeding the out-point back
+  // in as the source length is the same ladder `computeContentDurationFrames`
+  // uses, and it clamps `in` against `out` — which the old subtraction didn't,
+  // so an inverted trim could produce we < ws.
+  const videoWs = (l: VideoLayer): number => Math.max(0, l.timeline_start_frame);
   const videoWe = (l: VideoLayer): number =>
     l.source_out_frame === null
       ? Infinity
-      : l.timeline_start_frame + (l.source_out_frame - l.source_in_frame);
+      : videoWindow(l, l.source_out_frame / DURATION_FPS).endFrame;
 
   // Refusal check FIRST (before any mutation): a ripple-cut across a
   // speed-ramped video layer would misalign its remapped time, so refuse it.
@@ -5022,16 +5538,6 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
       if (Object.keys(cts).length > 0) layer.color_tracks = cts;
       else delete layer.color_tracks;
     }
-  };
-
-  const remapSpeedKeyframes = (
-    layer: VideoLayer,
-    pick: <T extends { frame: number }>(arr: T[]) => T[],
-  ): void => {
-    if (!layer.speed_keyframes || layer.speed_keyframes.length === 0) return;
-    const kept = pick(layer.speed_keyframes);
-    if (kept.length > 0) layer.speed_keyframes = kept;
-    else delete layer.speed_keyframes;
   };
 
   // A layer with a `block` rides the composition timeline at block.start, and its
@@ -5150,16 +5656,20 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
       // Entirely after the cut → shift earlier.
       layer.timeline_start_frame = ws - delta;
       remapLayerTracks(layer, shiftKeyframes);
-      remapSpeedKeyframes(layer, shiftKeyframes);
+      // Speed keyframes are CLIP-RELATIVE, so a clip that merely SLIDES keeps
+      // its curve unchanged — that is the whole point of the clip-relative
+      // storage, and remapping here would re-introduce the drift it removes.
       continue;
     }
     if (finiteEnd && start >= we) {
       // Entirely before the cut → untouched (its frames are all < start).
       remapLayerTracks(layer, shiftKeyframes);
-      remapSpeedKeyframes(layer, shiftKeyframes);
       continue;
     }
-    // Overlap (ovStart < ovEnd). Speed-ramped overlaps were refused above.
+    // Overlap (ovStart < ovEnd). Speed-ramped overlaps were refused above, so
+    // nothing below can carry a rate curve — which is why none of these
+    // branches remaps `speed_keyframes`. A clip that merely slides keeps its
+    // (clip-relative) curve untouched.
     if (ovStart === ws && finiteEnd && ovEnd === we) {
       // Whole window inside the cut → delete the layer.
       deletedVideoIds.push(`video.${layer.id}`);
@@ -5167,18 +5677,17 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
     }
     if (ovStart > ws && finiteEnd && ovEnd === we) {
       // Tail-trim: keep [ws, ovStart).
-      layer.source_out_frame = layer.source_in_frame + (ovStart - ws);
+      // Timeline offset -> SOURCE frame at the clip's rate (1:1 only at speed 1).
+      layer.source_out_frame = sourceFrameAtTimelineOffset(layer, ovStart - ws);
       remapLayerTracks(layer, shiftKeyframes);
-      remapSpeedKeyframes(layer, shiftKeyframes);
       pruneIfEmptyVideo(layer);
       continue;
     }
     if (ovStart === ws && ovEnd < we) {
       // Head-trim: drop the front; content from ovEnd now plays at ovEnd-delta.
-      layer.source_in_frame = layer.source_in_frame + (ovEnd - ws);
+      layer.source_in_frame = sourceFrameAtTimelineOffset(layer, ovEnd - ws);
       layer.timeline_start_frame = ovEnd - delta;
       remapLayerTracks(layer, shiftKeyframes);
-      remapSpeedKeyframes(layer, shiftKeyframes);
       pruneIfEmptyVideo(layer);
       continue;
     }
@@ -5191,17 +5700,15 @@ const cutRange: ToolDispatch<CutRangeArgs> = (project, args) => {
     const right: VideoLayer = {
       ...structuredClone(layer),
       id: rightId,
-      source_in_frame: layer.source_in_frame + (ovEnd - ws),
+      source_in_frame: sourceFrameAtTimelineOffset(layer, ovEnd - ws),
       timeline_start_frame: ovEnd - delta,
       // source_out_frame inherited (may be null → keeps the natural end).
       // lane_id inherited from the original clone → both halves = one lane.
     };
     remapLayerTracks(right, rightKeyframes);
-    remapSpeedKeyframes(right, rightKeyframes);
     // Left: tail-trim + keep only the pre-cut tracks.
-    layer.source_out_frame = layer.source_in_frame + (ovStart - ws);
+    layer.source_out_frame = sourceFrameAtTimelineOffset(layer, ovStart - ws);
     remapLayerTracks(layer, leftKeyframes);
-    remapSpeedKeyframes(layer, leftKeyframes);
     // Captions welded to this clip follow the interior split: a line whose
     // source window begins at/after the right half's in-point belongs to the
     // right half (leaving it on the left would cull it — the left's source_out
@@ -5696,6 +6203,44 @@ const setMatteSource: ToolDispatch<SetMatteSourceArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
+// set_clip_speed — constant playback rate for a clip
+// ---------------------------------------------------------------------------
+
+type SetClipSpeedArgs = {
+  elementId: string;
+  speed: number;
+};
+
+// Retime a clip to a constant rate. The trimmed source span is untouched — the
+// clip's on-timeline length is DERIVED from the rate (`videoWindow`), so 0.5×
+// makes the clip twice as long and 2× halves it. Layers after it on the
+// timeline are NOT rippled; a retimed clip can therefore overlap or leave a gap
+// against its neighbours, exactly as dragging its trim handle can.
+const setClipSpeed: ToolDispatch<SetClipSpeedArgs> = (project, args) => {
+  const { elementId, speed } = args;
+  if (!elementId || !elementId.startsWith("video.")) {
+    return { project, result: { ok: false, error: "elementId must be video.<id>" } };
+  }
+  if (!Number.isFinite(speed) || speed < MIN_SPEED || speed > MAX_SPEED) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `invalid speed: ${speed} (must be in [${MIN_SPEED}, ${MAX_SPEED}])`,
+      },
+    };
+  }
+  const id = elementId.slice("video.".length);
+  const idx = project.video_layers.findIndex((v) => v.id === id);
+  if (idx < 0) {
+    return { project, result: { ok: false, error: `video layer not found: ${elementId}` } };
+  }
+  const next = cloneProject(project);
+  next.video_layers[idx] = { ...next.video_layers[idx], speed };
+  return { project: next, result: { ok: true, data: { elementId, speed } } };
+};
+
+// ---------------------------------------------------------------------------
 // add_speed_keyframe / remove_speed_keyframe — video time-remap curve
 // ---------------------------------------------------------------------------
 
@@ -5724,13 +6269,35 @@ const addSpeedKeyframe: ToolDispatch<AddSpeedKeyframeArgs> = (project, args) => 
   const next = cloneProject(project);
   const cur = next.video_layers[idx];
   const list = [...(cur.speed_keyframes ?? [])];
-  const f = Math.round(frame);
+  // `frame` is a PROJECT frame (what a caller with a playhead has); storage is
+  // CLIP-RELATIVE so the curve travels with the clip. Convert here — the one
+  // place the two spaces meet on the write path — and answer in PROJECT frames
+  // too, so the value a caller reads back is the value that addresses the
+  // keyframe again. Echoing the stored offset made remove_speed_keyframe fail
+  // on the number add_speed_keyframe had just returned.
+  const clipStart = Math.max(0, cur.timeline_start_frame);
+  const projectFrame = Math.round(frame);
+  // A frame BEFORE the clip has no offset — clamping it onto 0 silently
+  // rewrote the head keyframe's rate. Refuse instead.
+  if (projectFrame < clipStart) {
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `frame ${projectFrame} is before ${elementId} starts (${clipStart}); a speed keyframe must sit on the clip`,
+      },
+    };
+  }
+  const f = projectFrame - clipStart;
   const existing = list.findIndex((k) => k.frame === f);
   if (existing >= 0) list[existing] = { frame: f, rate };
   else list.push({ frame: f, rate });
   list.sort((a, b) => a.frame - b.frame);
   next.video_layers[idx] = { ...cur, speed_keyframes: list };
-  return { project: next, result: { ok: true, data: { elementId, frame: f, rate } } };
+  return {
+    project: next,
+    result: { ok: true, data: { elementId, frame: projectFrame, rate } },
+  };
 };
 
 type RemoveSpeedKeyframeArgs = { elementId: string; frame: number };
@@ -5747,10 +6314,21 @@ const removeSpeedKeyframe: ToolDispatch<RemoveSpeedKeyframeArgs> = (project, arg
   }
   const next = cloneProject(project);
   const cur = next.video_layers[idx];
-  const f = Math.round(frame);
+  // Project frame in, clip-relative storage out — mirrors addSpeedKeyframe,
+  // including reporting the PROJECT frame the caller passed rather than the
+  // internal offset (which is neither the argument nor anything they can see).
+  const clipStart = Math.max(0, cur.timeline_start_frame);
+  const projectFrame = Math.round(frame);
+  const f = projectFrame - clipStart;
   const list = (cur.speed_keyframes ?? []).filter((k) => k.frame !== f);
   if (list.length === (cur.speed_keyframes ?? []).length) {
-    return { project, result: { ok: false, error: `no speed keyframe at frame ${f} on ${elementId}` } };
+    return {
+      project,
+      result: {
+        ok: false,
+        error: `no speed keyframe at frame ${projectFrame} on ${elementId}`,
+      },
+    };
   }
   next.video_layers[idx] = {
     ...cur,
@@ -6264,8 +6842,8 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
     // would collapse to nothing.)
     text_autofit: "hug",
     fill: null,
-    // Omitted ⇒ always-present persistent overlay. See parseAddBlockArg.
-    ...(parsedBlock.block ? { block: parsedBlock.block } : {}),
+    // Window AND edge transitions together — see bornLayerDefaults.
+    ...bornLayerDefaults(parsedBlock.block),
   };
   const styleErr = applyTextStyleProps(layer, args as Record<string, unknown>);
   if (styleErr) {
@@ -6339,8 +6917,11 @@ export const CAPTION_STYLE_PRESETS: Record<string, Record<string, unknown>> = {
   },
 };
 
-// Shared marker prefix for caption layers (the editor's EnrichmentPanel checks
-// for it to flip "Add captions" → "Captions added").
+// Layer name `add_caption_track` stamps on the text layers it creates — bare
+// for a single static block, suffixed with the line number per line otherwise —
+// so a caption reads as a caption in the layer list rather than by its words.
+// A label only: whether a clip is already captioned is answered by its welded
+// `caption_source` anchor (see hasCaptionsForClip), never by this string.
 export const CAPTION_LAYER_NAME = "Captions";
 
 const addCaptionTrack: ToolDispatch<AddCaptionTrackArgs> = (project, args) => {
@@ -6938,37 +7519,42 @@ const setLoop: ToolDispatch<SetLoopArgs> = (project, args) => {
 // set_canvas_size
 // ---------------------------------------------------------------------------
 //
-// Resize the composition canvas with a "fit + recenter" reflow: the whole
-// composition is scaled by a SINGLE uniform factor s = min(newW/oldW,
-// newH/oldH) — so nothing distorts (a circle stays a circle) — then recentred
-// so the old composition centre maps to the new canvas centre. On a
-// same-aspect resize the recentre term cancels and this reduces to a plain
-// uniform scale. Mirrors the editor's CanvasSizePill behaviour — both the
-// editor store and this tool call reflowComposition.
+// Resize ONE page's canvas with a "fit + recenter" reflow: that page is scaled
+// by a SINGLE uniform factor s = min(newW/oldW, newH/oldH) — so nothing
+// distorts (a circle stays a circle) — then recentred so the old composition
+// centre maps to the new canvas centre. On a same-aspect resize the recentre
+// term cancels and this reduces to a plain uniform scale. Mirrors the editor's
+// CanvasSizePill behaviour — both the editor store and this tool call
+// reflowPage.
 
-// Reflow a project into a new canvas size: EVERY page's layers are fit-scaled
-// and recentred from the old canvas to the new one (via the shared
-// reflowCompositionLayers), then the project dims are stamped. Pure: clones,
-// never mutates the input. All pages share the one canvas, so a resize is a
-// whole-project operation — there is no per-page canvas to diverge.
-export const reflowComposition = (
+// Reflow page `index` into a new canvas size: its layers are fit-scaled and
+// recentred from the old canvas to the new one (via the shared
+// reflowCompositionLayers), then the page's dims are stamped. Pure: clones,
+// never mutates the input. Sibling pages keep their own sizes — a resize is a
+// per-page operation.
+export const reflowPage = (
   project: Project,
+  index: number,
   newW: number,
   newH: number,
 ): Project => {
-  const oldW = project.canvas_width;
-  const oldH = project.canvas_height;
   const next = cloneProject(project);
-  next.canvas_width = newW;
-  next.canvas_height = newH;
-  for (const page of next.pages) {
-    reflowCompositionLayers(page, oldW, oldH, newW, newH);
+  const page = next.pages[index];
+  if (!page) {
+    throw new Error(
+      `reflowPage: no page at index ${index} (project has ${next.pages.length})`,
+    );
   }
+  reflowCompositionLayers(page, page.canvas_width, page.canvas_height, newW, newH);
+  page.canvas_width = newW;
+  page.canvas_height = newH;
   return next;
 };
 
 type SetCanvasSizeArgs = { width?: unknown; height?: unknown };
 
+// Resizes the ACTIVE page only, like every other content tool — use
+// select_page to point it at a different one.
 const setCanvasSize: ProjectToolDispatch<SetCanvasSizeArgs> = (
   project,
   args,
@@ -6985,7 +7571,9 @@ const setCanvasSize: ProjectToolDispatch<SetCanvasSizeArgs> = (
       },
     };
   }
-  if (project.canvas_width === width && project.canvas_height === height) {
+  const index = clampActiveIndex(project);
+  const page = project.pages[index];
+  if (page.canvas_width === width && page.canvas_height === height) {
     return {
       project,
       result: {
@@ -6994,7 +7582,7 @@ const setCanvasSize: ProjectToolDispatch<SetCanvasSizeArgs> = (
       },
     };
   }
-  const next = reflowComposition(project, width, height);
+  const next = reflowPage(project, index, width, height);
   return {
     project: next,
     result: { ok: true, data: { canvas_width: width, canvas_height: height } },
@@ -7176,7 +7764,10 @@ const addPage: ProjectToolDispatch<AddPageArgs> = (project, args) => {
     page.id = crypto.randomUUID();
     if (name !== undefined) page.name = name;
   } else {
-    page = blankPage(project.canvas_width, project.canvas_height, name);
+    // A new page inherits the ACTIVE page's canvas — pages stay uniform until
+    // the user deliberately resizes one.
+    const from = pages[clampActiveIndex(project)];
+    page = blankPage(from.canvas_width, from.canvas_height, name);
   }
   const next = cloneProject(project);
   next.pages.push(page);
@@ -7357,7 +7948,10 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   update_audio_overlay: updateAudioOverlay as ToolDispatch<never>,
   set_video_layer_trim: setVideoLayerTrim as ToolDispatch<never>,
   set_layer_block: setLayerBlock as ToolDispatch<never>,
+  set_layer_transition: setLayerTransition as ToolDispatch<never>,
   move_band: moveBand as ToolDispatch<never>,
+  shift_group: shiftGroup as ToolDispatch<never>,
+  set_group_window: setGroupWindow as ToolDispatch<never>,
   set_duration: setDuration as ToolDispatch<never>,
   fit_duration_to_content: fitDurationToContent as ToolDispatch<never>,
   cut_range: cutRange as ToolDispatch<never>,
@@ -7377,6 +7971,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   set_video_clip: setVideoClip as ToolDispatch<never>,
   set_video_layer_muted: setVideoLayerMuted as ToolDispatch<never>,
   set_matte_source: setMatteSource as ToolDispatch<never>,
+  set_clip_speed: setClipSpeed as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
 };
@@ -7415,13 +8010,21 @@ export const isPureToolName = (name: string): boolean =>
 export interface PagesOverview {
   page_count: number;
   active_index: number;
-  pages: Array<{ index: number; name: string | null; has_video: boolean }>;
+  pages: Array<{
+    index: number;
+    name: string | null;
+    has_video: boolean;
+    canvas_width: number;
+    canvas_height: number;
+  }>;
   note: string;
 }
 
 // The agent-facing summary of a project's pages, attached to describe_video's
 // data. Pages are addressed by INDEX — page ids are internal storage keys,
-// never surfaced. Omitted for single-page projects (a plain "video").
+// never surfaced. Each page carries its own canvas dims, so they're listed here
+// too: an agent that resizes one page must not assume the others followed.
+// Omitted for single-page projects (a plain "video").
 export const pagesOverview = (project: Project): PagesOverview => ({
   page_count: project.pages.length,
   active_index: clampActiveIndex(project),
@@ -7429,9 +8032,11 @@ export const pagesOverview = (project: Project): PagesOverview => ({
     index,
     name: p.name ?? null,
     has_video: p.video_layers.length > 0,
+    canvas_width: p.canvas_width,
+    canvas_height: p.canvas_height,
   })),
   note:
-    "This project has multiple pages. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use select_page to move between pages, add_page / delete_page / reorder_pages to manage them, and set_canvas_size to resize every page at once.",
+    "This project has multiple pages, each with its OWN canvas size. Content tools (layers, keyframes, fills, …) target the ACTIVE page (active_index); use select_page to move between pages, add_page / delete_page / reorder_pages to manage them, and set_canvas_size to resize the active page (siblings keep their size).",
 });
 
 // Route one tool call against a pages-only project. Project-scoped tools
@@ -7465,6 +8070,60 @@ export const dispatchOnProject = (
   }
   if (!result.ok || edited === projection) return { project, result };
   return { project: writeCompositionBack(project, index, edited), result };
+};
+
+// Tools that can repoint a layer at DIFFERENT BYTES — the one edit class where
+// the previous state cannot be reconstructed from the project alone, because the
+// old asset only exists as a filename the document no longer mentions.
+//
+// The editor checkpoints a version before any of these run (see
+// `checkpointBeforeSourceSwap` in editor/src/store.ts). Listed here, in the pure
+// layer, so the store, the prompt-panel adapter and the call-site budget test
+// read ONE list rather than three that drift.
+//
+// `update_audio_overlay` is a general-purpose tool — gain, fades, trim — that
+// only sometimes carries a filename. Membership means "can swap a source", not
+// "always does", so callers must also check that the args actually change the
+// source field: `toolCallSwapsSource(name, args, project)` below.
+export const SOURCE_SWAP_TOOLS = [
+  "set_image_filename",
+  "set_video_clip",
+  "update_audio_overlay",
+] as const;
+
+const SOURCE_SWAP_TOOL_SET: ReadonlySet<string> = new Set(SOURCE_SWAP_TOOLS);
+
+// Would dispatching this call actually point a layer at a different asset?
+// False for a non-swap tool, for a swap tool whose args carry no source field,
+// and for one that re-sets the source it already has (a no-op the dispatchers
+// themselves early-return on) — so none of those mint a version.
+export const toolCallSwapsSource = (
+  name: string,
+  args: Record<string, unknown>,
+  project: Composition,
+): boolean => {
+  if (!SOURCE_SWAP_TOOL_SET.has(name)) return false;
+  if (name === "set_image_filename") {
+    const next = args.filename;
+    if (typeof next !== "string") return false;
+    const layer = project.image_layers.find(
+      (l) => `image.${l.id}` === args.elementId,
+    );
+    return layer !== undefined && layer.filename !== next;
+  }
+  if (name === "set_video_clip") {
+    const next = args.clip;
+    if (typeof next !== "string") return false;
+    const layer = project.video_layers.find(
+      (v) => `video.${v.id}` === args.elementId,
+    );
+    return layer !== undefined && layer.clip !== next;
+  }
+  // update_audio_overlay
+  const next = args.filename;
+  if (typeof next !== "string") return false;
+  const overlay = (project.audio_overlays ?? []).find((o) => o.id === args.id);
+  return overlay !== undefined && overlay.filename !== next;
 };
 
 export const TOOL_DEFINITIONS: ToolFunction[] = [
@@ -8034,7 +8693,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_text_background",
       description:
-        "Add or update the rounded background box behind a TEXT layer (text.<id>) in one call — sets the backdrop fill plus the box's padding, corner radius, and optional stroke. Pass only the fields you want to change. Pair with text_autofit \"hug\" (via set_layer_text) so the box shrink-wraps the text instead of using the layer's fixed frame — ideal for caption / sticker chips. Pass fill null to remove the box. Text layers only; for shapes/images/video use set_layer_fill.",
+        "Add or update the rounded background box behind a TEXT layer (text.<id>) in one call — sets the backdrop fill plus the box's padding, corner radius, and optional stroke. Pass only the fields you want to change. New text layers are already text_autofit \"hug\", so padding alone shrink-wraps the box to the text — ideal for caption / sticker chips; set_layer_text(text_autofit:\"hug\") is only needed when adding a box to an OLDER layer still on \"wrap\". THIS IS HOW YOU BUILD A BUTTON: a button / CTA / chip / tag / pill / labelled badge is ONE text layer with a native background, never a rounded-rect shape with a text layer parked on top — padding is what sizes the box around the label, so the two can't drift apart when the text or the scale changes and the user drags one layer instead of two. The one exception: the box is NOT painted on CURVED text (a straight box behind a bent line reads as broken), so an arc-shaped chip genuinely needs a shape behind it. Pass fill null to remove the box. Text layers only; for shapes/images/video use set_layer_fill.",
       parameters: {
         type: "object",
         properties: {
@@ -8234,7 +8893,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "group_layers",
       description:
-        "Wrap sibling elements in a new group. The group composes its x/y/scale/rotation/opacity onto its descendants and pivots rotate/scale at its (pivotX, pivotY), seeded to the centroid of its children at create time. The group's x/y track values are translation offsets applied around the pivot — groups have no static body of their own. All listed elementIds must currently share the same parent (root, or one existing group).",
+        "Wrap sibling elements in a new group. USE THIS whenever several layers are one thing — a butterfly assembled from wings + body + antennae, an icon built from primitives, a card + its title + badge, a lower-third — and name the group what the thing is; a multi-shape object left as loose siblings is a defect the user has to clean up, and the group's name is their only handle on it. The group composes its x/y/scale/rotation/opacity onto its descendants (so one track flies/spins/fades the whole thing) and pivots rotate/scale at its (pivotX, pivotY), seeded to the centroid of its children at create time. The group's x/y track values are translation offsets applied around the pivot — groups have no static body of their own. All listed elementIds must currently share the same parent (root, or one existing group).",
       parameters: {
         type: "object",
         properties: {
@@ -8523,6 +9182,53 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "set_layer_transition",
+      description:
+        "Set how a layer ENTERS at the start of its on-timeline window and LEAVES at the end, instead of popping. The transition is EDGE-RELATIVE — only a length and a look are stored — so it rides the edge through every later trim, slide or clip retime. Prefer this over fade_layer / apply_preset whenever the intent is 'enters and leaves nicely': those write opacity keyframes at ABSOLUTE frames, which strand themselves the moment the edge moves, and clutter the timeline lanes. A layer created WITH a `block` is born carrying a short fade at each edge — whether you passed the block or the editor minted one — so check `inspect_layers` before adding one, rather than assuming there is none. Layers created before this default existed, and any edge cleared to \"cut\", carry nothing and do need setting. A layer with NO block is always-present, has no edges, and a transition on it is inert. Video clips default to a hard cut, because a hard cut between shots is the grammar of short-form video. kind \"cut\" clears the edge back to a hard cut. The length is a request: when the window is too short to hold both ramps they are squeezed proportionally at render time, and the stored values are left intact.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description:
+              "Element id of the layer (image.<id>, video.<id>, text.<id>, shapes.<id>, or group.<id>).",
+          },
+          edge: {
+            type: "string",
+            enum: ["in", "out", "both"],
+            description:
+              "Which edge to set. \"in\" is the start of the layer's window, \"out\" the end.",
+          },
+          kind: {
+            type: "string",
+            enum: ["cut", "fade", "slide", "pop"],
+            description:
+              "The look. \"cut\" = hard edge (clears any transition). \"fade\" = opacity ramp. \"slide\" = travels in/out from a direction while fading. \"pop\" = scales up from 80% with an overshoot.",
+          },
+          frames: {
+            type: "number",
+            description:
+              "Ramp length in frames (30 fps). Default 6. Ignored for kind \"cut\".",
+          },
+          curve: {
+            type: "string",
+            description:
+              "Optional easing override (linear, easeIn, easeOut, easeInOut, outQuart, outExpo, outBack, inBack, inOutBack). Defaults suit the kind: entries decelerate in, exits accelerate away.",
+          },
+          direction: {
+            type: "string",
+            enum: ["left", "right", "up", "down"],
+            description:
+              "For kind \"slide\" only. On the IN edge this is where the layer comes FROM; on the OUT edge, where it goes TO. Default \"left\".",
+          },
+        },
+        required: ["elementId", "edge", "kind"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "move_band",
       description:
         "Place an embedded morpha band on the host timeline: set its TIME ORIGIN (the frame it starts). The band's whole inner reel plays relative to this frame, so its intro animations fire when the band appears instead of at 0:00 (the fix for 'the embedded intro doesn't animate'). Keeps the band's current window length; if it had none, the band spans from start to the composition end. Pass the band group's id (from describe_video — a group with morpha:true).",
@@ -8541,6 +9247,57 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
         },
         required: ["bandId", "start"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "shift_group",
+      description:
+        "MOVE a group and everything inside it along the timeline, keeping its internal timing intact — the 'slide this whole section later' operation. A plain group is a relative CONTAINER: it has no window of its own, so on the timeline it spans the hull of its contents, and moving it slides the whole subtree as one rigid body. `start` is the ABSOLUTE frame the group's window should end up at, not a delta, so calling it twice with the same value is a no-op. Descendants keep their spacing; the move stops when the earliest thing inside reaches frame 0. Welded caption lines are deliberately left behind (they follow their clip's speech, not this group), and an embedded morpha band moves as one unit. Fails when the group is empty or holds an always-present layer — there is no bounded window to move. To CLIP what is shown of a group rather than move it, use set_group_window; for a single layer use set_layer_block.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description: "The group's id (group.<id> or the bare <id>).",
+          },
+          start: {
+            type: "number",
+            description:
+              "ABSOLUTE frame the group's window should start at after the move (0-indexed, 30 fps) — not an offset.",
+          },
+        },
+        required: ["elementId", "start"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_group_window",
+      description:
+        "TRIM a group's own visible window — the [start, start+duration) range over which the group and its subtree are drawn. The contents are NOT moved or deleted: this clips what is shown, so use it to hide the head or tail of a whole section. Writing a window overrides the group's derived contents-hull from then on. Two safety corrections apply automatically: the group's OWN keyframes are compensated for the change in start so its animation doesn't jump (reported as keyframesCompensatedBy), and the duration is grown if needed so the window can never hide one of the group's own authored keyframes (reported as grownToCoverKeyframes). To MOVE the group and its contents instead, use shift_group.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: {
+            type: "string",
+            description: "The group's id (group.<id> or the bare <id>).",
+          },
+          start: {
+            type: "number",
+            description:
+              "First frame the group is drawn on, in its parent timeline (0-indexed, 30 fps).",
+          },
+          duration: {
+            type: "number",
+            description:
+              "How many frames the group stays drawn for (≥ 1). Grown automatically if it would hide the group's own keyframes.",
+          },
+        },
+        required: ["elementId", "start", "duration"],
       },
     },
   },
@@ -8577,7 +9334,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "cut_range",
       description:
-        "Ripple-delete a time window [startFrame, endFrame) — remove that span and pull all later content earlier by delta = endFrame - startFrame (the NLE 'ripple delete' / 'close gap'). Shifts every keyframe, colour keyframe, speed keyframe, marker, audio overlay, loop region, and start_at through the cut, and is SOURCE-AWARE for video layers: a clip that straddles the cut is trimmed, and one whose interior is removed is SPLIT into two layers. Audio overlays interior to the cut are truncated at the seam (overlays have no source-in to bridge the gap). REFUSES to cut across a video layer that carries speed-ramp keyframes — remove them, or cut outside that layer's span, first. The composition length shrinks accordingly (an authored length loses only the overlap with its visible region). Frames are 0-indexed project-timeline frames at 30 fps; endFrame is exclusive and clamped to the composition length.",
+        "Ripple-delete a time window [startFrame, endFrame) — remove that span and pull all later content earlier by delta = endFrame - startFrame (the NLE 'ripple delete' / 'close gap'). Shifts every keyframe, colour keyframe, marker, audio overlay, loop region, and start_at through the cut (a speed ramp is anchored to its clip and rides along unchanged), and is SOURCE-AWARE for video layers: a clip that straddles the cut is trimmed, and one whose interior is removed is SPLIT into two layers. Audio overlays interior to the cut are truncated at the seam (overlays have no source-in to bridge the gap). REFUSES to cut across a video layer that carries speed-ramp keyframes — remove them, or cut outside that layer's span, first. The composition length shrinks accordingly (an authored length loses only the overlap with its visible region). Frames are 0-indexed project-timeline frames at 30 fps; endFrame is exclusive and clamped to the composition length.",
       parameters: {
         type: "object",
         properties: {
@@ -9135,7 +9892,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_canvas_size",
       description:
-        "Resize the composition canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. On a multi-page project this resizes EVERY page — all pages share the dims and reflow by the same factor. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
+        "Resize the ACTIVE page's canvas to width × height pixels. The composition is scaled UNIFORMLY to fit the new frame (a single factor s = min(newW/oldW, newH/oldH), so nothing distorts — a circle stays a circle) and then re-centred so the old composition centre maps to the new canvas centre. Every layer's position, size, group pivots, and x/y/width/height keyframes follow this fit+recentre; same-aspect resizes scale exactly, aspect changes letterbox the content centred. Each page owns its size, so this leaves sibling pages untouched — select_page then set_canvas_size again to resize another one. Common sizes: 1080×1920 (9:16 Reels/TikTok/Shorts), 1080×1350 (4:5 Instagram), 1080×1080 (1:1 square), 1920×1080 (16:9 YouTube).",
       parameters: {
         type: "object",
         properties: {
@@ -9229,9 +9986,29 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
+      name: "set_clip_speed",
+      description:
+        "Play a clip slower or faster at a CONSTANT rate — the normal way to retime a clip. 1 = source speed, 0.5 = half speed, 2 = double speed; range [0.1, 8]. The trim is unchanged, so the clip's length on the timeline changes to suit: at 0.5x it occupies twice as many frames, at 2x half as many. Audio is time-stretched with pitch preserved. Use add_speed_keyframe instead only when the rate must CHANGE over the clip (a ramp).",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: { type: "string", description: "video.<id>." },
+          speed: {
+            type: "number",
+            description:
+              "Constant playback rate (1 = source speed, 0.5 = half, 2 = double), in [0.1, 8].",
+          },
+        },
+        required: ["elementId", "speed"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_speed_keyframe",
       description:
-        "Add or overwrite a speed-ramp (time-remap) keyframe on a video layer. `rate` is the playback rate at `frame`: 1 = real-time, 0.5 = half-speed, 2 = double-speed. Range: rate in [0.1, 8].",
+        "Add or overwrite a speed-ramp (time-remap) keyframe on a video layer, for a rate that CHANGES over the clip. `frame` is a PROJECT-timeline frame and must sit on the clip (at or after its timeline_start_frame); the curve itself is anchored to the clip, so moving the clip carries the ramp with it and never changes its duration. For a constant slower/faster clip use set_clip_speed instead. `rate` is the playback rate at `frame`: 1 = real-time, 0.5 = half-speed, 2 = double-speed. Range: rate in [0.1, 8]. The ramp multiplies the layer's constant speed, and the clip's timeline length is derived from the resulting curve.",
       parameters: {
         type: "object",
         properties: {
@@ -9251,7 +10028,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "remove_speed_keyframe",
       description:
-        "Remove the speed-ramp keyframe at `frame` on a video layer. Removing the last keyframe clears the speed_keyframes array entirely (restoring 1× playback).",
+        "Remove the speed-ramp keyframe at `frame` (a PROJECT-timeline frame — the same value add_speed_keyframe and inspect_layers report) on a video layer. Removing the last keyframe clears the speed_keyframes array entirely (restoring 1× playback).",
       parameters: {
         type: "object",
         properties: {

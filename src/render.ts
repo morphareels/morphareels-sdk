@@ -8,6 +8,9 @@ export interface RenderFrameOptions {
   projectId: string;
   /** Composition frame (0-indexed, 30 fps). Default 0. */
   frame?: number;
+  /** 0-based page index for multi-page projects. Default: the project's
+   * active page. Out of range is the caller's error — the render reports it. */
+  page?: number;
   /** Origin serving /render-canvas + /api/project + /clips. Default https://morphareels.ai */
   origin?: string;
   /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
@@ -39,6 +42,34 @@ export interface RenderFrameOptions {
   cacheDir?: string;
 }
 
+/** `&page=N` query fragment, or "" when no page was asked for. Fail-fast on a
+ * non-index value — the headless routes treat out-of-range as caller error,
+ * so a fractional or negative index should never reach the wire. */
+const pageQuery = (page: number | undefined): string => {
+  if (page === undefined) return "";
+  if (!Number.isInteger(page) || page < 0) {
+    throw new Error(`page must be a 0-based page index, got ${page}`);
+  }
+  return `&page=${page}`;
+};
+
+/** URL for the /render-canvas headless route (one composited frame). */
+export const renderCanvasUrl = (
+  origin: string,
+  projectId: string,
+  frame: number,
+  page?: number,
+): string =>
+  `${origin}/render-canvas?project=${encodeURIComponent(projectId)}&frame=${frame}${pageQuery(page)}`;
+
+/** URL for the /render-export headless route (full MP4 encode). */
+export const renderExportUrl = (
+  origin: string,
+  projectId: string,
+  page?: number,
+): string =>
+  `${origin}/render-export?project=${encodeURIComponent(projectId)}${pageQuery(page)}`;
+
 /**
  * Render one composited frame to a PNG Buffer. The video frame is decoded and
  * every overlay (captions/shapes/text) composited by a REAL browser — no
@@ -60,6 +91,8 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
   const width = Math.max(64, Math.round(opts.width ?? 1080));
   const height = Math.max(64, Math.round(opts.height ?? 1920));
   const timeout = opts.timeoutMs ?? 90_000;
+  // Built before the browser launches so an invalid page index fails fast.
+  const url = renderCanvasUrl(origin, opts.projectId, frame, opts.page);
 
   const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
@@ -72,7 +105,6 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
       await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = ctx.pages()[0] ?? (await ctx.newPage());
-    const url = `${origin}/render-canvas?project=${encodeURIComponent(opts.projectId)}&frame=${frame}`;
     // `domcontentloaded`, not `networkidle`: a <video preload="auto"> streaming
     // a large non-faststart clip keeps the network busy well past the 500ms
     // idle window, which would block (or time out) goto before the page can
@@ -147,6 +179,11 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
 export interface RenderVideoOptions {
   /** Project id, served at `${origin}/render-export?project=<id>`. */
   projectId: string;
+  /** 0-based page index for multi-page projects — loop the pages to get one
+   * MP4 per page (the editor's "Videos" export card, scripted). Default: the
+   * project's active page. Out of range is the caller's error — the render
+   * reports it. */
+  page?: number;
   /** Origin serving /render-export + /api/project + /clips. Default https://morphareels.ai */
   origin?: string;
   /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
@@ -191,6 +228,8 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
   }
   const origin = opts.origin ?? "https://morphareels.ai";
   const timeout = opts.timeoutMs ?? 600_000;
+  // Built before the browser launches so an invalid page index fails fast.
+  const url = renderExportUrl(origin, opts.projectId, opts.page);
 
   const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
@@ -203,7 +242,6 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
       await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
     }
     const page = ctx.pages()[0] ?? (await ctx.newPage());
-    const url = `${origin}/render-export?project=${encodeURIComponent(opts.projectId)}`;
     await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
     try {

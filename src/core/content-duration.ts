@@ -118,9 +118,11 @@ export const computeContentDurationFrames = (
   for (const layer of project.video_layers ?? []) {
     const end = videoEndFrames(layer, opts.videoNaturalSeconds?.(layer));
     if (end > frames) frames = end;
-    for (const sk of layer.speed_keyframes ?? []) {
-      if (sk.frame + 1 > frames) frames = sk.frame + 1;
-    }
+    // Speed keyframes must NOT extend the comp. They are a property OF the
+    // clip, and the clip's extent is its (now retimed) window — which a
+    // speed-up makes SHORTER than the absolute frames its own keyframes sit at.
+    // Counting them would pin the comp past the last frame of picture and leave
+    // a black tail that "length always fits the content" says can't exist.
   }
 
   // Audio overlays.
