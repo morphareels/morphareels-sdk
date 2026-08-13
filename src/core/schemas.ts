@@ -626,6 +626,15 @@ export const resolveSpeedKeyframes = (
   return list;
 };
 
+// Default on-timeline length of a freshly added layer OR a frozen frame, in
+// frames. Every NLE gives a still a default duration rather than making it span
+// the sequence — Premiere / Resolve 5 s, Final Cut ~4 s, CapCut ~3 s. 5 s @30fps.
+// Layer-AGNOSTIC on purpose: an image, a shape, a text layer and a freeze are
+// all clips and all get the SAME number. Never fork a per-kind copy of this.
+// `defaultBlockOnAdd` (editor/src/clip-snap.ts) is the playhead-aware function
+// over it; `freeze_frame` uses the raw constant (it has an explicit frame).
+export const LAYER_CLIP_DEFAULT_FRAMES = 150;
+
 // Legal bounds for a playback rate, shared by the scalar `speed`, the ramp
 // keyframes, and every clamp below. A rate of 0 would consume no source at all
 // (an infinitely long clip), so the floor is deliberately > 0.

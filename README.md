@@ -21,6 +21,8 @@ const [{ id }] = await morpha.listProjects();                 // typed workspace
 await morpha.uploadImage(id, { url: "https://example.com/logo.png" }); // ingest, then reference by filename
 await morpha.callTool(id, "add_image_layer", { filename: "logo.png", x: 540, y: 600, width: 300, height: 300 });
 await morpha.saveVersion(id, { name: "add logo" });          // snapshot the change-set
+// restoreVersion(id, versionId) replaces the whole project (auto-checkpointed);
+// restoreVersion(id, versionId, { pageIndex }) reverts just one page.
 
 const png = await morpha.renderFrame(id, 150); // a composited PNG, no ffmpeg
 const mp4 = await morpha.renderVideo(id);      // the full composition as MP4, no ffmpeg

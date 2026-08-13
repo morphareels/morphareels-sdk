@@ -46,6 +46,7 @@ import {
   fillSchema,
   findLayerByElementId,
   findParentGroup,
+  getAncestorGroupChain,
   isCaptionLineElement,
   layerOf,
   deriveGroupStart,
@@ -79,6 +80,7 @@ import {
   type LayerStyle,
   MIN_SPEED,
   MAX_SPEED,
+  LAYER_CLIP_DEFAULT_FRAMES,
   layerSpeed,
   sourceFrameAtTimelineOffset,
   type LoopPass,
@@ -425,40 +427,17 @@ const childBaseCenter = (
 export const LAYER_ID_FORMAT = /^[0-9a-f]{6}$/;
 export const BACKGROUND_LAYER_ID = "background";
 
-export type LayerKind = "image" | "video" | "text" | "shapes" | "group";
-
-const allLayerIdsForKind = (project: Composition, kind: LayerKind): Set<string> => {
-  const out = new Set<string>();
-  const arr =
-    kind === "image"
-      ? project.image_layers
-      : kind === "video"
-        ? project.video_layers
-        : kind === "text"
-          ? project.text_layers
-          : kind === "shapes"
-            ? project.shapes
-            : project.groups;
-  for (const l of arr) out.add(l.id);
-  return out;
-};
-
-export const generateLayerId = (project: Composition, kind: LayerKind): string => {
-  const existing = allLayerIdsForKind(project, kind);
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const buf = new Uint8Array(3);
-    crypto.getRandomValues(buf);
-    const id = Array.from(buf)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    if (!existing.has(id)) return id;
-  }
-  // 100 collisions in a row on a 16M-id space is astronomically unlikely;
-  // throw rather than spin forever if the rng is broken.
-  throw new Error(
-    `generateLayerId: 100 collisions on ${kind} (existing=${existing.size})`,
-  );
-};
+// Layer-id minting moved to src/clip-split.ts (the razor mints the right
+// half's id there). Imported — not just re-exported — because this module uses
+// both throughout (`export … from` creates no local binding); re-exported so
+// existing importers keep working.
+import {
+  generateLayerId,
+  insertElementAfter,
+  splitClipAt,
+  type LayerKind,
+} from "./clip-split.ts";
+export { generateLayerId, type LayerKind };
 
 // Rewrite every reference to `oldElementId` so they point at `newElementId`.
 // Mutates `project` in place — call on a cloned project. Covers every
@@ -6240,6 +6219,230 @@ const setClipSpeed: ToolDispatch<SetClipSpeedArgs> = (project, args) => {
   return { project: next, result: { ok: true, data: { elementId, speed } } };
 };
 
+// Push everything at or after `at` later by `delta` — the INSERT half of an
+// edit that adds time. Every kind of thing that sits on the timeline moves:
+// clips, bounded layers, audio overlays and welded captions. Shifting only
+// `video_layers` was the first version of this and it silently left music,
+// captions and every bounded overlay behind.
+//
+// `skip` names layers the caller has already positioned itself. Anything that
+// STRADDLES `at` is deliberately untouched — it was already on screen when the
+// insert began, so moving it would tear it away from what it was over.
+const shiftTimelineAt = (
+  project: Composition,
+  at: number,
+  delta: number,
+  skip: ReadonlySet<string>, // ELEMENT ids ("image.ab12"), not bare ids
+): void => {
+  if (delta === 0) return;
+  // A layer nested under an embedded morpha BAND lives in the band's own
+  // timeline: its `block.start` / `timeline_start_frame` are BAND-LOCAL (see
+  // `ancestorBandOriginSum` / `effectiveFrameOffset`), so comparing them
+  // against a host-timeline frame is category confusion, and inserting host
+  // time never moves them — the BAND is the thing on the host timeline, and it
+  // shifts (or straddles) as one unit via its own block below. Shifting a band
+  // child too would double-shift it, leaving it painting at no frame.
+  const bandNested = (elementId: string): boolean => {
+    for (const gid of getAncestorGroupChain(project, elementId)) {
+      const g = layerOf(project, `group.${gid}`);
+      if (g && isMorphaGroup(g as Group)) return true;
+    }
+    return false;
+  };
+  for (let i = 0; i < project.video_layers.length; i++) {
+    const l = project.video_layers[i];
+    const eid = `video.${l.id}`;
+    if (skip.has(eid) || bandNested(eid)) continue;
+    if (l.timeline_start_frame >= at) {
+      project.video_layers[i] = {
+        ...l,
+        timeline_start_frame: l.timeline_start_frame + delta,
+      };
+    }
+  }
+  // Bounded layers of every other kind — image / text / shape / group. A
+  // welded caption line is skipped even if it carries a block: its window is
+  // DERIVED from its clip's trim (deriveCaptionWindow), and that clip has
+  // already moved — same reason cut_range's remap excludes `caption_source`
+  // layers.
+  const bounded: Array<
+    [
+      string,
+      Array<{
+        id: string;
+        block?: { start: number; duration: number };
+        caption_source?: unknown;
+      }>,
+    ]
+  > = [
+    ["image", project.image_layers],
+    ["text", project.text_layers],
+    ["shapes", project.shapes],
+    ["group", project.groups],
+  ];
+  for (const [kind, arr] of bounded) {
+    for (let i = 0; i < arr.length; i++) {
+      const l = arr[i];
+      const eid = `${kind}.${l.id}`;
+      if (skip.has(eid) || l.caption_source || bandNested(eid)) continue;
+      if (l.block && l.block.start >= at) {
+        (arr[i] as { block?: { start: number; duration: number } }) = {
+          ...(arr[i] as object),
+          block: { ...l.block, start: l.block.start + delta },
+        } as never;
+      }
+    }
+  }
+  // Audio overlays. A WELDED overlay derives its timing from its clip, which
+  // has already moved, so only a STANDALONE one (music, voiceover) is shifted
+  // here — moving both would double the shift.
+  for (let i = 0; i < (project.audio_overlays ?? []).length; i++) {
+    const o = project.audio_overlays[i];
+    if (o.sourceLayerId) continue;
+    if (o.startFrame >= at) {
+      project.audio_overlays[i] = {
+        ...o,
+        startFrame: o.startFrame + delta,
+        ...(o.endFrame != null ? { endFrame: o.endFrame + delta } : {}),
+      };
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// freeze_frame — split at a frame and hold it as a still IMAGE
+// ---------------------------------------------------------------------------
+
+type FreezeFrameArgs = {
+  elementId: string;
+  frame: number;
+  image: string;
+  holdFrames?: number;
+};
+
+// Freeze the picture at `frame`: the clip is cut there and a STILL of that frame
+// is inserted between the halves, pushing everything after it later. The NLE
+// "frame hold".
+//
+// The still is an IMAGE LAYER, not a frozen video layer. That is the whole
+// design, and it is the third attempt: a video layer's geometry is maintained
+// through its TRIM by every operation that touches it — both Timeline handles,
+// `cut_range`, the razor — so giving a clip a SECOND notion of length
+// desynchronises the moment anything moves it. (Reading `source_out_frame` as a
+// duration broke four consumers; putting the length in `block` made a moved
+// still paint zero frames, because the block gate and the clip-window gate went
+// disjoint.) An image layer has ONE notion of length — its block — and every op
+// already handles it correctly, so nothing has to learn that stills exist.
+//
+// `image` is the filename of a PNG of that frame, already uploaded to the
+// project's assets. Rendering it needs the browser's compositor, so the editor
+// captures and uploads first, then calls this — the same split `add_image_layer`
+// already uses (it does not verify the file exists either).
+//
+// The CUT half is `splitClipAt` — the same razor the editor's scissors is a
+// wrapper over — so a freeze carries everything a split carries (retimed cut
+// point, speed-ramp rebase, lane weld, adjacent z-placement, welded-audio
+// re-weld, caption re-anchor) by construction, not by re-implementation. A
+// natural-end clip (`source_out_frame` null) is treated as unbounded on the
+// right, same as `cut_range` / `splitClipAt`; the editor, which can decode the
+// real duration, guards the end before calling.
+const freezeFrame: ToolDispatch<FreezeFrameArgs> = (project, args) => {
+  const { elementId, frame, image, holdFrames } = args;
+  if (!elementId || !elementId.startsWith("video.")) {
+    return { project, result: { ok: false, error: "elementId must be video.<id>" } };
+  }
+  if (!image || typeof image !== "string") {
+    return {
+      project,
+      result: { ok: false, error: "image is required — the uploaded PNG of the frozen frame" },
+    };
+  }
+  const src = project.video_layers.find(
+    (v) => v.id === elementId.slice("video.".length),
+  );
+  if (!src) {
+    return { project, result: { ok: false, error: `video layer not found: ${elementId}` } };
+  }
+  const hold = Math.round(holdFrames ?? LAYER_CLIP_DEFAULT_FRAMES);
+  if (!Number.isFinite(hold) || hold < 1) {
+    return { project, result: { ok: false, error: `invalid holdFrames: ${holdFrames}` } };
+  }
+  const at = Math.round(frame);
+
+  // 1. THE CUT — the shared razor. On refusal nothing has been touched.
+  const next = cloneProject(project);
+  const split = splitClipAt(next, elementId, at, src.source_out_frame);
+  if (!split.ok) {
+    return {
+      project,
+      result: { ok: false, error: `${split.error} — move the playhead into the clip` },
+    };
+  }
+  // The SOURCE frame on screen at the cut — on a retimed clip this is not
+  // `at - start`, and it is the frame the caller must have rendered.
+  const frozenSource = split.cutSourceFrame;
+
+  // 2. THE STILL — an ordinary bounded image clip, matching the source clip's
+  // geometry so the freeze is visually seamless.
+  const stillId = generateLayerId(next, "image");
+  const still: ImageLayer = {
+    id: stillId,
+    filename: image,
+    x: src.x,
+    y: src.y,
+    width: src.width,
+    height: src.height,
+    rotation: src.rotation,
+    pivotX: src.pivotX,
+    pivotY: src.pivotY,
+    fill: null,
+    // A hard cut in and out: a freeze is a cut, not a dissolve, and the born
+    // defaults would otherwise fade it.
+    block: { start: at, duration: hold },
+  };
+  next.image_layers = [...next.image_layers, still];
+  // Between the halves: the razor placed the remainder directly after the left
+  // half (in the parent group's children or layer_order), so inserting the
+  // still after the left half reads left → still → remainder, at the clip's own
+  // z — and each id appears exactly ONCE (the first version materialized the
+  // root order AFTER pushing the new layers, which listed them twice).
+  insertElementAfter(next, elementId, `image.${stillId}`);
+
+  // 3. THE INSERT — everything starting at or after the cut moves later by the
+  // hold: the remainder (the razor left it flush at the cut), other clips,
+  // bounded layers, standalone audio. Welded captions and welded overlays
+  // derive their timing from their clip, so they follow it; anything that
+  // STRADDLES the cut is left alone — it was already on screen when the freeze
+  // began. Only the still is pre-positioned.
+  shiftTimelineAt(next, at, hold, new Set([`image.${stillId}`]));
+  // The welded overlay the razor copied onto the remainder recorded the
+  // remainder's PRE-shift file-time origin. Vestigial while welded (timing
+  // derives from the clip), but keep it sensible for a later detach.
+  for (let i = 0; i < (next.audio_overlays ?? []).length; i++) {
+    const o = next.audio_overlays[i];
+    if (o.sourceLayerId === split.rightEid) {
+      next.audio_overlays[i] = {
+        ...o,
+        startFrame: Math.max(0, at + hold - frozenSource),
+      };
+    }
+  }
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: {
+        elementId,
+        frozenAt: at,
+        frozenSourceFrame: frozenSource,
+        holdFrames: hold,
+        still: `image.${stillId}`,
+        remainder: split.rightEid,
+      },
+    },
+  };
+};
+
 // ---------------------------------------------------------------------------
 // add_speed_keyframe / remove_speed_keyframe — video time-remap curve
 // ---------------------------------------------------------------------------
@@ -7972,6 +8175,7 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   set_video_layer_muted: setVideoLayerMuted as ToolDispatch<never>,
   set_matte_source: setMatteSource as ToolDispatch<never>,
   set_clip_speed: setClipSpeed as ToolDispatch<never>,
+  freeze_frame: freezeFrame as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
 };
@@ -9980,6 +10184,36 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
         },
         required: ["elementId", "matte_source_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "freeze_frame",
+      description:
+        "Freeze the picture at a frame: the clip is CUT there and a still of that frame is inserted between the halves, pushing everything after it later (the NLE 'frame hold'). This is how you hold a moment — play, freeze, continue. The still is an ordinary IMAGE layer showing that frame for `holdFrames` (default 150 = 5s at 30fps), so you resize, split, move or delete it like any other layer. `image` is the filename of a PNG of that frame, already uploaded to the project's assets — rendering one needs a browser, so capture and upload it first. The reply's `frozenSourceFrame` is the SOURCE frame that was frozen, which differs from `frame` on a retimed clip. `frame` must be strictly inside the clip.",
+      parameters: {
+        type: "object",
+        properties: {
+          elementId: { type: "string", description: "video.<id> to freeze." },
+          frame: {
+            type: "number",
+            description:
+              "Project-timeline frame to freeze at — must be strictly inside the clip.",
+          },
+          image: {
+            type: "string",
+            description:
+              "Filename of an already-uploaded PNG of the frozen frame, in the project's assets.",
+          },
+          holdFrames: {
+            type: "number",
+            description:
+              "How long the still holds, in frames. Defaults to 150 (5s at 30fps), the same default every added clip gets.",
+          },
+        },
+        required: ["elementId", "frame", "image"],
       },
     },
   },

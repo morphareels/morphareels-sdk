@@ -193,6 +193,12 @@ export interface MorphaClient {
   restoreVersion(
     projectId: string,
     versionId: string,
+    opts?: {
+      /** 0-based index into the project's CURRENT pages. Restores only that
+       * page from the version (matched by stable page id); omit to restore
+       * the whole project (which auto-checkpoints the overwritten state). */
+      pageIndex?: number;
+    },
   ): Promise<{ restored: string; name: string; version_number?: number }>;
   renameVersion(
     projectId: string,
@@ -798,8 +804,11 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       };
       return data.versions;
     },
-    restoreVersion: async (projectId, versionId) =>
-      (await serverData("restore_version", projectId, { versionId })) as {
+    restoreVersion: async (projectId, versionId, opts) =>
+      (await serverData("restore_version", projectId, {
+        versionId,
+        ...(opts?.pageIndex !== undefined ? { page_index: opts.pageIndex } : {}),
+      })) as {
         restored: string;
         name: string;
         version_number?: number;
