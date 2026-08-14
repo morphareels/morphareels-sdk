@@ -115,7 +115,7 @@ export interface MorphaClient {
   listProjects(opts?: {
     workspaceId?: string;
   }): Promise<
-    Array<{ id: string; name: string | null; editorUrl: string; ownerEmail?: string | null }>
+    Array<{ id: string; name: string; editorUrl: string; ownerEmail?: string | null }>
   >;
   /** The workspaces (shared team spaces) the account belongs to. `role` is the
    *  caller's role; only owner/admin/editor can add projects. Use `id` as the
@@ -126,7 +126,7 @@ export interface MorphaClient {
     Array<{ id: string; name: string; role: string; memberCount: number }>
   >;
   /** A deep link that opens a project in the editor. */
-  openProject(projectId: string): Promise<{ name: string | null; editorUrl: string }>;
+  openProject(projectId: string): Promise<{ name: string; editorUrl: string }>;
   /** Create a new project (optionally cloning `fromProjectId`, or placing it in
    *  a workspace via `workspaceId`). The id is an opaque v4 UUID minted
    *  server-side and returned as `projectId` — you never choose it; refer to the
@@ -719,7 +719,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       )) as {
         projects: Array<{
           id: string;
-          name: string | null;
+          name: string;
           editorUrl: string;
           ownerEmail?: string | null;
         }>;
@@ -739,7 +739,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     },
     openProject: async (projectId) =>
       (await serverData("open_project", projectId)) as {
-        name: string | null;
+        name: string;
         editorUrl: string;
       },
     createProject: async (opts = {}) =>

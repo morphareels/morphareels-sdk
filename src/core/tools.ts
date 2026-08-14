@@ -18,6 +18,7 @@
 //   - "shapes.<id>"     — shape layers
 //   - "group.<id>"      — layer groups (transform composes onto descendants)
 import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
+import { formatClockLabel } from "./clock-time.ts";
 // Cross-tree import: the font catalogues live in editor/src/ (the editor is
 // their primary consumer); the agent-facing list_fonts tool reuses them so
 // every source the picker knows about is also discoverable via MCP.
@@ -6387,6 +6388,10 @@ const freezeFrame: ToolDispatch<FreezeFrameArgs> = (project, args) => {
   const stillId = generateLayerId(next, "image");
   const still: ImageLayer = {
     id: stillId,
+    // Label by the timeline moment, in clock time — without a name the
+    // Timeline/Inspector would fall back to the asset filename, which carries
+    // a raw source-frame count (never user-facing).
+    name: `Freeze ${formatClockLabel(at)}`,
     filename: image,
     x: src.x,
     y: src.y,
