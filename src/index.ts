@@ -41,8 +41,12 @@ export type { CaptionLine, TranscriptWordLike } from "./core/captions.ts";
 // ── Rendering (real local browser, no ffmpeg, no server) ────────────────────
 // renderFrame → one composited PNG; renderVideo → the full MP4 (the same
 // in-browser WebCodecs pipeline the editor's Render button uses).
-export { renderFrame, renderVideo } from "./render.ts";
-export type { RenderFrameOptions, RenderVideoOptions } from "./render.ts";
+export { renderFrame, renderFrames, renderVideo } from "./render.ts";
+export type {
+  RenderFrameOptions,
+  RenderFramesOptions,
+  RenderVideoOptions,
+} from "./render.ts";
 
 // ── Processing (real local browser) — proxy / audio split / transcription /
 // OCR / object detection for an uploaded clip. The agent-flow way to make a

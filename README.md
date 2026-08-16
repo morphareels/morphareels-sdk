@@ -93,6 +93,14 @@ Rendering decodes the video and composites every overlay in a **real browser** (
 npm i playwright   # optional peer dep; only needed for renderFrame()
 ```
 
+**Sampling several frames? Use `renderFrames`.** One browser, one project fetch, one clip download — `renderFrame` in a loop pays for all three per frame:
+
+```ts
+const [start, middle, end] = await morpha.renderFrames(id, [0, 150, 300]);
+```
+
+Same pixels as the one-at-a-time path; the saving is the fixed per-frame cost, so it grows with the number of frames. Measured against production: 5 frames of a 2 MB clip 8.3s → 5.5s, 10 frames of an 8 MB clip 18.8s → 9.9s.
+
 ## Export MP4 without ffmpeg
 
 `renderVideo()` exports the full composition to MP4 — the same in-browser WebCodecs H.264 pipeline the editor's Render button uses, driven by a real local browser. No ffmpeg dependency, no GPL, no server.

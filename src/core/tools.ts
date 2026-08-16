@@ -868,6 +868,7 @@ export const inlineMorpha = (
     {
       id: bandId,
       name: displayName,
+      opacity: 1,
       pivotX: next.canvas_width / 2,
       pivotY: next.canvas_height / 2,
       x: 0,
@@ -1747,10 +1748,13 @@ type MoveLayerArgs = {
   width?: number;
   height?: number;
   rotation?: number;
+  scale?: number;
+  opacity?: number;
+  clear_animation?: unknown;
 };
 
 const moveLayer: ToolDispatch<MoveLayerArgs> = (project, args) => {
-  const { elementId, x, y, width, height, rotation } = args;
+  const { elementId, x, y, width, height, rotation, scale, opacity } = args;
   if (!elementId || typeof elementId !== "string") {
     return { project, result: { ok: false, error: "elementId is required" } };
   }
@@ -1769,8 +1773,44 @@ const moveLayer: ToolDispatch<MoveLayerArgs> = (project, args) => {
   if (height !== undefined && (!Number.isFinite(height) || height <= 0)) {
     return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
+  if (scale !== undefined && (!Number.isFinite(scale) || scale <= 0)) {
+    return { project, result: { ok: false, error: `invalid scale: ${scale}` } };
+  }
+  if (opacity !== undefined && !Number.isFinite(opacity)) {
+    return { project, result: { ok: false, error: `invalid opacity: ${opacity}` } };
+  }
 
   const next = cloneProject(project);
+
+  // `scale` and `opacity` live on every layer record (leaf and group alike), so
+  // they are written ONCE here rather than in each per-kind branch below. Same
+  // rule as set_layer_fill: a keyframe track beats the static base at every
+  // frame, so writing a base under a live track would be invisible — refuse it,
+  // and name the two ways forward.
+  const baseTarget = findLayerByElementId(next, elementId);
+  for (const [prop, value] of [
+    ["scale", scale],
+    ["opacity", opacity],
+  ] as const) {
+    if (value === undefined || !baseTarget) continue;
+    const keyframes = baseTarget.animations?.[prop]?.length ?? 0;
+    if (keyframes > 0 && args.clear_animation !== true) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error:
+            `${elementId}'s ${prop} is ANIMATED (${keyframes} keyframe` +
+            `${keyframes === 1 ? "" : "s"}); setting a static ${prop} would be ` +
+            `invisible because the animation wins at every frame. Either change ` +
+            `it at a frame with add_keyframe, or pass clear_animation: true to ` +
+            `replace the animation with this value.`,
+        },
+      };
+    }
+    if (keyframes > 0 && baseTarget.animations) delete baseTarget.animations[prop];
+    baseTarget[prop] = value;
+  }
 
   if (elementId.startsWith("image.")) {
     const id = elementId.slice("image.".length);
@@ -2498,6 +2538,9 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   const layer: ImageLayer = {
     id,
     filename,
+    // Base transform identity; see perElementDataFields.
+    scale: 1,
+    opacity: 1,
     x,
     y,
     width,
@@ -2558,6 +2601,8 @@ const addVideoLayer: ToolDispatch<AddVideoLayerArgs> = (project, args) => {
   const layer: VideoLayer = {
     id,
     clip,
+    scale: 1,
+    opacity: 1,
     ...(name && name.length > 0 ? { name } : {}),
     x,
     y,
@@ -2645,6 +2690,8 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
   const shape: Shape = {
     id,
     kind: kind as ShapeKind,
+    scale: 1,
+    opacity: 1,
     // (x, y) is the CENTRE of the shape's bounding box — default to canvas
     // centre when the caller omits a position.
     x: x ?? next.canvas_width / 2,
@@ -2732,6 +2779,8 @@ const addCurve: ToolDispatch<AddCurveArgs> = (project, args) => {
   const shape: Shape = {
     id,
     kind: "curve",
+    scale: 1,
+    opacity: 1,
     x: fit.x,
     y: fit.y,
     width: fit.width,
@@ -4323,6 +4372,7 @@ const groupLayers: ToolDispatch<GroupLayersArgs> = (project, args) => {
     {
       id: newId,
       name: name ?? "",
+      opacity: 1,
       pivotX,
       pivotY,
       x: 0,
@@ -6563,6 +6613,8 @@ const freezeFrame: ToolDispatch<FreezeFrameArgs> = (project, args) => {
   const stillId = generateLayerId(next, "image");
   const still: ImageLayer = {
     id: stillId,
+    scale: 1,
+    opacity: 1,
     // Label by the timeline moment, in clock time — without a name the
     // Timeline/Inspector would fall back to the asset filename, which carries
     // a raw source-frame count (never user-facing).
@@ -7198,6 +7250,8 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
 
   const layer: TextLayer = {
     id,
+    scale: 1,
+    opacity: 1,
     text: typeof text === "string" ? text : "",
     x: typeof x === "number" ? x : next.canvas_width / 2,
     y: typeof y === "number" ? y : next.canvas_height / 2,
@@ -8545,7 +8599,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "move_layer",
       description:
-        "Set static position/size/rotation of a layer. Writes x/y/w/h/rotation directly on image.<id>, video.<id>, and shapes.<id>; for group.<id> sets pivotX/pivotY (no width/height/rotation — use add_keyframe for group rotation). Note: when a layer has an x / y / rotation keyframe track, the track OVERRIDES the static value at every frame with a keyframe — use add_keyframe to animate, move_layer to set the un-animated default.",
+        "Set a layer's static base transform. Writes x/y/w/h/rotation directly on image.<id>, video.<id>, and shapes.<id>; for group.<id> sets pivotX/pivotY (no width/height/rotation — use add_keyframe for group rotation). Also sets `scale` and `opacity`, which every layer kind carries. Note: when a layer has a keyframe track for a property, the track OVERRIDES the static value at every frame — use add_keyframe to animate, move_layer to set the un-animated default. A scale/opacity write over an existing track is REFUSED for that reason; pass clear_animation:true to replace the animation with the static value.",
       parameters: {
         type: "object",
         properties: {
@@ -8566,6 +8620,18 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           width: { type: "number", description: "Width in px (must be > 0)." },
           height: { type: "number", description: "Height in px (must be > 0)." },
           rotation: { type: "number", description: "Rotation in degrees, clockwise." },
+          scale: {
+            type: "number",
+            description: "Uniform scale multiplier about the layer's pivot. 1 = natural size. Every layer kind carries it.",
+          },
+          opacity: {
+            type: "number",
+            description: "Layer opacity, 0..1 (values outside are allowed and clamp at paint time). Composes with any ancestor group's opacity.",
+          },
+          clear_animation: {
+            type: "boolean",
+            description: "Only meaningful when setting `scale` / `opacity` on a layer where that property is animated. true = the static value REPLACES the keyframe track. Omitted / false = the call is refused rather than writing a value the animation would hide.",
+          },
         },
         required: ["elementId"],
       },

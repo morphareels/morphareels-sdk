@@ -79,22 +79,53 @@ export const renderExportUrl = (
  * needs the OS decoder, i.e. macOS/Windows). Requires `playwright` installed
  * (optional peer dependency) and Google Chrome available on the machine.
  */
-export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => {
+export interface RenderFramesOptions extends Omit<RenderFrameOptions, "frame"> {
+  /** Composition frames (0-indexed, 30 fps), rendered in the order given. */
+  frames: number[];
+}
+
+/**
+ * Render SEVERAL frames of one project, in one browser, with one project fetch
+ * and one clip load.
+ *
+ * `renderFrame` in a loop pays for a browser launch, a document load, a project
+ * fetch, a font load and a full clip download PER FRAME. Here the page loads
+ * once and is asked to re-seek, so the second and subsequent frames cost a seek
+ * and a repaint.
+ *
+ * Measured against production, batch first so a warm profile could not flatter
+ * the comparison: 5 frames of a 2 MB clip, 8.3s -> 5.5s (1.5x); 10 frames of an
+ * 8 MB clip, 18.8s -> 9.9s (1.9x). The seek itself is the floor and both paths
+ * pay it, so the saving is the fixed per-frame cost and grows with the number
+ * of frames — worth reaching for when sampling a strip, not a reason to batch
+ * two.
+ *
+ * Falls back to a per-frame navigation when the page cannot re-seek — an older
+ * deployment that predates `__morphaRenderAt`, or a layer served by an injected
+ * frame image, which is one frame by construction. The result is identical
+ * either way; only the time differs.
+ */
+export const renderFrames = async (
+  opts: RenderFramesOptions,
+): Promise<Buffer[]> => {
+  // Before the Playwright import: no frames is no work, and a caller should
+  // not need a browser installed to be told so.
+  if (opts.frames.length === 0) return [];
   let pw: typeof import("playwright");
   try {
     pw = await import("playwright");
   } catch {
     throw new Error(
-      "renderFrame() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
+      "renderFrames() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
     );
   }
   const origin = opts.origin ?? "https://morphareels.ai";
-  const frame = Math.max(0, Math.round(opts.frame ?? 0));
+  const frames = opts.frames.map((f) => Math.max(0, Math.round(f)));
   const width = Math.max(64, Math.round(opts.width ?? 1080));
   const height = Math.max(64, Math.round(opts.height ?? 1920));
   const timeout = opts.timeoutMs ?? 90_000;
   // Built before the browser launches so an invalid page index fails fast.
-  const url = renderCanvasUrl(origin, opts.projectId, frame, opts.page);
+  const urls = frames.map((f) => renderCanvasUrl(origin, opts.projectId, f, opts.page));
 
   const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
@@ -103,80 +134,129 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
     cacheDir: opts.cacheDir,
   });
   try {
-    // Unconditional: the route carries auth when there is a token, and carries
-    // cache revalidation always — a warm profile serving last hour's asset is
-    // the same wrong frame with or without a token (see browser-auth.ts).
     await routeMorphaOrigin(ctx, origin, opts.token);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
-    // `domcontentloaded`, not `networkidle`: a <video preload="auto"> streaming
-    // a large non-faststart clip keeps the network busy well past the 500ms
-    // idle window, which would block (or time out) goto before the page can
-    // paint. The page's structured readiness flag is the real sync point.
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
-    // Wait for a terminal state. New page: __morphaRenderStatus.done. Old page
-    // (legacy build): the bare __morphaRenderReady boolean. Either resolves.
-    try {
-      await page.waitForFunction(
-        () => {
-          const w = window as unknown as {
-            __morphaRenderStatus?: { done?: boolean };
-            __morphaRenderReady?: boolean;
-          };
-          if (w.__morphaRenderStatus) {
-            return w.__morphaRenderStatus.done === true;
-          }
-          return w.__morphaRenderReady === true;
-        },
-        { timeout },
+    const shot = (): Promise<Buffer> =>
+      page.locator("canvas").first().screenshot({ type: "png" });
+
+    // Load the page for the first frame, then re-seek for the rest.
+    const load = async (url: string, frame: number): Promise<void> => {
+      // `domcontentloaded`, not `networkidle`: a <video preload="auto">
+      // streaming a large non-faststart clip keeps the network busy well past
+      // the 500ms idle window, which would block (or time out) goto before the
+      // page can paint. The page's structured readiness flag is the real sync
+      // point.
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+      try {
+        await page.waitForFunction(
+          () => {
+            const w = window as unknown as {
+              __morphaRenderStatus?: { done?: boolean };
+              __morphaRenderReady?: boolean;
+            };
+            if (w.__morphaRenderStatus) return w.__morphaRenderStatus.done === true;
+            return w.__morphaRenderReady === true;
+          },
+          { timeout },
+        );
+      } catch {
+        throw new Error(
+          `Morpha render timed out after ${Math.round(timeout / 1000)}s for project ${opts.projectId} frame ${frame} — the clip may still be loading; raise timeoutMs for very large clips.`,
+        );
+      }
+      assertRenderOk(
+        (await page.evaluate(
+          () =>
+            (window as unknown as { __morphaRenderStatus?: unknown })
+              .__morphaRenderStatus ?? null,
+        )) as RenderStatus | null,
+        opts.projectId,
+        frame,
+        timeout,
       );
-    } catch {
-      throw new Error(
-        `Morpha render timed out after ${Math.round(timeout / 1000)}s for project ${opts.projectId} frame ${frame} — the clip may still be loading; raise timeoutMs for very large clips.`,
-      );
+    };
+
+    await load(urls[0], frames[0]);
+    const out: Buffer[] = [await shot()];
+
+    for (let i = 1; i < frames.length; i++) {
+      const status = (await page.evaluate(
+        (f) =>
+          (
+            window as unknown as {
+              __morphaRenderAt?: (n: number) => Promise<unknown>;
+            }
+          ).__morphaRenderAt?.(f) ?? null,
+        frames[i],
+      )) as RenderStatus | null;
+      if (status === null) {
+        // The page cannot re-seek (older build, or an injected frame image).
+        // Navigating produces the same pixels, just slower.
+        await load(urls[i], frames[i]);
+      } else {
+        assertRenderOk(status, opts.projectId, frames[i], timeout);
+      }
+      out.push(await shot());
     }
-
-    // Read the structured status. null on older deployments that only set the
-    // legacy boolean — there we can't distinguish black from good, so return
-    // the buffer exactly as before (no regression).
-    const status = (await page.evaluate(() => {
-      return (
-        (window as unknown as { __morphaRenderStatus?: unknown })
-          .__morphaRenderStatus ?? null
-      );
-    })) as {
-      ok?: boolean;
-      error?: string;
-      videoLayersExpected?: number;
-      videoLayersFailed?: number;
-      fontsFailed?: number;
-      degradedFonts?: Array<{ family?: string; weight?: number; italic?: boolean }>;
-    } | null;
-
-    if (status && status.ok === false) {
-      const expected = status.videoLayersExpected ?? 0;
-      const failed = status.videoLayersFailed ?? 0;
-      const fontsFailed = status.fontsFailed ?? 0;
-      throw new Error(
-        `Morpha render incomplete for project ${opts.projectId} frame ${frame}: ` +
-          (status.error ?? "render reported not-ok") +
-          (expected
-            ? ` (${failed}/${expected} video layer(s) failed to decode within ${Math.round(
-                timeout / 1000,
-              )}s — raise timeoutMs for very large clips)`
-            : "") +
-          (fontsFailed
-            ? ` (${fontsFailed} web font(s) failed to load within ${Math.round(
-                timeout / 1000,
-              )}s — the render page couldn't fetch the font; check the machine's network egress to the font CDN, or raise timeoutMs)`
-            : ""),
-      );
-    }
-
-    return await page.locator("canvas").first().screenshot({ type: "png" });
+    return out;
   } finally {
     await ctx.close();
   }
+};
+
+/** The structured terminal status the render page publishes. */
+type RenderStatus = {
+  ok?: boolean;
+  error?: string;
+  videoLayersExpected?: number;
+  videoLayersFailed?: number;
+  fontsFailed?: number;
+  degradedFonts?: Array<{ family?: string; weight?: number; italic?: boolean }>;
+} | null;
+
+// Throw on a frame the page itself says is not trustworthy. `null` is an older
+// deployment that only sets the legacy boolean — there we cannot tell black
+// from good, so it passes through exactly as it always did (no regression).
+const assertRenderOk = (
+  status: RenderStatus,
+  projectId: string,
+  frame: number,
+  timeout: number,
+): void => {
+  if (!status || status.ok !== false) return;
+  const expected = status.videoLayersExpected ?? 0;
+  const failed = status.videoLayersFailed ?? 0;
+  const fontsFailed = status.fontsFailed ?? 0;
+  throw new Error(
+    `Morpha render incomplete for project ${projectId} frame ${frame}: ` +
+      (status.error ?? "render reported not-ok") +
+      (expected
+        ? ` (${failed}/${expected} video layer(s) failed to decode within ${Math.round(
+            timeout / 1000,
+          )}s — raise timeoutMs for very large clips)`
+        : "") +
+      (fontsFailed
+        ? ` (${fontsFailed} web font(s) failed to load within ${Math.round(
+            timeout / 1000,
+          )}s — the render page couldn't fetch the font; check the machine's network egress to the font CDN, or raise timeoutMs)`
+        : ""),
+  );
+};
+
+/**
+ * Render one composited frame to a PNG Buffer. The video frame is decoded and
+ * every overlay (captions/shapes/text) composited by a REAL browser — no
+ * ffmpeg. With the default `channel: "chrome"`, HEVC/AV1/H.264 all decode (HEVC
+ * needs the OS decoder, i.e. macOS/Windows). Requires `playwright` installed
+ * (optional peer dependency) and Google Chrome available on the machine.
+ *
+ * For several frames of one project use `renderFrames`, which shares the
+ * browser AND the clip load across them.
+ */
+export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => {
+  const [png] = await renderFrames({ ...opts, frames: [opts.frame ?? 0] });
+  return png;
 };
 
 export interface RenderVideoOptions {

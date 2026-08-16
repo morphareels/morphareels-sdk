@@ -20,8 +20,10 @@ import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
 import type { ToolFunction } from "./core/tools.ts";
 import {
   renderFrame,
+  renderFrames,
   renderVideo,
   type RenderFrameOptions,
+  type RenderFramesOptions,
   type RenderVideoOptions,
 } from "./render.ts";
 import {
@@ -321,6 +323,14 @@ export interface MorphaClient {
     frame?: number,
     opts?: Omit<RenderFrameOptions, "projectId" | "frame">,
   ): Promise<Buffer>;
+  /** Several frames of one project, in one browser with ONE project fetch and
+   *  ONE clip load — the clip is the expensive part, and `renderFrame` in a
+   *  loop pays for it every time. Returns one PNG per frame, in order. */
+  renderFrames(
+    projectId: string,
+    frames: number[],
+    opts?: Omit<RenderFramesOptions, "projectId" | "frames">,
+  ): Promise<Buffer[]>;
   renderVideo(
     projectId: string,
     opts?: Omit<RenderVideoOptions, "projectId">,
@@ -946,6 +956,8 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
 
     renderFrame: (projectId, frame = 0, opts = {}) =>
       renderFrame({ origin, token, ...opts, projectId, frame }),
+    renderFrames: (projectId, frames, opts = {}) =>
+      renderFrames({ origin, token, ...opts, projectId, frames }),
     renderVideo: (projectId, opts = {}) =>
       renderVideo({ origin, token, ...opts, projectId }),
   };

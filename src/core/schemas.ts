@@ -113,6 +113,25 @@ const perElementDataFields = {
   style: z.lazy(() => layerStyleSchema).optional(),
   color_tracks: z.lazy(() => elementColorTracksSchema).optional(),
   track_loops: z.lazy(() => trackLoopsSchema).optional(),
+  // Static base for `scale` and `opacity`, the last two properties that used to
+  // exist ONLY as keyframe tracks. Without a base, editing either wrote a lone
+  // keyframe — which `evaluateTrack` returns as a CONSTANT, so nothing appeared
+  // to happen while the property silently stopped being static and the user's
+  // NEXT edit produced an animation nobody asked for. Groups already carried a
+  // base `scale`; this gives every layer both, so one sentence describes the
+  // whole rule: track exists → keyframe at the playhead, else → the base.
+  //
+  // UNCLAMPED, deliberately, both of them. `keyframeSchema.value` is a bare
+  // `z.number()`, so a track can legally hold 1.2 or -0.3 — and de-animating a
+  // stopwatch BAKES the value at the playhead into the base. A tidy-looking
+  // `.min(0).max(1)` here would turn that gesture into a parse failure.
+  // Painting clamps at the edge instead (globalAlpha, hexWithAlpha).
+  //
+  // Absent parses to 1, which is exactly the hard-coded fallback every sampler
+  // used before — so existing projects render identically and need NO
+  // migration. (`preprocessProject` does nothing for this; don't go looking.)
+  scale: z.number().default(1),
+  opacity: z.number().default(1),
   // When this element was inlined from an embedded morpha (see groupSchema's
   // `source_morpha_id`), this is its ORIGINAL element id in that source project
   // (e.g. "image.abc123"). Used to map host-side edits back onto the source on
@@ -1542,10 +1561,11 @@ export const groupSchema = z
     pivotX: z.number(),
     pivotY: z.number(),
     // Static base transform, composed about (pivotX, pivotY). Overridden
-    // per-property by any keyframe track under "group.<id>".
+    // per-property by any keyframe track under "group.<id>". `scale` and
+    // `opacity` come from perElementDataFields — every layer carries them now,
+    // so a group's base transform and a leaf's are the same five fields.
     x: z.number().default(0),
     y: z.number().default(0),
-    scale: z.number().default(1),
     rotation: z.number().default(0),
     children: z.array(z.string()).default([]),
     // Optional backdrop fill painted behind the group's children. The rect is
@@ -1656,7 +1676,7 @@ export const isCaptionLineElement = (
 //       migrateSpeedKeyframesToClipRelative subtracts `timeline_start_frame`
 //       from each keyframe, which preserves behaviour for every project as it
 //       stands. ROLL-FORWARD-ONLY, like every bump (dev-docs/editor-gotchas.md).
-export const SCHEMA_VERSION = 6 as const;
+export const SCHEMA_VERSION = 7 as const;
 
 // Strip deprecated clip_frame fields from raw input before validation. The
 // pre-refactor schema modelled the source video as a built-in singleton
@@ -3415,6 +3435,27 @@ export const projectSchema = z.preprocess(
 export type Easing = z.infer<typeof easingSchema>;
 export type Keyframe = z.infer<typeof keyframeSchema>;
 export type TrackProperty = z.infer<typeof trackPropertySchema>;
+
+// The TRANSFORM group — where the layer is, how big, how turned. Everything
+// else on a layer is appearance: `opacity` composites it, `curve` bends text.
+//
+// The split is load-bearing, not descriptive. The Inspector's leaf fields will
+// start a track on a static property when a SIBLING TRANSFORM is already
+// animated (the FCP affordance: an animated layer keeps animating). Scoping
+// that to this group is the whole point — FCP couples the Transform group and
+// nothing wider, so a layer that merely fades in must not have its position
+// animated because you typed a number into Y.
+export const TRANSFORM_TRACK_PROPERTIES = [
+  "x",
+  "y",
+  "width",
+  "height",
+  "rotation",
+  "scale",
+] as const satisfies readonly TrackProperty[];
+
+export const isTransformProperty = (p: TrackProperty): boolean =>
+  (TRANSFORM_TRACK_PROPERTIES as readonly TrackProperty[]).includes(p);
 export type ElementTracks = z.infer<typeof elementTracksSchema>;
 export type Animations = z.infer<typeof animationsSchema>;
 export type Project = z.infer<typeof projectSchema>;
@@ -3857,7 +3898,7 @@ export const getAncestorGroupChain = (
 // operation move independent things. Order-preserving; dedupes first occurrence.
 // The single source of truth shared by the drag co-move path (CanvasOverlay) and
 // the align / distribute store actions.
-export const deNestSelection = (
+export const dropNestedChildren = (
   project: Composition,
   ids: readonly string[],
 ): string[] => {
@@ -3957,7 +3998,7 @@ export const clearFillColorTrack = (layer: AnyLayer): void => {
 // A layer's fill has two homes and the TRACK wins, so writing the static field
 // on a layer whose fill is animated paints NOTHING — the same defect that made
 // "Clear" look broken, seen from the other side. The editor can resolve that
-// itself (it has a playhead, so an armed fill takes a keyframe there), but a
+// itself (it has a playhead, so an animated fill takes a keyframe there), but a
 // headless caller has no playhead and no way to mean "at frame N" — so a plain
 // fill write over a live track is refused rather than silently swallowed.
 //
