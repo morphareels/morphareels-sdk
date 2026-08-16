@@ -3927,6 +3927,23 @@ export const findLayerByElementId = (
   return list.find((l) => l.id === id) ?? null;
 };
 
+// Drop a layer's fill colour track (and the `color_tracks` map if that empties
+// it). Mutates in place — callers pass a layer inside a cloned project.
+//
+// Clearing a fill means clearing the WHOLE fill, animated or not. `evalFill`
+// (renderer) and the Inspector's picker both prefer the colour track over the
+// static field, so a `fill: null` that leaves `color_tracks.fill` behind still
+// paints — which is exactly what made the Inspector's "Clear" button look like
+// it did nothing. One rule, shared by the pure `set_layer_fill` tool and the
+// editor store's own fill patch.
+export const clearFillColorTrack = (layer: AnyLayer): void => {
+  if (!layer.color_tracks?.fill) return;
+  delete layer.color_tracks.fill;
+  if (Object.keys(layer.color_tracks).length === 0) {
+    layer.color_tracks = undefined;
+  }
+};
+
 // Per-Project-identity cache of element id → layer record. The store clones the
 // project (structuredClone) on every mutation, so a fresh identity invalidates
 // this automatically — no manual invalidation needed.

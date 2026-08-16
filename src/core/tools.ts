@@ -43,6 +43,7 @@ import {
   blockOf,
   clampCurve,
   CAPTIONS_GROUP_NAME,
+  clearFillColorTrack,
   collectCaptionsRootIds,
   fillSchema,
   findLayerByElementId,
@@ -3427,6 +3428,11 @@ const setLayerFill: ToolDispatch<SetLayerFillArgs> = (project, args) => {
       }
       next.groups[idx] = { ...next.groups[idx], fill: null };
     }
+    // Clearing the fill clears its ANIMATION too — a surviving colour track
+    // keeps painting (evalFill prefers the track over the static field), so a
+    // "cleared" backdrop that still shows is not cleared at all.
+    const cleared = findLayerByElementId(next, elementId);
+    if (cleared) clearFillColorTrack(cleared);
     return { project: next, result: { ok: true } };
   }
   if (fill === undefined) {
@@ -8880,7 +8886,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_layer_fill",
       description:
-        "Set a layer's fill. The canvas backdrop is the pinned is_background image_layer (its element id is exposed via describe_video as background.elementId; the literal 'background.canvas' is also accepted as a synonym); null is rejected on the backdrop. Shapes require a Fill (null/missing is rejected). Image / video / group layers accept a Fill object (or `#rrggbb` hex) to paint a backdrop, or `null` to clear it. Shapes paint their body; image/video paint behind the bitmap; groups paint a rect centred on the pivot sized by (box_width, box_height).",
+        "Set a layer's fill. The canvas backdrop is the pinned is_background image_layer (its element id is exposed via describe_video as background.elementId; the literal 'background.canvas' is also accepted as a synonym); null is rejected on the backdrop. Shapes require a Fill (null/missing is rejected). Image / video / text / group layers accept a Fill object (or `#rrggbb` hex) to paint a backdrop, or `null` to clear it — clearing removes the layer's fill colour keyframes too, so an animated backdrop really does go away. Shapes paint their body; image/video paint behind the bitmap; groups paint a rect centred on the pivot sized by (box_width, box_height).",
       parameters: {
         type: "object",
         properties: {
@@ -8890,7 +8896,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           fill: {
             description:
-              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/group only) clears the backdrop.',
+              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/text/group only) clears the backdrop, including any fill colour keyframes on it.',
           },
         },
         required: ["elementId", "fill"],

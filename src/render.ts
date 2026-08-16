@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
-import { scopeAuthHeaderToOrigin } from "./browser-auth.ts";
+import { routeMorphaOrigin } from "./browser-auth.ts";
 
 export interface RenderFrameOptions {
   /** Project id, served at `${origin}/api/project/<id>`. */
@@ -32,12 +32,14 @@ export interface RenderFrameOptions {
    */
   timeoutMs?: number;
   /**
-   * Directory for the persistent Chromium profile that caches web fonts,
-   * images, and the render bundle across calls. Defaults to
+   * Directory for the persistent Chromium profile that caches THIRD-PARTY
+   * assets (web fonts) across calls. Defaults to
    * `<os.tmpdir()>/morpha-render-cache`, with a per-project subdirectory. A
    * warm profile fetches each web font once and serves it from disk on later
    * renders, so repeated renders don't re-fetch (and aren't blocked by a slow
-   * font CDN). Set this to relocate or isolate the cache.
+   * font CDN). Morpha's own responses are deliberately never reused from it —
+   * a render always reads current project state, images and clips. Set this to
+   * relocate or isolate the cache.
    */
   cacheDir?: string;
 }
@@ -101,9 +103,10 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
     cacheDir: opts.cacheDir,
   });
   try {
-    if (opts.token) {
-      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
-    }
+    // Unconditional: the route carries auth when there is a token, and carries
+    // cache revalidation always — a warm profile serving last hour's asset is
+    // the same wrong frame with or without a token (see browser-auth.ts).
+    await routeMorphaOrigin(ctx, origin, opts.token);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     // `domcontentloaded`, not `networkidle`: a <video preload="auto"> streaming
     // a large non-faststart clip keeps the network busy well past the 500ms
@@ -238,9 +241,8 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     cacheDir: opts.cacheDir,
   });
   try {
-    if (opts.token) {
-      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
-    }
+    // Unconditional — same reason as renderFrame above.
+    await routeMorphaOrigin(ctx, origin, opts.token);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
@@ -286,13 +288,17 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
   }
 };
 
-// Launch a persistent Chromium context so the on-disk HTTP cache (web fonts,
-// images, the render bundle) is reused across renders instead of re-fetched on
-// every call — a cold browser per render is why repeated renders of a project
-// kept re-downloading CDN-hosted fonts and intermittently failing when that CDN
-// was slow. Keyed per project; if the profile is locked (a concurrent render of
-// the same project holds Chromium's SingletonLock) it falls back to a private
-// dir so the render still runs — just without the shared warm cache.
+// Launch a persistent Chromium context so the on-disk HTTP cache is reused
+// across renders instead of re-fetched on every call — a cold browser per
+// render is why repeated renders of a project kept re-downloading CDN-hosted
+// fonts and intermittently failing when that CDN was slow. That third-party
+// cache is the whole benefit: Morpha-origin requests are routed (see
+// browser-auth.ts) and so deliberately never served from this profile, because
+// a project's assets and clips are mutable at a fixed URL and a warm profile
+// would paint the previous ones. Keyed per project; if the profile is locked
+// (a concurrent render of the same project holds Chromium's SingletonLock) it
+// falls back to a private dir so the render still runs — just without the
+// shared warm cache.
 const launchRenderContext = async (
   pw: typeof import("playwright"),
   opts: {

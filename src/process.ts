@@ -8,7 +8,7 @@
 // uploads a clip MUST process it through this path or by opening the editor.
 // Requires `playwright` (optional peer dependency) and Google Chrome available.
 
-import { scopeAuthHeaderToOrigin } from "./browser-auth.ts";
+import { routeMorphaOrigin } from "./browser-auth.ts";
 
 /** A processing step. `transcript` + `audio_split` are the audio-only steps the
  *  caption flow needs; `proxy` / `text_regions` decode video frames
@@ -201,8 +201,11 @@ export const processClip = async (
   });
   try {
     const ctx = await browser.newContext();
+    // Token-only: this context is EPHEMERAL (browser.newContext, discarded
+    // with the browser), so it has no cache old enough to go stale — routing it
+    // unconditionally would only cost the render bundle a re-fetch per clip.
     if (opts.token) {
-      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
+      await routeMorphaOrigin(ctx, origin, opts.token);
     }
     const page = await ctx.newPage();
     return await runOne(
@@ -233,8 +236,11 @@ export const processClips = async (
   });
   try {
     const ctx = await browser.newContext();
+    // Token-only: this context is EPHEMERAL (browser.newContext, discarded
+    // with the browser), so it has no cache old enough to go stale — routing it
+    // unconditionally would only cost the render bundle a re-fetch per clip.
     if (opts.token) {
-      await scopeAuthHeaderToOrigin(ctx, origin, opts.token);
+      await routeMorphaOrigin(ctx, origin, opts.token);
     }
     const page = await ctx.newPage();
     const out: ProcessClipOutcome[] = [];

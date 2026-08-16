@@ -336,18 +336,82 @@ export const edgeTransitionAt = (
  * next reader believes clip defaults live here. They live in the clip's own
  * absence of a transition, which `edgeTransitionAt` reads as a hard cut — the
  * grammar of short-form video, and a content judgement rather than an oversight.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE IN-RAMP IS A LEAD-IN WHEN A HUMAN IS PARKED AT THE WINDOW'S START.
+ *
+ * `mintedAtPlayhead` is the caller asserting exactly one thing: `block.start`
+ * IS the frame the user is looking at. Every editor add path is in that
+ * position by construction (`defaultBlockOnAdd` mints the window at the
+ * playhead); a caller passing its own `block` is not, and omits it.
+ *
+ * THE PRECISE BOUNDARY, because the obvious phrasing overclaims it. This is not
+ * "the editor anchors and the headless tools don't" — the editor's own LLM
+ * panel dispatches the PURE tools while a human sits at a playhead. It is: the
+ * anchor belongs to whoever PLACED the window at the frame being looked at. The
+ * GUI add paths did, by construction. A model choosing its own `block` did not,
+ * and its window is its intent, the same way a hand-set fade is the user's. In
+ * practice that path is already visible anyway — `add_shape` / `add_image_layer`
+ * / `add_text_layer` tell the model to OMIT `block` by default, and a blockless
+ * layer is always-present with no transitions at all.
+ *
+ * It exists because the un-anchored form of this function shipped a layer that
+ * was INVISIBLE at the frame it was created at — at every playhead, not just
+ * frame 0. `edgeTransitionAt` samples an in-ramp at `local / inFrames`, which
+ * is exactly 0 on the window's FIRST frame, and that frame was the playhead. So
+ * a promise made one file over (`defaultBlockOnAdd`: "the layer is visible the
+ * moment it lands") was broken here, silently, by a feature that is correct on
+ * its own. See CLAUDE.md, "You see what you just made".
+ *
+ * The fix runs the ramp INTO the playhead instead of out of it: the window is
+ * extended BACKWARDS by the ramp length so the ramp COMPLETES on `block.start`,
+ * where `local === inFrames` and the layer is fully at rest. This is not a new
+ * idiom — it is `fadeToPlayheadFrames` (above), which has always meant "the
+ * ramp finishes where you are parked", applied at birth.
+ *
+ * Backwards ONLY: the window's END never moves, so `defaultBlockOnAdd`'s
+ * fit-to-comp-end branch still lands flush with the composition and the derived
+ * composition length is unchanged.
+ *
+ * At frame 0 there is no room for a lead-in, so a layer added there is born
+ * with NO in-ramp at all — a hard edge, which is the honest answer rather than
+ * a ramp squeezed into nothing. Between 1 and 5 the ramp SHORTENS to fit.
+ *
+ * The anchor is derived from `block.start` and never passed as a second number.
+ * A `playheadFrame` parameter would be a second source of truth for one anchor:
+ * hand it a frame that disagreed with `block.start` and the window's end would
+ * silently move. There is nothing here to disagree with.
  */
 export const bornLayerDefaults = (
   block: { start: number; duration: number } | undefined,
+  opts?: {
+    /** The caller placed `block.start` at the frame the user is parked at.
+     *  Editor add paths only — pinned by test/visible-on-create.test.ts. */
+    mintedAtPlayhead?: boolean;
+  },
 ): {
   block?: { start: number; duration: number };
   transition_in?: EdgeTransition;
   transition_out?: EdgeTransition;
 } => {
   if (!block) return {};
+  const out: EdgeTransition = {
+    kind: "fade",
+    frames: DEFAULT_OVERLAY_TRANSITION_FRAMES,
+  };
+  if (!opts?.mintedAtPlayhead) {
+    return { block, transition_in: { ...out }, transition_out: out };
+  }
+  // Whatever room exists before the playhead, up to the default ramp. `start`
+  // is already a non-negative whole frame (defaultBlockOnAdd normalizes it), so
+  // this is >= 0 and `start - lead` can't go negative.
+  const lead = Math.min(
+    DEFAULT_OVERLAY_TRANSITION_FRAMES,
+    Math.max(0, Math.floor(block.start)),
+  );
   return {
-    block,
-    transition_in: { kind: "fade", frames: DEFAULT_OVERLAY_TRANSITION_FRAMES },
-    transition_out: { kind: "fade", frames: DEFAULT_OVERLAY_TRANSITION_FRAMES },
+    block: { start: block.start - lead, duration: block.duration + lead },
+    ...(lead > 0 ? { transition_in: { kind: "fade", frames: lead } } : {}),
+    transition_out: out,
   };
 };
