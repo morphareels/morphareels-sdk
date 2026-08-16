@@ -93,6 +93,23 @@ export const DEFAULT_OVERLAY_TRANSITION_FRAMES = 6;
  * `bornLayerDefaults`) — this is only the length the first click picks. */
 export const DEFAULT_VIDEO_TRANSITION_FRAMES = 10;
 
+/**
+ * Where a window must OPEN for the layer to be fully at rest at `atFrame`.
+ *
+ * One line, but it is the whole of "the user sees what they just made", and it
+ * has two callers that must never disagree: `bornLayerDefaults` (a layer
+ * CREATED at the playhead) and `arrivalShiftFor` (a layer PASTED, DUPLICATED or
+ * dropped in from the Collection while the playhead is elsewhere). Both need
+ * the same answer — open the window `inRampFrames` early, so `local ===
+ * inFrames` at `atFrame` and the entrance has finished.
+ *
+ * Clamped at 0: near the top of the composition there is no room for a full
+ * lead-in, and a shortened ramp is the honest answer. Read the clamped result
+ * back to learn the ramp that actually fits: `atFrame - restStartFor(...)`.
+ */
+export const restStartFor = (atFrame: number, inRampFrames: number): number =>
+  Math.max(0, Math.floor(atFrame) - Math.max(0, Math.floor(inRampFrames)));
+
 /** How far a "slide" travels, as a fraction of the canvas's long edge. */
 const SLIDE_TRAVEL_FRACTION = 0.12;
 
@@ -147,7 +164,14 @@ const isInert = (t: EdgeTransition | undefined): boolean =>
  * the user asked for. A destructive clamp would have quietly deleted them.
  *
  * Sub-2-frame windows get no ramp at all: there is no room for one, and a
- * 1-frame "fade" is just a dimmer frame.
+ * 1-frame "fade" is not a fade.
+ *
+ * A squeeze CAN still floor a ramp at 1 frame (`Math.max(1, …)` below, so a
+ * squeezed transition never silently becomes a cut while the UI still shows a
+ * ramp). On the in-edge that single frame now samples at `(0 + 1) / 1 === 1`,
+ * i.e. fully on — the edges are mirrors and a ramp's zero sits outside the
+ * window, so the one frame it has is the frame it arrives on rather than a
+ * frame it spends absent. Degenerate either way; this is the better degenerate.
  */
 export const resolveEdgeFrames = (
   inFrames: number,
@@ -266,10 +290,28 @@ export const edgeTransitionAt = (
   const local = frame - ancestorBandOriginSum(project, elementId) - win.start;
   if (local < 0 || local >= win.duration) return IDENTITY;
 
+  // THE TWO EDGES ARE MIRRORS, and getting that wrong cost a frame.
+  //
+  // A ramp's 0 endpoint belongs OUTSIDE the window — on the frame where the
+  // layer isn't there — because every frame INSIDE the window is a frame the
+  // user asked to see something on. The out-edge always had this right by
+  // construction: `fromEnd` counts down outFrames…1 across the last outFrames
+  // painted frames, so its zero lands at `fromEnd === 0`, one frame PAST the
+  // window, which is never drawn. The last painted frame is faint, not blank.
+  //
+  // The in-edge used `local / inFrames`, which puts its zero at `local === 0` —
+  // the window's FIRST PAINTED FRAME. So a 6-frame fade-in spent one of its
+  // frames painting nothing at all and delivered 5 frames of visible ramp,
+  // where a 6-frame fade-out delivers 6. Worse, that blank frame is what made
+  // every newly added layer invisible at the frame it was created at (#487):
+  // the window started at the playhead, so the frame the user was standing on
+  // was exactly the frame the ramp had decided to paint nothing on.
+  //
+  // `(local + 1) / inFrames` is the mirror: 1/n on the first painted frame,
+  // reaching 1 on the last frame of the ramp. Same curve, same length, one
+  // frame earlier, and no frame wasted on nothing.
   if (inFrames > 0 && local < inFrames && tIn) {
-    // t = 0 on the window's first frame (fully out) and reaches 1 exactly when
-    // the ramp ends — so the layer is at rest for every frame after it.
-    const e = easeUnit(tIn.curve ?? DEFAULT_CURVE_IN[tIn.kind], local / inFrames);
+    const e = easeUnit(tIn.curve ?? DEFAULT_CURVE_IN[tIn.kind], (local + 1) / inFrames);
     return factorsFor(tIn, e, project);
   }
   const fromEnd = win.duration - local;
@@ -357,11 +399,15 @@ export const edgeTransitionAt = (
  *
  * It exists because the un-anchored form of this function shipped a layer that
  * was INVISIBLE at the frame it was created at — at every playhead, not just
- * frame 0. `edgeTransitionAt` samples an in-ramp at `local / inFrames`, which
- * is exactly 0 on the window's FIRST frame, and that frame was the playhead. So
- * a promise made one file over (`defaultBlockOnAdd`: "the layer is visible the
- * moment it lands") was broken here, silently, by a feature that is correct on
- * its own. See CLAUDE.md, "You see what you just made".
+ * frame 0. `edgeTransitionAt` sampled an in-ramp at `local / inFrames` back
+ * then, which is exactly 0 on the window's FIRST frame, and that frame was the
+ * playhead. So a promise made one file over (`defaultBlockOnAdd`: "the layer is
+ * visible the moment it lands") was broken here, silently, by a feature that is
+ * correct on its own. See CLAUDE.md, "You see what you just made".
+ *
+ * The ramp edges are mirrors now, so an un-anchored birth lands
+ * HALF-TRANSPARENT rather than invisible. That does not retire this anchor: the
+ * promise is AT REST at the playhead, and half-transparent is not at rest.
  *
  * The fix runs the ramp INTO the playhead instead of out of it: the window is
  * extended BACKWARDS by the ramp length so the ramp COMPLETES on `block.start`,
@@ -402,15 +448,14 @@ export const bornLayerDefaults = (
   if (!opts?.mintedAtPlayhead) {
     return { block, transition_in: { ...out }, transition_out: out };
   }
-  // Whatever room exists before the playhead, up to the default ramp. `start`
-  // is already a non-negative whole frame (defaultBlockOnAdd normalizes it), so
-  // this is >= 0 and `start - lead` can't go negative.
-  const lead = Math.min(
-    DEFAULT_OVERLAY_TRANSITION_FRAMES,
-    Math.max(0, Math.floor(block.start)),
-  );
+  // Whatever room exists before the playhead, up to the default ramp — read
+  // back off `restStartFor` rather than recomputed here, so a birth and an
+  // arrival can never disagree about what "at rest" means (pinned by
+  // test/visible-on-create.test.ts).
+  const start = restStartFor(block.start, DEFAULT_OVERLAY_TRANSITION_FRAMES);
+  const lead = Math.max(0, Math.floor(block.start)) - start;
   return {
-    block: { start: block.start - lead, duration: block.duration + lead },
+    block: { start, duration: block.duration + lead },
     ...(lead > 0 ? { transition_in: { kind: "fade", frames: lead } } : {}),
     transition_out: out,
   };

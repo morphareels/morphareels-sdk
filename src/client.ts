@@ -15,6 +15,7 @@
 // OCR/safe-zones/transcript readers). Every one is callable here, either
 // via the generic `callTool` or a typed convenience method below.
 
+import { randomUUID } from "node:crypto";
 import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
 import type { ToolFunction } from "./core/tools.ts";
 import {
@@ -383,6 +384,25 @@ const unquoteEtag = (raw: string): string => {
   return v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
 };
 
+/** Append a short random token before the extension, so a name the CALLER did
+ *  not choose cannot land on a key that already exists.
+ *
+ *  Both R2 namespaces are keyed by bare filename and both writers put straight
+ *  at that key, so uploading `clip.mp4` twice overwrote the first — and every
+ *  layer referencing it switched footage. When a caller passes an explicit
+ *  `filename` they have named the thing and keep control (that is how you
+ *  deliberately replace bytes in place); when the name is merely DERIVED from a
+ *  local path, it is an accident of the caller's disk and must not collide.
+ *  Mirrors the editor's uniquelyNamedUpload. */
+export const uniquifyDerivedName = (raw: string): string => {
+  const base = raw.replace(/^.*[\\/]/, "");
+  const dot = base.lastIndexOf(".");
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : "";
+  const token = randomUUID().replace(/-/g, "").slice(0, 8);
+  return `${stem}-${token}${ext}`;
+};
+
 /** Every unique clip filename a project references. A project is pages-only —
  *  its content lives on `pages[]` — so discovery sweeps every page's video
  *  layers, deduping across (and within) pages. */
@@ -688,7 +708,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       import("node:path"),
     ]);
     const bytes = await readFile(filePath);
-    const filename = overrideName ?? basename(filePath);
+    const filename = overrideName ?? uniquifyDerivedName(basename(filePath));
     if (bytes.byteLength > MULTIPART_CHUNK_BYTES) {
       return uploadLocalFileMultipart(projectId, bytes, filename, durationSeconds);
     }
@@ -879,7 +899,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         import("node:path"),
       ]);
       const bytes = await readFile(source.file);
-      const filename = source.filename ?? basename(source.file);
+      const filename = source.filename ?? uniquifyDerivedName(basename(source.file));
       return uploadAssetBytes(projectId, bytes, filename);
     },
     setCustomFont: async (projectId, opts) => {

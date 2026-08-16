@@ -2442,6 +2442,8 @@ type ReflowLeaf = {
 type ReflowGroup = {
   pivotX?: number;
   pivotY?: number;
+  x?: number;
+  y?: number;
   box_width?: number;
   box_height?: number;
   animations?: Record<string, { value: number }[] | undefined>;
@@ -2493,6 +2495,14 @@ export const reflowCompositionLayers = (
     if (!g) continue;
     if (typeof g.pivotX === "number") g.pivotX = mapX(g.pivotX);
     if (typeof g.pivotY === "number") g.pivotY = mapY(g.pivotY);
+    // A group's own x/y is a translation OFFSET about that pivot, so it scales
+    // like a distance (map the pivot, scale the offset) — mapping it as a point
+    // would double-count the recentre. Its keyframes are scaled just below, and
+    // the static base being left out was a real gap: every leaf under the group
+    // moved with the resize while the group's own displacement stayed at the
+    // old canvas's magnitude, shearing the composition apart.
+    if (typeof g.x === "number") g.x *= s;
+    if (typeof g.y === "number") g.y *= s;
     if (typeof g.box_width === "number") g.box_width *= s;
     if (typeof g.box_height === "number") g.box_height *= s;
     const t = g.animations;
@@ -3943,6 +3953,43 @@ export const clearFillColorTrack = (layer: AnyLayer): void => {
     layer.color_tracks = undefined;
   }
 };
+
+// A layer's fill has two homes and the TRACK wins, so writing the static field
+// on a layer whose fill is animated paints NOTHING — the same defect that made
+// "Clear" look broken, seen from the other side. The editor can resolve that
+// itself (it has a playhead, so an armed fill takes a keyframe there), but a
+// headless caller has no playhead and no way to mean "at frame N" — so a plain
+// fill write over a live track is refused rather than silently swallowed.
+//
+// Every pure-tool site that assigns a static `fill` goes through this, and
+// `test/agent-fill-guard.test.ts` scans for one that doesn't.
+export type StaticFillWrite =
+  | { ok: true }
+  | { ok: false; keyframes: number };
+
+export const guardStaticFillWrite = (
+  layer: AnyLayer,
+  clearAnimation: boolean,
+): StaticFillWrite => {
+  const keyframes = layer.color_tracks?.fill?.length ?? 0;
+  if (keyframes === 0) return { ok: true };
+  if (!clearAnimation) return { ok: false, keyframes };
+  // Opted in: the new fill REPLACES the animation, both homes.
+  clearFillColorTrack(layer);
+  return { ok: true };
+};
+
+// One wording for the refusal, so the editor's assistant and the headless
+// surfaces tell an agent the same thing — including both ways forward.
+export const animatedFillRefusal = (
+  elementId: string,
+  keyframes: number,
+): string =>
+  `${elementId} has an ANIMATED fill (${keyframes} colour keyframe${
+    keyframes === 1 ? "" : "s"
+  }); setting a plain fill would be invisible because the animation wins at ` +
+  `every frame. Either change it at a frame with add_color_keyframe, or pass ` +
+  `clear_animation: true to replace the animation with this fill.`;
 
 // Per-Project-identity cache of element id → layer record. The store clones the
 // project (structuredClone) on every mutation, so a fresh identity invalidates

@@ -36,10 +36,16 @@ import {
 } from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
 import {
+  canvasDelta,
+  canvasDeltaToParentSpace,
+  composeAncestors,
+} from "./layer-space.ts";
+import {
   DEFAULT_OVERLAY_TRANSITION_FRAMES,
   bornLayerDefaults,
 } from "./transitions.ts";
 import {
+  animatedFillRefusal,
   blockOf,
   clampCurve,
   CAPTIONS_GROUP_NAME,
@@ -54,6 +60,7 @@ import {
   deriveGroupStart,
   getGroupDescendants,
   growBlockToCoverFrame,
+  guardStaticFillWrite,
   isMorphaGroup,
   type AnyLayer,
   materializeRootLayerOrder,
@@ -635,6 +642,29 @@ const purgeElementId = (project: Composition, elementId: string): void => {
       s.fill = { type: "solid", color: s.fill.color, opacity: s.fill.opacity };
     }
   }
+  // The fill's OTHER home. A colour keyframe holds a whole Fill, so a mask
+  // pointing at the deleted layer survives there too — and the track is what
+  // the renderer reads, so purging only the static field leaves the dangling
+  // reference in the copy that actually paints. Degrade each such keyframe the
+  // same way, to a solid of its own colour.
+  const dropMaskKeyframes = (layer: AnyLayer): void => {
+    const track = layer.color_tracks?.fill;
+    if (!track) return;
+    for (let i = 0; i < track.length; i += 1) {
+      const v = track[i].value;
+      if (v.type === "mask" && v.layer_id === elementId) {
+        track[i] = {
+          ...track[i],
+          value: { type: "solid", color: v.color, opacity: v.opacity },
+        };
+      }
+    }
+  };
+  project.image_layers.forEach(dropMaskKeyframes);
+  project.video_layers.forEach(dropMaskKeyframes);
+  project.text_layers.forEach(dropMaskKeyframes);
+  project.shapes.forEach(dropMaskKeyframes);
+  project.groups.forEach(dropMaskKeyframes);
 
   // 6. loop[*].overrides[*].elementId
   if (project.loop) {
@@ -1631,11 +1661,37 @@ const fullLayerRecord = (
           frame: kf.frame + Math.max(0, (layer as VideoLayer).timeline_start_frame),
         }))
       : undefined;
+  // An element inside a group stores x/y in its GROUP's space, not the canvas's
+  // — so the raw numbers above are not where it appears. Reads and writes are
+  // both in that stored space (move_layer writes what inspect_layers reports,
+  // and changing that would break every read-modify-write an agent does), so
+  // the canvas position is reported ALONGSIDE rather than replacing it. Only
+  // for grouped elements: for a root-level layer the two are identical and the
+  // extra keys would be noise.
+  const anc = composeAncestors(project, elementId, 0);
+  const nested = anc.scaleProduct !== 1 || anc.rotationProduct !== 0 ||
+    getAncestorGroupChain(project, elementId).length > 0;
+  const canvasGeom = nested
+    ? (() => {
+        const p = anc.apply({
+          x: (layer as { x?: number }).x ?? 0,
+          y: (layer as { y?: number }).y ?? 0,
+        });
+        return {
+          canvas_x: p.x,
+          canvas_y: p.y,
+          canvas_scale: anc.scaleProduct,
+          canvas_rotation: ((layer as { rotation?: number }).rotation ?? 0) +
+            anc.rotationProduct,
+        };
+      })()
+    : {};
   return {
     elementId,
     type,
     ...layer,
     ...(speedKfs ? { speed_keyframes: speedKfs } : {}),
+    ...canvasGeom,
     animations: layer.animations ?? null,
     color_tracks: layer.color_tracks ?? null,
     track_loops: layer.track_loops ?? null,
@@ -3368,7 +3424,11 @@ const setStyle: ToolDispatch<SetStyleArgs> = (project, args) => {
 // set_layer_fill
 // ---------------------------------------------------------------------------
 
-type SetLayerFillArgs = { elementId: string; fill: unknown };
+type SetLayerFillArgs = {
+  elementId: string;
+  fill: unknown;
+  clear_animation?: unknown;
+};
 
 const setLayerFill: ToolDispatch<SetLayerFillArgs> = (project, args) => {
   const { fill } = args;
@@ -3446,6 +3506,24 @@ const setLayerFill: ToolDispatch<SetLayerFillArgs> = (project, args) => {
     };
   }
   const next = cloneProject(project);
+  // A fill has two homes and the track wins, so this write is invisible on a
+  // layer whose fill is animated. Refuse it (or replace the animation when the
+  // caller says to) rather than report ok on a change nobody can see.
+  // `target` IS the record the per-kind branch below spreads, so clearing the
+  // track here survives that spread.
+  const target = findLayerByElementId(next, elementId);
+  if (target) {
+    const guard = guardStaticFillWrite(target, args.clear_animation === true);
+    if (!guard.ok) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error: animatedFillRefusal(elementId, guard.keyframes),
+        },
+      };
+    }
+  }
   if (elementId.startsWith("shapes.")) {
     const id = elementId.slice("shapes.".length);
     const idx = next.shapes.findIndex((s) => s.id === id);
@@ -3498,6 +3576,7 @@ type SetTextBackgroundArgs = {
   cornerRadius?: number;
   strokeWidth?: number;
   strokeColor?: string;
+  clear_animation?: unknown;
 };
 
 // Declarative "rounded box behind text": sets the text layer's backdrop fill
@@ -3571,7 +3650,21 @@ const setTextBackground: ToolDispatch<SetTextBackgroundArgs> = (
     };
   }
   const layer = next.text_layers[idx];
-  if (coercedFill !== undefined) layer.fill = coercedFill;
+  if (coercedFill !== undefined) {
+    // Same rule as set_layer_fill: the backdrop's colour track wins, so a
+    // static write over one would be invisible.
+    const guard = guardStaticFillWrite(layer, args.clear_animation === true);
+    if (!guard.ok) {
+      return {
+        project,
+        result: {
+          ok: false,
+          error: animatedFillRefusal(elementId, guard.keyframes),
+        },
+      };
+    }
+    layer.fill = coercedFill;
+  }
   // Merge the box style onto any existing style; zeros / empties drop out so
   // "no padding / border" stays unrepresentable rather than stored as 0.
   const merged: LayerStyle = { ...(layer.style ?? {}) };
@@ -3931,9 +4024,11 @@ const PRESET_TUPLES: Record<AnimationPreset, PresetTuple[]> = {
     { property: "scale", frame: 15, value: 1.2, easing: "outBack" },
     { property: "scale", frame: 30, value: 1, easing: "easeInOut" },
   ],
-  // Slide / shake values are DELTAS from the layer's base x/y; applyPreset
-  // bakes the layer's base in at apply time so the keyframes that land on
-  // the project are absolute canvas-space positions.
+  // Slide / shake values are DELTAS from the layer's base x/y, in CANVAS px —
+  // "slide in from 200px to the left" is a statement about the screen. Inside a
+  // group, x/y are the GROUP's space, so applyPreset converts the delta through
+  // the ancestor chain before adding the base; the keyframes that land on the
+  // project are absolute positions in the layer's own frame.
   "slide-in-left": [
     { property: "x", frame: 0, value: -200 },
     { property: "x", frame: 30, value: 0, easing: "outBack" },
@@ -3966,6 +4061,84 @@ type ApplyPresetArgs = {
   startFrame?: number;
 };
 
+/** Write a preset's tuples onto one element, starting at `sf`.
+ *
+ *  Shared by `apply_preset` and `apply_preset_stagger`, which carried
+ *  byte-identical copies of this loop — and so would have needed the same fix
+ *  twice.
+ *
+ *  A slide/shake offset is CANVAS-space travel ("come in from 200px to the
+ *  left" is a statement about the screen), but x/y are stored in the element's
+ *  PARENT space. Inside a group at scale 1.5 the raw offset travelled 300px,
+ *  and inside a rotated group a left-slide arrived diagonally. So the positional
+ *  tuples are summed per frame into one vector, converted through the ancestor
+ *  chain, and written back per axis. A rotated ancestor genuinely turns
+ *  single-axis canvas travel into both parent axes, so an x-only preset gains a
+ *  y track there; at the top level the conversion is exactly identity, so the
+ *  flat case is unchanged and gains nothing. */
+const applyPresetTuples = (
+  next: Composition,
+  elementId: string,
+  sf: number,
+  tuples: PresetTuple[],
+): Array<{ property: TrackProperty; frame: number; value: number }> => {
+  const base = baseForElement(next, elementId);
+  const writes: Array<{ property: TrackProperty; frame: number; value: number }> = [];
+
+  const offsetsByFrame = new Map<number, { x: number; y: number }>();
+  const easingByFrame = new Map<number, Easing>();
+  for (const t of tuples) {
+    if (t.property !== "x" && t.property !== "y") continue;
+    const frame = Math.max(0, Math.round(sf + t.frame));
+    const at = offsetsByFrame.get(frame) ?? { x: 0, y: 0 };
+    at[t.property] += t.value;
+    offsetsByFrame.set(frame, at);
+    // First positional tuple at a frame wins the easing. Every shipped preset
+    // has exactly one, so this only decides a case that does not exist yet —
+    // stated rather than left to be discovered by whoever writes the first
+    // diagonal preset.
+    if (!easingByFrame.has(frame)) easingByFrame.set(frame, t.easing ?? "easeInOut");
+  }
+  const parentOffsets = new Map<number, { x: number; y: number }>();
+  for (const [frame, off] of offsetsByFrame) {
+    const pd = canvasDeltaToParentSpace(
+      next,
+      elementId,
+      frame,
+      undefined,
+      canvasDelta(off.x, off.y),
+    );
+    parentOffsets.set(frame, { x: pd.x, y: pd.y });
+  }
+  const frames = [...parentOffsets.keys()].sort((a, b) => a - b);
+  // An axis gets a track only if the travel actually touches it. Every frame of
+  // the travel then gets a keyframe on that axis, so a converted cross-axis
+  // component animates across the whole move rather than only where the
+  // original tuple happened to sit.
+  const axisLive = {
+    x: frames.some((f) => parentOffsets.get(f)!.x !== 0),
+    y: frames.some((f) => parentOffsets.get(f)!.y !== 0),
+  };
+  for (const frame of frames) {
+    const pd = parentOffsets.get(frame)!;
+    const easing = easingByFrame.get(frame) ?? "easeInOut";
+    for (const axis of ["x", "y"] as const) {
+      if (!axisLive[axis]) continue;
+      const value = (axis === "x" ? base.x : base.y) + pd[axis];
+      upsertKeyframe(next, elementId, axis, frame, value, easing);
+      writes.push({ property: axis, frame, value });
+    }
+  }
+
+  for (const t of tuples) {
+    if (t.property === "x" || t.property === "y") continue;
+    const frame = Math.max(0, Math.round(sf + t.frame));
+    upsertKeyframe(next, elementId, t.property, frame, t.value, t.easing ?? "easeInOut");
+    writes.push({ property: t.property, frame, value: t.value });
+  }
+  return writes;
+};
+
 const applyPreset: ToolDispatch<ApplyPresetArgs> = (project, args) => {
   const { elementId, preset, startFrame } = args;
   if (!elementId) {
@@ -3986,19 +4159,7 @@ const applyPreset: ToolDispatch<ApplyPresetArgs> = (project, args) => {
   const sf = startFrame === undefined ? 0 : Math.round(startFrame);
   const tuples = PRESET_TUPLES[preset as AnimationPreset];
   const next = cloneProject(project);
-  const base = baseForElement(next, elementId);
-  const writes: Array<{ property: TrackProperty; frame: number; value: number }> = [];
-  for (const t of tuples) {
-    const frame = Math.max(0, Math.round(sf + t.frame));
-    const value =
-      t.property === "x"
-        ? base.x + t.value
-        : t.property === "y"
-          ? base.y + t.value
-          : t.value;
-    upsertKeyframe(next, elementId, t.property, frame, value, t.easing ?? "easeInOut");
-    writes.push({ property: t.property, frame, value });
-  }
+  const writes = applyPresetTuples(next, elementId, sf, tuples);
   return {
     project: next,
     result: { ok: true, data: { elementId, preset, startFrame: sf, writes } },
@@ -4072,17 +4233,7 @@ const applyPresetStagger: ToolDispatch<ApplyPresetStaggerArgs> = (project, args)
   for (let i = 0; i < ids.length; i++) {
     const elementId = ids[i] as string;
     const sf = Math.max(0, Math.round(startFrame + i * stagger));
-    const base = baseForElement(next, elementId);
-    for (const t of tuples) {
-      const frame = Math.max(0, Math.round(sf + t.frame));
-      const value =
-        t.property === "x"
-          ? base.x + t.value
-          : t.property === "y"
-            ? base.y + t.value
-            : t.value;
-      upsertKeyframe(next, elementId, t.property, frame, value, t.easing ?? "easeInOut");
-    }
+    applyPresetTuples(next, elementId, sf, tuples);
   }
   return {
     project: next,
@@ -5088,7 +5239,7 @@ const numericTracks = (layer: AnyLayer): FrameTrack[] => [
 const isClipMover = (eid: string, layer: AnyLayer): boolean =>
   eid.startsWith("video.") && !layer.block;
 
-const groupTimeCarriers = (
+export const groupTimeCarriers = (
   project: Composition,
   elementId: string,
 ): { movers: string[]; earliest: number } => {
@@ -5176,8 +5327,33 @@ const shiftGroup: ToolDispatch<ShiftGroupArgs> = (project, args) => {
     };
   }
   const next = cloneProject(project);
+  applyTimeShift(next, movers, delta);
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { elementId, start: currentStart + delta, delta, moved: movers.length },
+    },
+  };
+};
+
+// Slide every mover by `delta`, IN PLACE. Extracted from shift_group so the
+// arrival re-time (src/arrival.ts — paste / duplicate / add-from-collection
+// landing at the playhead) moves things the same way a group move does, rather
+// than growing a second copy of these three branches.
+//
+// `movers` comes from `groupTimeCarriers`, and the caller owns the clamp: the
+// delta is applied as a RIGID BODY, so it must already be reduced so nothing
+// lands before frame 0. Clamping per-frame here would collapse keyframes onto 0
+// and silently destroy the shape of an animation.
+export const applyTimeShift = (
+  project: Composition,
+  movers: readonly string[],
+  delta: number,
+): void => {
+  if (delta === 0) return;
   for (const eid of movers) {
-    const target = layerOf(next, eid);
+    const target = layerOf(project, eid);
     if (!target) continue;
     if (isClipMover(eid, target)) {
       const clip = target as VideoLayer;
@@ -5214,13 +5390,6 @@ const shiftGroup: ToolDispatch<ShiftGroupArgs> = (project, args) => {
       for (const kf of track) (kf as { frame: number }).frame += delta;
     }
   }
-  return {
-    project: next,
-    result: {
-      ok: true,
-      data: { elementId, start: currentStart + delta, delta, moved: movers.length },
-    },
-  };
 };
 
 type SetGroupWindowArgs = {
@@ -7738,7 +7907,7 @@ const setLoop: ToolDispatch<SetLoopArgs> = (project, args) => {
 // distorts (a circle stays a circle) — then recentred so the old composition
 // centre maps to the new canvas centre. On a same-aspect resize the recentre
 // term cancels and this reduces to a plain uniform scale. Mirrors the editor's
-// CanvasSizePill behaviour — both the editor store and this tool call
+// CanvasSizePicker behaviour — both the editor store and this tool call
 // reflowPage.
 
 // Reflow page `index` into a new canvas size: its layers are fit-scaled and
@@ -8384,8 +8553,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: "string",
             description: "video.<id>, image.<id>, shapes.<id>, or group.<id>.",
           },
-          x: { type: "number", description: "Centre x in 1080-wide base coords." },
-          y: { type: "number", description: "Centre y in 1920-tall base coords." },
+          x: {
+            type: "number",
+            description:
+              "Centre x in the element's OWN frame. At root that is canvas coords (1080 wide); INSIDE A GROUP it is the group's space, so it is not where the layer sits on the canvas. inspect_layers reports both — write back the `x` it gave you, and read `canvas_x` for the on-canvas position.",
+          },
+          y: {
+            type: "number",
+            description:
+              "Centre y in the element's OWN frame — canvas coords (1920 tall) at root, the group's space inside a group. See `x`.",
+          },
           width: { type: "number", description: "Width in px (must be > 0)." },
           height: { type: "number", description: "Height in px (must be > 0)." },
           rotation: { type: "number", description: "Rotation in degrees, clockwise." },
@@ -8886,7 +9063,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_layer_fill",
       description:
-        "Set a layer's fill. The canvas backdrop is the pinned is_background image_layer (its element id is exposed via describe_video as background.elementId; the literal 'background.canvas' is also accepted as a synonym); null is rejected on the backdrop. Shapes require a Fill (null/missing is rejected). Image / video / text / group layers accept a Fill object (or `#rrggbb` hex) to paint a backdrop, or `null` to clear it — clearing removes the layer's fill colour keyframes too, so an animated backdrop really does go away. Shapes paint their body; image/video paint behind the bitmap; groups paint a rect centred on the pivot sized by (box_width, box_height).",
+        "Set a layer's fill. The canvas backdrop is the pinned is_background image_layer (its element id is exposed via describe_video as background.elementId; the literal 'background.canvas' is also accepted as a synonym); null is rejected on the backdrop. Shapes require a Fill (null/missing is rejected). Image / video / text / group layers accept a Fill object (or `#rrggbb` hex) to paint a backdrop, or `null` to clear it — clearing removes the layer's fill colour keyframes too, so an animated backdrop really does go away. Shapes paint their body; image/video paint behind the bitmap; groups paint a rect centred on the pivot sized by (box_width, box_height). REFUSED on a layer whose fill is ANIMATED (it has colour keyframes): the track wins at every frame, so a plain fill write would be invisible. Change it at a frame with add_color_keyframe, or pass clear_animation:true to replace the animation with this fill.",
       parameters: {
         type: "object",
         properties: {
@@ -8897,6 +9074,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           fill: {
             description:
               'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/text/group only) clears the backdrop, including any fill colour keyframes on it.',
+          },
+          clear_animation: {
+            type: "boolean",
+            description:
+              "Only meaningful on a layer whose fill is animated. true = this fill REPLACES the colour animation (its keyframes are deleted). Omitted / false = the call is refused rather than writing a fill the animation would hide.",
           },
         },
         required: ["elementId", "fill"],
@@ -8933,6 +9115,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           strokeColor: {
             type: "string",
             description: "Box outline colour as #rrggbb.",
+          },
+          clear_animation: {
+            type: "boolean",
+            description:
+              "Only meaningful when `fill` is given AND the layer's backdrop fill is animated. true = the new fill REPLACES the colour animation. Omitted / false = the call is refused rather than writing a fill the animation would hide.",
           },
         },
         required: ["elementId"],
