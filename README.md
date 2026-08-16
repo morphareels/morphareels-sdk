@@ -99,7 +99,7 @@ npm i playwright   # optional peer dep; only needed for renderFrame()
 const [start, middle, end] = await morpha.renderFrames(id, [0, 150, 300]);
 ```
 
-Same pixels as the one-at-a-time path; the saving is the fixed per-frame cost, so it grows with the number of frames. Measured against production: 5 frames of a 2 MB clip 8.3s → 5.5s, 10 frames of an 8 MB clip 18.8s → 9.9s.
+Same pixels as the one-at-a-time path; the saving is the fixed per-frame cost, so it grows with the number of frames. Measured against production: **5 frames 9.2s → 3.4s (2.7×), 10 frames 18.8s → 4.9s (3.9×)**.
 
 ## Export MP4 without ffmpeg
 

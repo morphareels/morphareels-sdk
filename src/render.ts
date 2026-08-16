@@ -93,12 +93,16 @@ export interface RenderFramesOptions extends Omit<RenderFrameOptions, "frame"> {
  * once and is asked to re-seek, so the second and subsequent frames cost a seek
  * and a repaint.
  *
- * Measured against production, batch first so a warm profile could not flatter
- * the comparison: 5 frames of a 2 MB clip, 8.3s -> 5.5s (1.5x); 10 frames of an
- * 8 MB clip, 18.8s -> 9.9s (1.9x). The seek itself is the floor and both paths
- * pay it, so the saving is the fixed per-frame cost and grows with the number
- * of frames — worth reaching for when sampling a strip, not a reason to batch
- * two.
+ * Measured with the published package against the deployed page: 5 frames of a
+ * 2 MB clip, 9.2s -> 3.4s (2.7x); 10 frames, 18.8s -> 4.9s (3.9x). The saving
+ * grows with the frame count, because what it removes is the fixed per-frame
+ * cost — worth reaching for when sampling a strip, not a reason to batch two.
+ *
+ * Measure this against a deployment that HAS __morphaRenderAt. Against one that
+ * does not, the fallback below quietly turns every frame back into a
+ * navigation: the pixels still match, so nothing looks wrong, and the numbers
+ * describe the fallback rather than the feature. That is how the first set of
+ * figures here came to be understated.
  *
  * Falls back to a per-frame navigation when the page cannot re-seek — an older
  * deployment that predates `__morphaRenderAt`, or a layer served by an injected

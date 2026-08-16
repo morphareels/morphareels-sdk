@@ -3436,26 +3436,6 @@ export type Easing = z.infer<typeof easingSchema>;
 export type Keyframe = z.infer<typeof keyframeSchema>;
 export type TrackProperty = z.infer<typeof trackPropertySchema>;
 
-// The TRANSFORM group — where the layer is, how big, how turned. Everything
-// else on a layer is appearance: `opacity` composites it, `curve` bends text.
-//
-// The split is load-bearing, not descriptive. The Inspector's leaf fields will
-// start a track on a static property when a SIBLING TRANSFORM is already
-// animated (the FCP affordance: an animated layer keeps animating). Scoping
-// that to this group is the whole point — FCP couples the Transform group and
-// nothing wider, so a layer that merely fades in must not have its position
-// animated because you typed a number into Y.
-export const TRANSFORM_TRACK_PROPERTIES = [
-  "x",
-  "y",
-  "width",
-  "height",
-  "rotation",
-  "scale",
-] as const satisfies readonly TrackProperty[];
-
-export const isTransformProperty = (p: TrackProperty): boolean =>
-  (TRANSFORM_TRACK_PROPERTIES as readonly TrackProperty[]).includes(p);
 export type ElementTracks = z.infer<typeof elementTracksSchema>;
 export type Animations = z.infer<typeof animationsSchema>;
 export type Project = z.infer<typeof projectSchema>;
