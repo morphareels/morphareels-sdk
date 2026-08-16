@@ -410,7 +410,13 @@ export const uniquifyDerivedName = (raw: string): string => {
   const stem = dot > 0 ? base.slice(0, dot) : base;
   const ext = dot > 0 ? base.slice(dot) : "";
   const token = randomUUID().replace(/-/g, "").slice(0, 8);
-  return `${stem}-${token}${ext}`;
+  // Leave room for the token under the server's name cap. It trims overflow
+  // off the END of the stem, which is where the token sits — so a long name
+  // lost the token and collided again. The stem is the part that can afford to
+  // lose characters.
+  const room = 100 - ext.length - token.length - 1;
+  const keep = room > 0 ? stem.slice(0, room) : "";
+  return `${keep}-${token}${ext}`;
 };
 
 /** Every unique clip filename a project references. A project is pages-only —
