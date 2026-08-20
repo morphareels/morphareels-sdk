@@ -13,10 +13,10 @@
 //
 // 2. Freshness. `renderFrame`/`renderVideo` reuse a PERSISTENT per-project
 //    Chromium profile, so its HTTP disk cache outlives a render. Project JSON
-//    revalidates on its own, but `/assets/:p/:f` is served `immutable,
-//    max-age=3600` and `/clips/:p/:f` `max-age=300` — replace an image or clip
-//    under the same filename and a warm profile will paint the OLD bytes,
-//    with no request to the server at all, for up to an hour. So every
+//    and `/assets/:p/:f` revalidate on their own (`private, no-cache`), but
+//    `/clips/:p/:f` is served `private, max-age=300` — replace a clip under
+//    the same filename and a warm profile will paint the OLD bytes, with no
+//    request to the server at all, for up to five minutes. So every
 //    Morpha-origin request is routed (Playwright routing bypasses the HTTP
 //    cache) AND carries an explicit `cache-control: no-cache`, which is the
 //    part that does not depend on that Playwright behaviour staying true.
