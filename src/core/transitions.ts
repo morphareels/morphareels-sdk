@@ -460,3 +460,23 @@ export const bornLayerDefaults = (
     transition_out: out,
   };
 };
+
+/**
+ * The ramp length a layer's edge gets when the user turns a transition ON from
+ * a hard cut, in the editor.
+ *
+ * ONE resolver, because the two constants above are the same decision made
+ * per layer kind and the two UI hosts of the edge editor (the Inspector's
+ * Animation row and the timeline's edge-slot popover) must hand the same
+ * layer the same first length. Before this existed the Inspector handed a
+ * video clip the OVERLAY length while `DEFAULT_VIDEO_TRANSITION_FRAMES` sat
+ * unused, documenting a rule nothing implemented.
+ *
+ * Editor-only by design: the pure `set_layer_transition` keeps its documented
+ * default (an agent that omits `frames` gets the overlay length whatever the
+ * layer), so this is the first-CLICK default, not the API default.
+ */
+export const defaultTransitionFrames = (elementId: string): number =>
+  elementId.startsWith("video.")
+    ? DEFAULT_VIDEO_TRANSITION_FRAMES
+    : DEFAULT_OVERLAY_TRANSITION_FRAMES;
