@@ -51,11 +51,13 @@ export type {
 // ── Processing (real local browser) — proxy / audio split / transcription /
 // OCR / object detection for an uploaded clip. The agent-flow way to make a
 // clip's caches + artifacts exist without opening the editor.
-export { processClip, processClips } from "./process.ts";
+export { processClip, processClips, outcomeFromManifest } from "./process.ts";
 export type {
   ProcessClipOptions,
   ProcessClipsOptions,
   ProcessClipOutcome,
+  ProcessStep,
+  OptionalProcessStep,
 } from "./process.ts";
 
 // ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───

@@ -10,20 +10,24 @@
 
 import { routeMorphaOrigin } from "./browser-auth.ts";
 
-/** A processing step. `transcript` + `audio_split` are the audio-only steps the
- *  caption flow needs; `proxy` / `text_regions` decode video frames
- *  (slow in headless Chrome). Pass a subset as `steps` to run only those. */
-export type ProcessStep =
-  | "proxy"
-  | "audio_split"
-  | "transcript"
-  | "text_regions";
+/** The OPTIONAL processing steps a run may be restricted to. `transcript` +
+ *  `audio_split` are the audio-only steps the caption flow needs;
+ *  `text_regions` decodes video frames (slow in headless Chrome). The preview
+ *  proxy is NOT on this list: it is mandatory and runs on every processing
+ *  run, because it is what makes the clip usable in the editor. (The source of
+ *  these two types is editor/src/processing/process-clip-headless.ts; this
+ *  file mirrors them because the SDK cannot import editor code.) */
+export type OptionalProcessStep = "audio_split" | "transcript" | "text_regions";
+/** Every step a run reports on, the mandatory proxy included. */
+export type ProcessStep = "proxy" | OptionalProcessStep;
 
 export interface ProcessClipOutcome {
   clip: string;
-  /** false when the route reported a fatal error or timed out. Individual steps
-   *  can still be "unavailable"/"error" on an otherwise ok run (e.g. a clip with
-   *  no audio track) — inspect `steps`. */
+  /** true only when the run finished AND the mandatory proxy landed
+   *  (`steps.proxy === "ready"`). false when the page reported a fatal error,
+   *  the run timed out, or the proxy could not be built — `error` says which.
+   *  OPTIONAL steps can still be "unavailable"/"error" on an ok run (e.g. a
+   *  clip with no audio track) — inspect `steps` / `reasons`. */
   ok: boolean;
   steps?: Record<string, string>;
   /** Per-step failure reason (from each pass's `error`), when the page recorded
@@ -45,10 +49,10 @@ export interface ProcessClipOptions {
   /** Per-clip deadline. Default 300000 — proxy transcode + WASM-fallback Whisper
    *  in headless Chrome is much slower than a render; raise for long clips. */
   timeoutMs?: number;
-  /** Restrict processing to these steps (default: all). The fast caption path is
-   *  `["transcript", "audio_split"]` — it skips the slow/fragile video-frame
-   *  passes (proxy, OCR) so the run finishes in seconds. */
-  steps?: ProcessStep[];
+  /** Restrict the OPTIONAL steps to these (default: all of them). The fast
+   *  caption path is `["transcript", "audio_split"]` — it skips the slow per-
+   *  frame OCR pass. The proxy runs regardless; it cannot be named here. */
+  steps?: OptionalProcessStep[];
 }
 
 export interface ProcessClipsOptions extends Omit<ProcessClipOptions, "clip"> {
@@ -152,7 +156,7 @@ const runOne = async (
   projectId: string,
   clip: string,
   timeout: number,
-  steps?: ProcessStep[],
+  steps?: OptionalProcessStep[],
 ): Promise<ProcessClipOutcome> => {
   // Baseline so we detect THIS run's manifest rewrite, not a stale prior one.
   const baseline = (await readManifest(origin, token, projectId, clip)).updatedAt;
@@ -175,16 +179,40 @@ const runOne = async (
   while (Date.now() < deadline) {
     await sleep(5_000);
     last = await readManifest(origin, token, projectId, clip);
-    if (last.updatedAt > baseline) {
-      return { clip, ok: true, steps: last.steps, reasons: last.reasons };
-    }
+    if (last.updatedAt > baseline) break;
   }
+  return outcomeFromManifest(clip, last, baseline, timeout);
+};
+
+/** One run's outcome, judged from the manifest the page writes at the END of
+ *  its run. Finished = the manifest's `updatedAt` advanced past the baseline
+ *  read before navigation. `ok` requires BOTH that and the mandatory proxy
+ *  being ready — an agent that only checks `ok` cannot leave a clip
+ *  un-optimised without noticing. Optional-step failures are reported in
+ *  `steps` / `reasons` and do not fail the run. Pure; exported for tests. */
+export const outcomeFromManifest = (
+  clip: string,
+  manifest: {
+    updatedAt: number;
+    steps?: Record<string, string>;
+    reasons?: Record<string, string>;
+  },
+  baseline: number,
+  timeoutMs: number,
+): ProcessClipOutcome => {
+  const base = { clip, steps: manifest.steps, reasons: manifest.reasons };
+  if (!(manifest.updatedAt > baseline)) {
+    return {
+      ...base,
+      ok: false,
+      error: `processing did not finish within ${Math.round(timeoutMs / 1000)}s for clip ${clip} — raise timeoutMs`,
+    };
+  }
+  if (manifest.steps?.proxy === "ready") return { ...base, ok: true };
   return {
-    clip,
+    ...base,
     ok: false,
-    steps: last.steps,
-    reasons: last.reasons,
-    error: `processing did not finish within ${Math.round(timeout / 1000)}s for clip ${clip} — raise timeoutMs`,
+    error: `proxy not built: ${manifest.reasons?.proxy ?? "unknown"}`,
   };
 };
 

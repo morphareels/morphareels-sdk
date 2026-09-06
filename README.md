@@ -49,13 +49,14 @@ projectSchema.parse(project); // it's a valid Morpha project, ready to save or r
 
 ## Add a video clip (upload **and** process)
 
-Clip ingest is npm-only: `addVideo` uploads the clip **and** runs the full processing pipeline — proxy build, audio split, transcription, OCR — so the clip is editor-ready and the `transcribeClip` / `detectTextRegions` readers light up. (Processing runs in a real local Chrome, like `renderFrame` — install Playwright + Chrome.)
+Clip ingest is npm-only, and `addVideo` is the only way in: it uploads the clip **and** runs the processing pipeline — preview proxy, audio split, transcription, OCR — so the clip is editor-ready and the `transcribeClip` / `detectTextRegions` readers light up. (Processing runs in a real local Chrome, like `renderFrame` — install Playwright + Chrome.)
 
 ```ts
 const morpha = createClient({ token: process.env.MORPHA_API_KEY });
 
 const { filename, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
-// processing.steps → { proxy, audio_split, transcript, text_regions }
+// processing.ok      → true only once the preview proxy landed
+// processing.steps   → { proxy, audio_split, transcript, text_regions }
 // processing.reasons → per-step failure reason when a step didn't succeed
 await morpha.callTool(id, "add_video_layer", { clip: filename, x: 540, y: 960, width: 1080, height: 1920 });
 
@@ -64,18 +65,20 @@ const t = await morpha.transcribeClip(id, filename); // now { status: "ready", d
 
 `addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). Large local files upload in **chunked multipart**, so a big clip on a slow uplink won't time out.
 
-**Fast caption path** — the per-frame OCR + object-detection passes are the slow part and are irrelevant for talking-head captioning. Pass `steps` to run only what captions need:
+**The preview proxy is mandatory.** It is what the editor plays instead of the full-bitrate original, so every processing run builds it and `steps` cannot name it (the type will not let you). `processing.ok` is false when it did not land, with the reason in `processing.error`; check it.
+
+**Fast caption path** — the per-frame OCR pass is the slow part and is irrelevant for talking-head captioning. Pass `steps` to narrow the optional steps to what captions need:
 
 ```ts
 const { filename, processing } = await morpha.addVideo(
   id,
   { file: "/abs/clip.mp4", durationSeconds: 61 },
-  { steps: ["transcript", "audio_split"] }, // skip proxy + OCR + object detection
+  { steps: ["transcript", "audio_split"] }, // skip OCR; the proxy still builds
 );
 // processing.steps.transcript === "ready" in seconds → captions ready
 ```
 
-To (re)process clips added another way: `processClip(id, clip)` / `processProject(id)` (both accept the same `steps`). Check state any time with `clipProcessingStatus(id)`.
+To (re)process clips added another way: `processClip(id, clip)` / `processProject(id)` (both accept the same `steps`, and both build any missing proxy). Check state any time with `clipProcessingStatus(id)`.
 
 ## Render a video frame to PNG (no ffmpeg)
 
