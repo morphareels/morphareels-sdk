@@ -93,6 +93,21 @@ export interface CacheReadResult {
 export interface MorphaClient {
   /** Fetch a hosted project's JSON (migrated + schema-validated). */
   getProject(projectId: string): Promise<Project>;
+  /**
+   * Give people access to a project by email address. `editors` is the subset
+   * of `emails` that may also edit; everyone else on the list is read-only.
+   * Both lists REPLACE what was there, so pass the full set each time.
+   *
+   * This is how an agent hands finished work back to a human. An account made
+   * with {@link registerAccount} cannot be signed into, so sharing the project
+   * to the person's own address, and giving them `<origin>/app/<projectId>`,
+   * is what lets them open it. They sign in as themselves and it is there.
+   */
+  shareProject(
+    projectId: string,
+    emails: string[],
+    editors?: string[],
+  ): Promise<void>;
   /** The hosted tool catalog (the full superset — pure tools + server tools),
    *  OpenAI tool shape: `{ type: "function", function: { name, description, parameters } }`. */
   listTools(): Promise<ToolFunction[]>;
@@ -446,6 +461,27 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return h;
   };
 
+  const shareProject = async (
+    projectId: string,
+    emails: string[],
+    editors: string[] = [],
+  ): Promise<void> => {
+    const res = await doFetch(
+      `${origin}/api/project/${encodeURIComponent(projectId)}/share`,
+      {
+        method: "PUT",
+        headers: headers({ "content-type": "application/json" }),
+        body: JSON.stringify({ emails, editors }),
+      },
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `shareProject failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}`,
+      );
+    }
+  };
+
   const getProject = async (projectId: string): Promise<Project> => {
     const res = await doFetch(
       `${origin}/api/project/${encodeURIComponent(projectId)}`,
@@ -730,6 +766,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
 
   return {
     getProject,
+    shareProject,
     listTools,
     callTool,
 

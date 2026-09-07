@@ -60,6 +60,12 @@ export type {
   OptionalProcessStep,
 } from "./process.ts";
 
+// ── Registration (no browser, no human) ─────────────────────────────────────
+// The way in for an agent holding no credential at all: mint a fresh account
+// and get an `mp_…` key back, then hand it straight to createClient({ token }).
+export { registerAccount } from "./register.ts";
+export type { RegisterAccountOptions, RegisteredAccount } from "./register.ts";
+
 // ── Hosted client (the programmatic equivalent of driving Morpha over MCP) ───
 // createClient({ token }) → getProject / listTools / callTool / addVideo /
 // processClip / renderFrame.

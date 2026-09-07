@@ -8978,11 +8978,15 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     type: "function",
     function: {
       name: "remove_layer",
-      description: "Delete a video, image, or shape layer.",
+      description:
+        "Delete a video, image, text, or shape LEAF layer. Errors on a group.<id> (dissolve it with ungroup_layers instead) and on a pinned layer such as the canvas backdrop. Deleting a video layer also takes everything welded to that clip: its welded audio overlay(s) and its welded caption lines, both of which derive their timing from the clip's trim and have no meaning without it.",
       parameters: {
         type: "object",
         properties: {
-          elementId: { type: "string", description: "image.<id> or shapes.<id>." },
+          elementId: {
+            type: "string",
+            description: "video.<id>, image.<id>, text.<id>, or shapes.<id>.",
+          },
         },
         required: ["elementId"],
       },
