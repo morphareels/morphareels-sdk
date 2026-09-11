@@ -116,7 +116,7 @@ const mp4 = await renderVideo({ projectId: "demo", token: process.env.MORPHA_API
 await writeFile("video.mp4", mp4);
 ```
 
-It renders at 2× the canvas by default (2160×3840 for a portrait canvas); pass `scale: 1` for the canvas's own size. Like `renderFrame()`, this needs Playwright + system Chrome (`channel: "chrome"` — Chromium can't encode H.264).
+It renders at 2× the canvas by default (2160×3840 for a portrait canvas); pass `scale: 1` for the canvas's own size. Like `renderFrame()`, this needs Playwright + system Chrome (`channel: "chrome"` — Chromium can't encode H.264). If the composition has sound but the browser can't encode AAC (Chrome on Linux ships without an AAC encoder), it throws rather than return a silent file; pass `allowSilentAudio: true` to accept one.
 
 ## Auto-caption a clip
 

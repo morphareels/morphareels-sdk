@@ -3,6 +3,10 @@ import path from "node:path";
 import { mkdirSync } from "node:fs";
 import { routeMorphaOrigin } from "./browser-auth.ts";
 import { DEFAULT_EXPORT_SCALE, type ExportScale } from "./core/export-scale.ts";
+import type {
+  ExportAudioOutcome,
+  ExportPageGlobals,
+} from "./core/render-export-protocol.ts";
 
 export interface RenderFrameOptions {
   /** Project id, served at `${origin}/api/project/<id>`. */
@@ -351,7 +355,28 @@ export interface RenderVideoOptions {
    * re-fetched cold on every call.
    */
   cacheDir?: string;
+  /**
+   * Accept an MP4 without its sound. By default renderVideo throws when the
+   * composition has sound but the browser could not encode it: Chrome on
+   * Linux ships without an AAC encoder, so the file would come back silent.
+   * Chrome on macOS or Windows has one. Pass true to take the silent file.
+   */
+  allowSilentAudio?: boolean;
 }
+
+/** Throw when an export came out without sound it should have had, unless the
+ * caller accepts a silent file. `undefined` is a deployment from before the
+ * page reported sound, and it passes through as it always did. */
+export const assertExportAudio = (
+  audio: ExportAudioOutcome | undefined,
+  projectId: string,
+  allowSilentAudio: boolean,
+): void => {
+  if (audio !== "encoder-missing" || allowSilentAudio) return;
+  throw new Error(
+    `Morpha export for project ${projectId} has no sound: this Chrome has no AAC audio encoder (Chrome on Linux ships without one). Run renderVideo where Chrome can encode AAC (macOS or Windows), or pass { allowSilentAudio: true } to accept the silent MP4.`,
+  );
+};
 
 /**
  * Render a project's FULL composition to an MP4 Buffer using a REAL local
@@ -360,6 +385,8 @@ export interface RenderVideoOptions {
  * project loaded, waits for the encode to finish, and returns the MP4 bytes.
  * Requires `playwright` installed (optional peer dependency) and Google Chrome
  * available (the default `channel: "chrome"` — Chromium can't encode H.264).
+ * A composition with sound that comes back silent throws unless
+ * `allowSilentAudio` is set (see assertExportAudio).
  */
 export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => {
   let pw: typeof import("playwright");
@@ -401,8 +428,7 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
       await waitUntilReady(
         page,
         () =>
-          (window as unknown as { __morphaExportReady?: boolean })
-            .__morphaExportReady === true,
+          (window as unknown as ExportPageGlobals).__morphaExportReady === true,
         timeout,
       );
     } catch (err) {
@@ -422,24 +448,22 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     }
 
     const status = (await page.evaluate(() => {
-      const w = window as unknown as {
-        __morphaExportStatus?: string;
-        __morphaExportError?: string;
+      const w = window as unknown as ExportPageGlobals;
+      return {
+        status: w.__morphaExportStatus,
+        error: w.__morphaExportError,
+        audio: w.__morphaExportAudio,
       };
-      return { status: w.__morphaExportStatus, error: w.__morphaExportError };
-    })) as { status?: string; error?: string };
+    })) as { status?: string; error?: string; audio?: ExportAudioOutcome };
     if (status.status !== "ok") {
       throw new Error(
         `Morpha export failed for project ${opts.projectId}: ${status.error ?? "export reported not-ok"}`,
       );
     }
+    assertExportAudio(status.audio, opts.projectId, opts.allowSilentAudio === true);
 
     const handoff = (await page.evaluate(() => {
-      const w = window as unknown as {
-        __morphaExportScale?: number;
-        __morphaExportSize?: number;
-        __morphaExportChunk?: unknown;
-      };
+      const w = window as unknown as ExportPageGlobals;
       return {
         scale: w.__morphaExportScale,
         size: w.__morphaExportSize,
@@ -466,9 +490,9 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
         page.evaluate(
           ([o, n]) =>
             (
-              window as unknown as {
-                __morphaExportChunk: (o: number, n: number) => Promise<string>;
-              }
+              window as unknown as Required<
+                Pick<ExportPageGlobals, "__morphaExportChunk">
+              >
             ).__morphaExportChunk(o, n),
           [offset, length] as [number, number],
         ),

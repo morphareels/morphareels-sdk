@@ -17,8 +17,27 @@
 //                                            duration readouts)
 //   formatClockTenths    frames  → M:SS.t    tenths, for playback progress
 //   parseFrameInput      string  → frames    "m:ss(.fff)" / bare frames / "end"
+//   formatTimeLeft       minutes → words     time left on a running job, for
+//                                            the clip card ("About 3 min left")
 
 const FPS = 30;
+
+// Time left on a job running in the tab, from time-left.ts's whole-minute
+// estimate (0 = under a minute). "sentence" is the clip card's own line;
+// "phrase" follows a pill label ("Optimizing… 34% · 3 min left"). Never a
+// seconds countdown: an estimate that ticks by the second reads as a promise.
+export const formatTimeLeft = (
+  minutes: number,
+  form: "sentence" | "phrase" = "sentence",
+): string => {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  const span = h === 0 ? `${m} min` : m === 0 ? `${h} hr` : `${h} hr ${m} min`;
+  if (form === "phrase") {
+    return minutes === 0 ? "under a minute left" : `${span} left`;
+  }
+  return minutes === 0 ? "Less than a minute left" : `About ${span} left`;
+};
 
 // Clock-time readout — M:SS.ff, frame-accurate but NEVER shows a raw frame
 // count; null renders as "end". Negative frames clamp to 0:00.00 (drag labels
