@@ -32,6 +32,7 @@ import {
   blankPage,
   clampActiveIndex,
   compositionForPage,
+  VERSIONS_AS_PAGES_GUIDANCE,
   writeCompositionBack,
 } from "./carousel.ts";
 import { fitCurveBox } from "./curve-bbox.ts";
@@ -10734,7 +10735,9 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_page",
       description:
-        "Append a page to the project — works on any project, turning a single-page video into a multi-page one. Without duplicate_index a blank page is appended, sized to the project's canvas. With duplicate_index the page at that position is deep-copied (a fresh id is minted). There is no limit on page count. The new page becomes the active page; its index is returned.",
+        "Append a page to the project — works on any project, turning a single-page video into a multi-page one. Without duplicate_index a blank page is appended, sized to the project's canvas. With duplicate_index the page at that position is deep-copied (a fresh id is minted). There is no limit on page count. The new page becomes the active page; its index is returned. " +
+        VERSIONS_AS_PAGES_GUIDANCE +
+        " To edit the copies, select_page each one and describe_video for its element ids; to export them, use the editor's Videos option or renderVideo with page.",
       parameters: {
         type: "object",
         properties: {

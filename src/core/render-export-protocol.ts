@@ -5,16 +5,6 @@
 
 import type { ExportScale } from "./export-scale.ts";
 
-/** What became of the composition's sound in a finished export.
- *  - "encoded": the file carries an AAC track with the mix.
- *  - "none": there was nothing to encode (no clip and no overlay, or audio
- *    was not asked for), so the file has no audio track.
- *  - "encoder-missing": the composition has sound but this browser has no AAC
- *    encoder (Chrome on Linux ships without one), so the file has no audio
- *    track. Every surface says so, rather than handing over a silent file as
- *    if it were complete. */
-export type ExportAudioOutcome = "encoded" | "none" | "encoder-missing";
-
 export interface ExportPageGlobals {
   __morphaExportReady?: boolean;
   __morphaExportStatus?: "ok" | "error";
@@ -25,5 +15,4 @@ export interface ExportPageGlobals {
   __morphaExportScale?: ExportScale;
   __morphaExportSize?: number;
   __morphaExportChunk?: (offset: number, length: number) => Promise<string>;
-  __morphaExportAudio?: ExportAudioOutcome;
 }

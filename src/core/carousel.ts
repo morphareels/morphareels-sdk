@@ -14,6 +14,18 @@ import type { Composition, PageComposition, Project } from "./schemas.ts";
 // carousel record with its own writer and suppressed autosave — the source of
 // the half-migrated states this model removes.) No I/O, no React, no zustand.
 
+/** The rule every agent surface carries for versions of one video: pages of
+ *  one project, never a project each. Accounts cap how many projects they hold
+ *  (src/project-caps.ts: an anonymous account holds 1, a free one 5) while
+ *  pages have no limit, and the per-page export gives one MP4 per page. The
+ *  MCP instructions, the add_page and duplicate_project descriptions and both
+ *  assistant prompts interpolate it rather than restating it. It is short on
+ *  purpose: the keyless MCP text has to stay inside Claude Code's 2,048
+ *  characters (worker/src/mcp-instructions.ts). */
+export const VERSIONS_AS_PAGES_GUIDANCE =
+  "For several versions of one video (hooks, languages, a sheet's rows), make pages of one project " +
+  "with add_page and duplicate_index. Exporting gives one video per page, and pages have no limit.";
+
 export const clampActiveIndex = (project: Project): number =>
   Math.min(Math.max(0, project.active_index), project.pages.length - 1);
 
