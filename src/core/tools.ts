@@ -45,6 +45,10 @@ import {
   bornLayerDefaults,
 } from "./transitions.ts";
 import {
+  PLATFORM_SAFE_AREA_GUIDANCE,
+  platformSafeAreaFor,
+} from "./safe-areas.ts";
+import {
   animatedFillRefusal,
   blockOf,
   clampCurve,
@@ -1611,11 +1615,19 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
     clips: lane.clips.map((c) => `video.${c.id}`),
   }));
 
+  const safeArea = platformSafeAreaFor(project.canvas_width, project.canvas_height);
+
   const data = {
     project_id: project.project_id,
     name: project.name ?? null,
     canvas_width: project.canvas_width,
     canvas_height: project.canvas_height,
+    // Where this page stays visible on TikTok, Reels and Instagram's feed. The
+    // editor shows people the same area (the Safe zones overlay and the crop
+    // marks), but an agent sees neither, so it gets the numbers and the rule.
+    platform_safe_area: safeArea
+      ? { ...safeArea, note: PLATFORM_SAFE_AREA_GUIDANCE }
+      : null,
     duration_seconds: project.duration_seconds,
     // Whether `duration_seconds` is an AUTHORED (pinned) length vs auto-fit to
     // content. `content_duration_seconds` is the length auto-fit WOULD pick
@@ -8737,7 +8749,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "describe_video",
       description:
-        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a multi-page project the tree describes the ACTIVE page and the data carries a `pages` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
+        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, platform_safe_area (the part of the canvas TikTok / Reels UI and Instagram's feed crop leave visible: keep text, captions, logos and buttons inside it; null when nothing is covered or cropped), the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a multi-page project the tree describes the ACTIVE page and the data carries a `pages` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
       parameters: { type: "object", properties: {} },
     },
   },
