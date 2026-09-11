@@ -102,10 +102,10 @@ export interface MorphaClient {
    * of `emails` that may also edit; everyone else on the list is read-only.
    * Both lists REPLACE what was there, so pass the full set each time.
    *
-   * This is how an agent hands finished work back to a human. An account made
-   * with {@link registerAccount} cannot be signed into, so sharing the project
-   * to the person's own address, and giving them `<origin>/app/<projectId>`,
-   * is what lets them open it. They sign in as themselves and it is there.
+   * To hand an ANONYMOUS account's work to a person, give them the `claimUrl`
+   * from {@link registerAccount} instead. They sign in or sign up, and the
+   * project moves into their own account: sharing only lends it to them, and
+   * the claim link makes it theirs.
    */
   shareProject(
     projectId: string,
