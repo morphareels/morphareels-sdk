@@ -11,13 +11,17 @@
 //
 // The catalog is the SAME superset MCP exposes: the pure mutation tools PLUS the
 // server tools (list/create/duplicate/rename/delete projects, save/list/restore/
-// rename/delete versions, upload clips + images, find public images, and the
-// OCR/safe-zones/transcript readers). Every one is callable here, either
-// via the generic `callTool` or a typed convenience method below.
+// rename/delete versions, upload clips + images, and the OCR/safe-zones/
+// transcript readers). Every one is callable here, either via the generic
+// `callTool` or a typed convenience method below. `findPublicImage` is not a
+// catalog tool: it searches Openverse from THIS machine and stores the pick
+// through `upload_image`.
 
 import { randomUUID } from "node:crypto";
 import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
 import type { ToolFunction } from "./core/tools.ts";
+import type { PublicImagePick } from "./core/public-image.ts";
+import { searchPublicImage, type FindPublicImageOptions } from "./public-image.ts";
 import {
   renderFrame,
   renderFrames,
@@ -248,6 +252,26 @@ export interface MorphaClient {
     projectId: string,
     opts: { url: string; filename?: string },
   ): Promise<Record<string, unknown>>;
+  /** Search Openverse's Creative Commons / public-domain pool for `query`
+   *  FROM THIS MACHINE (the quota is yours, not one shared through Morpha),
+   *  store the first downloadable, large-enough result in the project through
+   *  `upload_image`, and return `{ filename, attribution, dimensions }` ready
+   *  for `add_image_layer`. Returns null when the first page held nothing
+   *  usable; throws when Openverse itself does not answer. The connector
+   *  surfaces (MCP / HTTP) have no equivalent: there an agent finds a URL with
+   *  its own web search and calls `uploadImage`. */
+  findPublicImage(
+    projectId: string,
+    query: string,
+    opts?: FindPublicImageOptions,
+  ): Promise<
+    | (Record<string, unknown> & {
+        filename: string;
+        attribution: PublicImagePick["attribution"];
+        dimensions: PublicImagePick["dimensions"];
+      })
+    | null
+  >;
   /** Upload an audio track into a project — the only way to get audio bytes in
    *  programmatically. `{ url }` fetches a public http(s) link server-side (the
    *  `upload_audio` tool); `{ file }` streams a local path to the raw asset
@@ -279,11 +303,6 @@ export interface MorphaClient {
   ): Promise<
     Array<{ family: string; src: string; weight?: number; style?: string }>
   >;
-  findPublicImage(
-    projectId: string,
-    query: string,
-    opts?: { licenseType?: "all-cc" | "commercial" | "cc0"; minDimension?: number },
-  ): Promise<{ filename: string; attribution: unknown; dimensions: unknown }>;
 
   // ── Vision / transcription (cache-backed; may be not-ready) ────────────────
   detectTextRegions(
@@ -915,6 +934,21 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     },
     uploadImage: async (projectId, opts) =>
       (await serverData("upload_image", projectId, { ...opts })) as Record<string, unknown>,
+    findPublicImage: async (projectId, query, opts) => {
+      const pick = await searchPublicImage(query, opts);
+      if (!pick) return null;
+      const stored = (await serverData("upload_image", projectId, {
+        url: pick.url,
+        filename: pick.filename,
+      })) as Record<string, unknown> & { filename?: unknown };
+      const filename = typeof stored.filename === "string" ? stored.filename : pick.filename;
+      return {
+        ...stored,
+        filename,
+        attribution: pick.attribution,
+        dimensions: pick.dimensions,
+      };
+    },
     uploadAudio: async (projectId, source) => {
       if ("url" in source) {
         return (await serverData("upload_audio", projectId, {
@@ -943,12 +977,6 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       };
       return data.custom_fonts;
     },
-    findPublicImage: async (projectId, query, opts = {}) =>
-      (await serverData("find_public_image", projectId, {
-        query,
-        license_type: opts.licenseType,
-        min_dimension: opts.minDimension,
-      })) as { filename: string; attribution: unknown; dimensions: unknown },
 
     detectTextRegions: (projectId, target) =>
       cacheRead("detect_text_regions", projectId, { ...target }),

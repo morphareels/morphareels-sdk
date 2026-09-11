@@ -60,6 +60,16 @@ export type {
   OptionalProcessStep,
 } from "./process.ts";
 
+// ── Public image search (runs here, on the caller's quota) ──────────────────
+// The client's findPublicImage wraps this and stores the pick via upload_image.
+export { searchPublicImage, SDK_USER_AGENT } from "./public-image.ts";
+export type { FindPublicImageOptions } from "./public-image.ts";
+export type {
+  PublicImagePick,
+  PublicImageAttribution,
+  PublicImageLicenseType,
+} from "./core/public-image.ts";
+
 // ── Registration (no browser, no human) ─────────────────────────────────────
 // The way in for an agent holding no credential at all: mint a fresh account
 // and get an `mp_…` key back, then hand it straight to createClient({ token }).

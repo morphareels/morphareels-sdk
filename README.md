@@ -10,7 +10,7 @@ Requires **Node ≥ 20**.
 
 ## Drive a hosted project — the MCP-equivalent client
 
-`createClient` is the recommended way to drive a hosted Morpha account from code — the programmatic equivalent of an MCP session over the **full** catalog. Every tool you can call over MCP you can call here: the pure mutation tools **plus** the workspace/lifecycle, version, upload, and vision tools (`list_projects`, `create_project`, `save_version`, `upload_clip`, `upload_image`, `find_public_image`, `detect_text_regions`, `safe_zones`, …). Most have a typed convenience method; anything else goes through generic `callTool`.
+`createClient` is the recommended way to drive a hosted Morpha account from code, the programmatic equivalent of an MCP session over the **full** catalog. Every tool you can call over MCP you can call here: the pure mutation tools **plus** the workspace/lifecycle, version, upload, and vision tools, all listed in the [tool reference](https://morphareels.ai/docs/tools). Most have a typed convenience method; anything else goes through generic `callTool`.
 
 ```ts
 import { createClient } from "morphareels-sdk";

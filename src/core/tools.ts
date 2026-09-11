@@ -115,12 +115,57 @@ import {
 // Public types
 // ---------------------------------------------------------------------------
 
+// The JSON Schema every tool parameter is declared with, at every depth.
+//
+// `type` is required on every node. This was `Record<string, unknown>`, so a
+// parameter carrying only a description compiled and shipped: three fill
+// parameters did, and claude.ai's connector flagged each one "Parameters
+// missing type". A declared type is not decoration. MCP clients validate
+// arguments against it before a call leaves them, and every chat model that
+// reads the catalog uses it to shape the call.
+//
+// A union is a type array (`["string", "null"]`), never oneOf / anyOf / allOf.
+// Arrays are the spelling this catalog has always used, and they sit inside
+// every provider's supported subset, which the composition keywords do not
+// (Gemini's function declarations and OpenAI's strict mode leave oneOf out).
+// The keyword list is exactly what the catalog uses. Anything else is an
+// excess-property error, so a typo fails too; a keyword joins the list when a
+// tool first needs it. test/tool-schema-types.test.ts pins the rule on what
+// each surface actually serves.
+export type JsonSchemaType =
+  | "string"
+  | "number"
+  | "integer"
+  | "boolean"
+  | "object"
+  | "array"
+  | "null";
+
+export type ToolParameterSchema = {
+  type: JsonSchemaType | readonly JsonSchemaType[];
+  description?: string;
+  enum?: readonly (string | number)[];
+  properties?: Record<string, ToolParameterSchema>;
+  required?: readonly string[];
+  items?: ToolParameterSchema;
+  minItems?: number;
+  maxItems?: number;
+  minimum?: number;
+  maximum?: number;
+};
+
+// A tool's whole parameter list: an object at the root, always with properties.
+export type ToolObjectSchema = ToolParameterSchema & {
+  type: "object";
+  properties: Record<string, ToolParameterSchema>;
+};
+
 export type ToolFunction = {
   type: "function";
   function: {
     name: string;
     description: string;
-    parameters: Record<string, unknown>;
+    parameters: ToolObjectSchema;
   };
 };
 
@@ -174,6 +219,23 @@ const FILL_SHAPE_HINT =
   '{type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / ' +
   '{type:"mask",layer_id,color}. Gradient stop position key is `pos` (0..1); ' +
   "`offset` is also accepted.";
+
+// A fill parameter's schema: a "#rrggbb" string or a Fill object, plus null
+// where the call can clear a fill. Both members are deliberately bare. MCP
+// clients validate arguments against the schema before the call reaches us
+// (claude.ai does), and coerceFill accepts shapes the canonical Fill would
+// refuse: gradient aliases, a `colors` array, stops keyed by `offset`. Pinning
+// `properties`, `required` or a hex `pattern` here would refuse those on the
+// client, where the model gets a bare validation error instead of the
+// FILL_SHAPE_HINT this server answers with. The descriptions carry the
+// canonical shapes.
+const fillParameter = (
+  description: string,
+  { nullable }: { nullable: boolean },
+): ToolParameterSchema => ({
+  type: nullable ? ["string", "object", "null"] : ["string", "object"],
+  description,
+});
 
 // Accept the `"#rrggbb"` shorthand (promoted to a solid Fill at full opacity),
 // a canonical Fill object (validated through `fillSchema`), or a loosely-shaped
@@ -8342,10 +8404,114 @@ const selectPage: ProjectToolDispatch<SelectPageArgs> = (project, args) => {
 };
 
 // ---------------------------------------------------------------------------
+// JSON-encoded arguments
+// ---------------------------------------------------------------------------
+//
+// A model asked for a STRUCTURED argument — a Fill, a `block`, a keyframe
+// list — sometimes emits it as JSON TEXT inside the arguments object instead
+// of as a nested value: `{"fill": "{\"type\":\"linear\", …}"}`. The validator
+// then reads a string where it wanted an object and refuses the call. That is
+// how a rebuild-from-a-screenshot turn lost its backdrop: 44 tool calls, 42
+// applied, and the one the whole design sits on bounced on a quoting habit,
+// leaving every layer on the default black.
+//
+// So a structured argument that arrives as JSON text is parsed back before the
+// tool sees it. WHICH arguments those are is read from the catalog rather than
+// guessed: a parameter whose declared type names "object" or "array", alone or
+// as one member of a type-array union. A union like `fill`, declared
+// ["string", "object", "null"] (hex string OR Fill object OR null), qualifies,
+// and so do the ["object", "null"] parameters a bare-string check used to
+// skip. Only an object or an array is ever substituted, so a string parameter
+// cannot be turned into something else: "#ffffff" and "text.a1" don't parse
+// at all, and "12" / "null" / "\"hug\"" parse to a scalar and are left exactly
+// as they came.
+const STRUCTURED_PARAM_TYPES: ReadonlySet<JsonSchemaType> = new Set(["object", "array"]);
+
+const isStructuredParam = (schema: ToolParameterSchema): boolean => {
+  const types = typeof schema.type === "string" ? [schema.type] : schema.type;
+  return types.some((type) => STRUCTURED_PARAM_TYPES.has(type));
+};
+
+// name → the set of its parameters that may legitimately hold an object or an
+// array. Exported so a surface with its OWN catalog (the editor-only tools)
+// builds the same index from the same rule instead of restating it.
+export const structuredParamNames = (
+  defs: readonly ToolFunction[],
+): Map<string, Set<string>> => {
+  const out = new Map<string, Set<string>>();
+  for (const def of defs) {
+    const names = new Set<string>();
+    for (const [key, schema] of Object.entries(def.function.parameters.properties)) {
+      if (isStructuredParam(schema)) names.add(key);
+    }
+    if (names.size > 0) out.set(def.function.name, names);
+  }
+  return out;
+};
+
+export const decodeJsonEncodedArgs = (
+  structured: ReadonlySet<string> | undefined,
+  args: Record<string, unknown>,
+): Record<string, unknown> => {
+  if (!structured || !args) return args;
+  let next: Record<string, unknown> | null = null;
+  for (const key of structured) {
+    const value = args[key];
+    if (typeof value !== "string") continue;
+    const text = value.trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    next ??= { ...args };
+    next[key] = parsed;
+  }
+  return next ?? args;
+};
+
+// TOOL_DEFINITIONS is declared further down this file, so the index is built on
+// first use rather than at module evaluation.
+let pureStructuredParams: Map<string, Set<string>> | null = null;
+const decodeArgsFor = (
+  name: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> => {
+  pureStructuredParams ??= structuredParamNames(TOOL_DEFINITIONS);
+  return decodeJsonEncodedArgs(pureStructuredParams.get(name), args);
+};
+
+// Both dispatch tables are wrapped, so every surface that reaches a pure tool —
+// the editor panel, POST /api/tool, /mcp, the SDK's exported `dispatch` —
+// inherits the decode without a per-surface hook anyone has to remember. One
+// helper covers both because a page dispatcher and a project dispatcher differ
+// only in what they are handed first.
+const decodingTable = <P, R>(
+  table: Record<string, (project: P, args: never) => R>,
+): Record<string, (project: P, args: never) => R> => {
+  const out: Record<string, (project: P, args: never) => R> = {};
+  for (const [name, fn] of Object.entries(table)) {
+    const inner = fn as unknown as (
+      project: P,
+      args: Record<string, unknown>,
+    ) => R;
+    out[name] = ((project: P, args: Record<string, unknown>) =>
+      inner(project, decodeArgsFor(name, args ?? {}))) as unknown as (
+      project: P,
+      args: never,
+    ) => R;
+  }
+  return out;
+};
+
+// ---------------------------------------------------------------------------
 // Catalog + dispatch table
 // ---------------------------------------------------------------------------
 
-export const dispatch: Record<string, ToolDispatch<never>> = {
+export const dispatch: Record<string, ToolDispatch<never>> = decodingTable({
   describe_video: describeVideo as ToolDispatch<never>,
   inspect_layers: inspectLayers as ToolDispatch<never>,
   move_layer: moveLayer as ToolDispatch<never>,
@@ -8412,19 +8578,20 @@ export const dispatch: Record<string, ToolDispatch<never>> = {
   freeze_frame: freezeFrame as ToolDispatch<never>,
   add_speed_keyframe: addSpeedKeyframe as ToolDispatch<never>,
   remove_speed_keyframe: removeSpeedKeyframe as ToolDispatch<never>,
-};
+});
 
 // Project-scoped tools operate on the whole pages-only Project (the page list +
 // active cursor + every-page resize), not a single composition. Kept in a
 // separate table so dispatchOnProject can route them to the record directly
 // while content tools run against the active page's projection.
-export const projectDispatch: Record<string, ProjectToolDispatch<never>> = {
-  set_canvas_size: setCanvasSize as ProjectToolDispatch<never>,
-  add_page: addPage as ProjectToolDispatch<never>,
-  delete_page: deletePage as ProjectToolDispatch<never>,
-  reorder_pages: reorderPages as ProjectToolDispatch<never>,
-  select_page: selectPage as ProjectToolDispatch<never>,
-};
+export const projectDispatch: Record<string, ProjectToolDispatch<never>> =
+  decodingTable({
+    set_canvas_size: setCanvasSize as ProjectToolDispatch<never>,
+    add_page: addPage as ProjectToolDispatch<never>,
+    delete_page: deletePage as ProjectToolDispatch<never>,
+    reorder_pages: reorderPages as ProjectToolDispatch<never>,
+    select_page: selectPage as ProjectToolDispatch<never>,
+  });
 
 // True when `name` resolves through dispatchOnProject — a project-scoped tool
 // (projectDispatch) or a page-composition tool (dispatch). Transport
@@ -9061,44 +9228,34 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           alphaMask: {
             description:
               "Linear alpha-mask gradient (image layers). Multiplies the layer's alpha along a gradient line — used to fade a layer out partway across (the front half of a 'sandwich' covering text below it). Object: { type: 'linear', angle: number (deg, CSS-style; 0=to top, 90=to right, 180=to bottom, 270=to left), stops: [{offset:0..1, alpha:0..1}, ...] (≥2 stops, ordered by offset) }. Pass null to clear.",
-            oneOf: [
-              { type: "null" },
-              {
-                type: "object",
-                properties: {
-                  type: { type: "string", enum: ["linear"] },
-                  angle: { type: "number" },
-                  stops: {
-                    type: "array",
-                    minItems: 2,
-                    items: {
-                      type: "object",
-                      properties: {
-                        offset: { type: "number", minimum: 0, maximum: 1 },
-                        alpha: { type: "number", minimum: 0, maximum: 1 },
-                      },
-                      required: ["offset", "alpha"],
-                    },
+            type: ["object", "null"],
+            properties: {
+              type: { type: "string", enum: ["linear"] },
+              angle: { type: "number" },
+              stops: {
+                type: "array",
+                minItems: 2,
+                items: {
+                  type: "object",
+                  properties: {
+                    offset: { type: "number", minimum: 0, maximum: 1 },
+                    alpha: { type: "number", minimum: 0, maximum: 1 },
                   },
+                  required: ["offset", "alpha"],
                 },
-                required: ["stops"],
               },
-            ],
+            },
+            required: ["stops"],
           },
           chroma_key: {
             description:
               "Green-screen key (video / image layers). Makes pixels near `color` transparent at render time so layers below show through. Object: { color: '#rrggbb' (default '#00ff00'), similarity: 0..1 (match radius, default 0.4), smoothness: 0..1 (edge feather, default 0.1) }. Pass null to clear.",
-            oneOf: [
-              { type: "null" },
-              {
-                type: "object",
-                properties: {
-                  color: { type: "string" },
-                  similarity: { type: "number", minimum: 0, maximum: 1 },
-                  smoothness: { type: "number", minimum: 0, maximum: 1 },
-                },
-              },
-            ],
+            type: ["object", "null"],
+            properties: {
+              color: { type: "string" },
+              similarity: { type: "number", minimum: 0, maximum: 1 },
+              smoothness: { type: "number", minimum: 0, maximum: 1 },
+            },
           },
           blend_mode: {
             type: "string",
@@ -9141,10 +9298,10 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: "string",
             description: "shapes.<id> / image.<id> / video.<id> / group.<id>. The pinned is_background image_layer is the canvas backdrop; the literal 'background.canvas' is accepted as a synonym.",
           },
-          fill: {
-            description:
-              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/text/group only) clears the backdrop, including any fill colour keyframes on it.',
-          },
+          fill: fillParameter(
+            'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:"mask",layer_id,color}. A gradient is ONE fill — don\'t fake it with stacked shapes. null (image/video/text/group only) clears the backdrop, including any fill colour keyframes on it.',
+            { nullable: true },
+          ),
           clear_animation: {
             type: "boolean",
             description:
@@ -9165,10 +9322,10 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
         type: "object",
         properties: {
           elementId: { type: "string", description: "text.<id>." },
-          fill: {
-            description:
-              "Box fill: '#rrggbb' (promoted to solid) or a Fill object: {type:\"solid\",color} / {type:\"linear\",stops:[{pos:0..1,color}],angle?} / {type:\"radial\",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:\"mask\",layer_id,color}. null clears the box; omit to leave the current fill.",
-          },
+          fill: fillParameter(
+            "Box fill: '#rrggbb' (promoted to solid) or a Fill object: {type:\"solid\",color} / {type:\"linear\",stops:[{pos:0..1,color}],angle?} / {type:\"radial\",stops:[{pos:0..1,color}],cx?,cy?,radius?} / {type:\"mask\",layer_id,color}. null clears the box; omit to leave the current fill.",
+            { nullable: true },
+          ),
           padding: {
             type: "number",
             description:
@@ -9242,10 +9399,10 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             type: "number",
             description: "Frame number, 0-indexed. 30 fps so frame 30 = 1 second.",
           },
-          value: {
-            description:
-              'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?}. Adjacent keyframes crossfade the gradient stop-by-stop.',
-          },
+          value: fillParameter(
+            'Either \'#rrggbb\' (promoted to solid) or a Fill object: {type:"solid",color} / {type:"linear",stops:[{pos:0..1,color}],angle?} / {type:"radial",stops:[{pos:0..1,color}],cx?,cy?,radius?}. Adjacent keyframes crossfade the gradient stop-by-stop.',
+            { nullable: false },
+          ),
           easing: {
             type: "string",
             enum: VALID_EASINGS,
