@@ -278,7 +278,7 @@ export interface MorphaClient {
    *  route. Returns the stored `filename` — pass it to `add_audio_overlay` (add
    *  a second track) or `update_audio_overlay` `{ id, filename }` (replace an
    *  existing track's file; find the `id` in `describe_video`'s `audio_overlays`).
-   *  Accepts .mp3/.m4a/.wav/.ogg/.aac; capped at 16 MiB. */
+   *  Accepts .mp3/.m4a/.wav/.ogg/.aac; capped at 50 MB. */
   uploadAudio(
     projectId: string,
     source:

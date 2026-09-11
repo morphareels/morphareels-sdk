@@ -28,7 +28,7 @@ const png = await morpha.renderFrame(id, 150); // a composited PNG, no ffmpeg
 const mp4 = await morpha.renderVideo(id);      // the full composition as MP4, no ffmpeg
 ```
 
-`createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings` (any signed-in account mints keys — MCP and the API are free on every plan; the free plan's limits are 1 GB of storage and 5 projects). Pure mutation tools return `{ result, project, editorUrl }`; workspace/upload/vision tools return `{ result }` (no `project`), and the typed methods unwrap `result.data` for you. Cache-backed vision/transcript reads can come back `not-ready` until the clip is opened once in the editor.
+`createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings` (any signed-in account mints keys — MCP and the API are free on every plan; the free plan's limits are 1 GB of storage, 5 projects and 500 MB per uploaded clip). Pure mutation tools return `{ result, project, editorUrl }`; workspace/upload/vision tools return `{ result }` (no `project`), and the typed methods unwrap `result.data` for you. Cache-backed vision/transcript reads can come back `not-ready` until the clip is opened once in the editor.
 
 ## Make a video in code
 
