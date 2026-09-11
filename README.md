@@ -25,7 +25,7 @@ await morpha.saveVersion(id, { name: "add logo" });          // snapshot the cha
 // restoreVersion(id, versionId, { pageIndex }) reverts just one page.
 
 const png = await morpha.renderFrame(id, 150); // a composited PNG, no ffmpeg
-const mp4 = await morpha.renderVideo(id);      // the full composition as MP4, no ffmpeg
+const mp4 = await morpha.renderVideo(id);      // the full composition as MP4 at 2×, no ffmpeg
 ```
 
 `createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings` (any signed-in account mints keys — MCP and the API are free on every plan; the free plan's limits are 1 GB of storage, 5 projects and 500 MB per uploaded clip). Pure mutation tools return `{ result, project, editorUrl }`; workspace/upload/vision tools return `{ result }` (no `project`), and the typed methods unwrap `result.data` for you. Cache-backed vision/transcript reads can come back `not-ready` until the clip is opened once in the editor.
@@ -116,7 +116,7 @@ const mp4 = await renderVideo({ projectId: "demo", token: process.env.MORPHA_API
 await writeFile("video.mp4", mp4);
 ```
 
-Like `renderFrame()`, this needs Playwright + system Chrome (`channel: "chrome"` — Chromium can't encode H.264).
+It renders at 2× the canvas by default (2160×3840 for a portrait canvas); pass `scale: 1` for the canvas's own size. Like `renderFrame()`, this needs Playwright + system Chrome (`channel: "chrome"` — Chromium can't encode H.264).
 
 ## Auto-caption a clip
 

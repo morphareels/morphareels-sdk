@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
 import { routeMorphaOrigin } from "./browser-auth.ts";
+import { DEFAULT_EXPORT_SCALE, type ExportScale } from "./core/export-scale.ts";
 
 export interface RenderFrameOptions {
   /** Project id, served at `${origin}/api/project/<id>`. */
@@ -55,6 +56,18 @@ const pageQuery = (page: number | undefined): string => {
   return `&page=${page}`;
 };
 
+/** Wait until `ready` returns true in the page, for at most `timeoutMs`.
+ * Playwright's signature is waitForFunction(fn, arg, options): the options go
+ * THIRD. Passed second they are taken as `arg`, silently, and the wait falls
+ * back to Playwright's 30-second default. Both SDK waits did that, so every
+ * render longer than 30 s failed as a timeout whatever timeoutMs said. Every
+ * wait goes through here (test/sdk-wait-timeout.test.ts counts the calls). */
+export const waitUntilReady = (
+  page: Pick<import("playwright").Page, "waitForFunction">,
+  ready: () => boolean,
+  timeoutMs: number,
+): Promise<unknown> => page.waitForFunction(ready, undefined, { timeout: timeoutMs });
+
 /** URL for the /render-canvas headless route (one composited frame). */
 export const renderCanvasUrl = (
   origin: string,
@@ -64,13 +77,20 @@ export const renderCanvasUrl = (
 ): string =>
   `${origin}/render-canvas?project=${encodeURIComponent(projectId)}&frame=${frame}${pageQuery(page)}`;
 
-/** URL for the /render-export headless route (full MP4 encode). */
+/** URL for the /render-export headless route (full MP4 encode), at `scale`
+ * (1× the canvas's own size, 2× double it), asking for the chunked handoff
+ * readExportChunks reads. Fail-fast on any other scale, like pageQuery. */
 export const renderExportUrl = (
   origin: string,
   projectId: string,
   page?: number,
-): string =>
-  `${origin}/render-export?project=${encodeURIComponent(projectId)}${pageQuery(page)}`;
+  scale: ExportScale = DEFAULT_EXPORT_SCALE,
+): string => {
+  if (scale !== 1 && scale !== 2) {
+    throw new Error(`scale must be 1 or 2, got ${scale}`);
+  }
+  return `${origin}/render-export?project=${encodeURIComponent(projectId)}${pageQuery(page)}&scale=${scale}&transfer=chunks`;
+};
 
 /**
  * Render one composited frame to a PNG Buffer. The video frame is decoded and
@@ -153,7 +173,8 @@ export const renderFrames = async (
       // point.
       await page.goto(url, { waitUntil: "domcontentloaded", timeout });
       try {
-        await page.waitForFunction(
+        await waitUntilReady(
+          page,
           () => {
             const w = window as unknown as {
               __morphaRenderStatus?: { done?: boolean };
@@ -162,7 +183,7 @@ export const renderFrames = async (
             if (w.__morphaRenderStatus) return w.__morphaRenderStatus.done === true;
             return w.__morphaRenderReady === true;
           },
-          { timeout },
+          timeout,
         );
       } catch {
         throw new Error(
@@ -263,6 +284,35 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
   return png;
 };
 
+/** Chunk size for pulling a finished MP4 out of the page. Each chunk crosses
+ * page.evaluate as its own base64 string, far under V8's 536,870,888-unit
+ * string cap, which one whole-file string hits at 383 MiB of MP4. */
+export const EXPORT_CHUNK_BYTES = 8 * 1024 * 1024;
+
+/** Pull `size` bytes through `readChunk(offset, length)`, which returns each
+ * chunk as base64, and check the total, so a short read fails instead of
+ * returning a truncated MP4. */
+export const readExportChunks = async (
+  readChunk: (offset: number, length: number) => Promise<string>,
+  size: number,
+  chunkBytes: number = EXPORT_CHUNK_BYTES,
+): Promise<Buffer> => {
+  const parts: Buffer[] = [];
+  let received = 0;
+  for (let offset = 0; offset < size; offset += chunkBytes) {
+    const part = Buffer.from(
+      await readChunk(offset, Math.min(chunkBytes, size - offset)),
+      "base64",
+    );
+    parts.push(part);
+    received += part.length;
+  }
+  if (received !== size) {
+    throw new Error(`Morpha export handoff returned ${received} of ${size} bytes`);
+  }
+  return Buffer.concat(parts, size);
+};
+
 export interface RenderVideoOptions {
   /** Project id, served at `${origin}/render-export?project=<id>`. */
   projectId: string;
@@ -276,6 +326,12 @@ export interface RenderVideoOptions {
   /** Bearer token for the Morpha account (forwarded to the project/clip fetches). */
   token?: string;
   /**
+   * Export quality: 2 (the default) renders at double the canvas size,
+   * 2160×3840 for a portrait canvas; 1 renders at the canvas's own size. The
+   * same choice as the editor's 1×/2× cards, with the same default.
+   */
+  scale?: ExportScale;
+  /**
    * Browser channel. Defaults to system Chrome ("chrome") so the WebCodecs
    * H.264 encoder is available. Do NOT use "chromium" — it ships without the
    * proprietary codec and the export will fail.
@@ -283,8 +339,9 @@ export interface RenderVideoOptions {
   channel?: string;
   /**
    * Milliseconds to wait for the in-browser encode to finish. Default 600000
-   * (10 min). A 30 s 1080×1920 composition encodes in well under a minute on a
-   * modern machine; long projects or slow-loading clips need more headroom.
+   * (10 min). On an Apple M5 Pro a 30 s composition of shapes rendered in 8 s
+   * at 2× and 5.6 s at 1×; footage, long projects and slow-loading clips need
+   * more headroom.
    */
   timeoutMs?: number;
   /**
@@ -315,8 +372,10 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
   }
   const origin = opts.origin ?? "https://morphareels.ai";
   const timeout = opts.timeoutMs ?? 600_000;
-  // Built before the browser launches so an invalid page index fails fast.
-  const url = renderExportUrl(origin, opts.projectId, opts.page);
+  const scale = opts.scale ?? DEFAULT_EXPORT_SCALE;
+  // Built before the browser launches so an invalid page index or scale fails
+  // fast.
+  const url = renderExportUrl(origin, opts.projectId, opts.page, scale);
 
   const ctx = await launchRenderContext(pw, {
     channel: opts.channel ?? "chrome",
@@ -328,18 +387,37 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     // Unconditional — same reason as renderFrame above.
     await routeMorphaOrigin(ctx, origin, opts.token);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
+    // A crash surfaces in the wait below as a generic Playwright error, and
+    // reporting it as a timeout sent people to raise timeoutMs, which can't
+    // help. The whole MP4 is held in the page's memory until it is handed
+    // over, so a long 2× export is what usually runs a page out of memory.
+    let crashed = false;
+    page.on("crash", () => {
+      crashed = true;
+    });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
     try {
-      await page.waitForFunction(
+      await waitUntilReady(
+        page,
         () =>
           (window as unknown as { __morphaExportReady?: boolean })
             .__morphaExportReady === true,
-        { timeout },
+        timeout,
       );
-    } catch {
+    } catch (err) {
+      if (crashed) {
+        throw new Error(
+          `The render page crashed while exporting project ${opts.projectId}. That is usually the browser running out of memory, because the whole MP4 is held in memory until it is handed over. Try { scale: 1 } or a shorter project.`,
+        );
+      }
+      if (err instanceof pw.errors.TimeoutError) {
+        throw new Error(
+          `Morpha export timed out after ${Math.round(timeout / 1000)}s for project ${opts.projectId}. Raise timeoutMs for long projects or large clips.`,
+        );
+      }
       throw new Error(
-        `Morpha export timed out after ${Math.round(timeout / 1000)}s for project ${opts.projectId} — raise timeoutMs for long projects or large clips.`,
+        `Morpha export failed for project ${opts.projectId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -356,17 +434,46 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
       );
     }
 
-    const base64 = (await page.evaluate(
-      () =>
-        (window as unknown as { __morphaExportBase64?: string })
-          .__morphaExportBase64 ?? "",
-    )) as string;
-    if (!base64) {
+    const handoff = (await page.evaluate(() => {
+      const w = window as unknown as {
+        __morphaExportScale?: number;
+        __morphaExportSize?: number;
+        __morphaExportChunk?: unknown;
+      };
+      return {
+        scale: w.__morphaExportScale,
+        size: w.__morphaExportSize,
+        chunked: typeof w.__morphaExportChunk === "function",
+      };
+    })) as { scale?: number; size?: number; chunked: boolean };
+    if (!handoff.chunked || typeof handoff.size !== "number") {
+      throw new Error(
+        `The Morpha deployment at ${origin} predates renderVideo's scale option (morphareels-sdk 0.8), so it can't hand the MP4 over in chunks. Retry once it's updated, or pin morphareels-sdk@0.7 for it.`,
+      );
+    }
+    if (handoff.scale !== scale) {
+      throw new Error(
+        `Morpha export for project ${opts.projectId} rendered at ${handoff.scale}× where ${scale}× was asked for`,
+      );
+    }
+    if (handoff.size === 0) {
       throw new Error(
         `Morpha export produced an empty MP4 for project ${opts.projectId}`,
       );
     }
-    return Buffer.from(base64, "base64");
+    return await readExportChunks(
+      (offset, length) =>
+        page.evaluate(
+          ([o, n]) =>
+            (
+              window as unknown as {
+                __morphaExportChunk: (o: number, n: number) => Promise<string>;
+              }
+            ).__morphaExportChunk(o, n),
+          [offset, length] as [number, number],
+        ),
+      handoff.size,
+    );
   } finally {
     await ctx.close();
   }
