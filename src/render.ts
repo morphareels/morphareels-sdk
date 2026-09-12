@@ -333,9 +333,13 @@ export interface RenderVideoOptions {
    */
   scale?: ExportScale;
   /**
-   * Browser channel. Defaults to system Chrome ("chrome") so the WebCodecs
-   * H.264 encoder is available. Do NOT use "chromium" — it ships without the
-   * proprietary codec and the export will fail.
+   * Browser channel. Defaults to system Chrome ("chrome").
+   *
+   * "chromium" encodes H.264 too: Morpha's own render container drives Chrome
+   * for Testing and measured H.264 available and AAC absent. So the channel is
+   * not what decides whether an export works — the PLATFORM is. No browser on
+   * Linux carries an AAC encoder, whichever channel it runs, and the export
+   * page refuses rather than handing back a silent MP4.
    */
   channel?: string;
   /**
@@ -359,11 +363,16 @@ export interface RenderVideoOptions {
  * browser — the same in-browser WebCodecs H.264 pipeline the editor's Render
  * button uses (no ffmpeg, no server). Drives the `/render-export` page with the
  * project loaded, waits for the encode to finish, and returns the MP4 bytes.
- * Requires `playwright` installed (optional peer dependency) and Google Chrome
- * available (the default `channel: "chrome"` — Chromium can't encode H.264).
- * It needs Chrome on macOS or Windows: Chrome on Linux has no AAC audio
- * encoder, and the render page refuses to export without one rather than
- * hand back a silent MP4.
+ * Requires `playwright` installed (optional peer dependency) and a browser
+ * available (the default `channel: "chrome"`).
+ *
+ * It must run on macOS or Windows. No browser on Linux ships an AAC audio
+ * encoder — measured on both Chrome and Chrome for Testing — and the render
+ * page refuses to export without one rather than hand back a silent MP4. An
+ * agent that has no browser to drive, or runs on Linux, can have Morpha render
+ * it instead: the `render_video` tool renders on Morpha's own container, which
+ * encodes the audio with ffmpeg beside the browser. It is a subscriber
+ * feature, and `render_status` returns the download link.
  */
 export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => {
   let pw: typeof import("playwright");

@@ -5,6 +5,12 @@
 
 import type { ExportScale } from "./export-scale.ts";
 
+/** What `?audio=wav` left for the driver: the composition's mix as a WAV, or
+ *  nothing to mix. The server render asks for this because the Chrome it runs
+ *  on, on Linux, has no AAC encoder: the page exports video-only and ffmpeg in
+ *  the container encodes the sound. */
+export type ExportAudioState = "wav" | "none";
+
 export interface ExportPageGlobals {
   __morphaExportReady?: boolean;
   __morphaExportStatus?: "ok" | "error";
@@ -15,4 +21,10 @@ export interface ExportPageGlobals {
   __morphaExportScale?: ExportScale;
   __morphaExportSize?: number;
   __morphaExportChunk?: (offset: number, length: number) => Promise<string>;
+  /** `?audio=wav` only: whether there is a mix to collect. */
+  __morphaExportAudioState?: ExportAudioState;
+  /** The WAV's length in bytes, when there is one. */
+  __morphaExportAudioSize?: number;
+  /** The WAV in base64 chunks, read the same way as the video. */
+  __morphaExportAudioChunk?: (offset: number, length: number) => Promise<string>;
 }

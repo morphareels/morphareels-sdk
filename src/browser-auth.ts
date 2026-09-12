@@ -25,6 +25,27 @@
 // stay unrouted, so fonts keep their token-free CORS fetch AND stay cached in
 // the persistent profile across renders — which is what that profile is for.
 
+/**
+ * What this needs of a browser context: the ability to route requests.
+ *
+ * Structural on purpose. Morpha's render container drives Chrome from its own
+ * Playwright install while this file lives in the SDK, which has another, and
+ * TypeScript treats two installs' `BrowserContext` as different types even at
+ * the same version. Naming the capability instead of the package lets one
+ * implementation serve both.
+ */
+export interface RoutableContext {
+  route(
+    url: (url: URL) => boolean,
+    handler: (route: {
+      request(): { headers(): Record<string, string> };
+      continue(options: { headers: Record<string, string> }): Promise<void>;
+    }) => Promise<void>,
+    // Playwright's own route() resolves to a Disposable, so the result is
+    // deliberately unconstrained: this says nothing about what it returns.
+  ): Promise<unknown>;
+}
+
 /** True only for URLs whose origin equals the configured Morpha origin
  *  (exact scheme + host + port). Exported for unit tests. */
 export const originMatcher = (origin: string): ((url: URL) => boolean) => {
@@ -38,11 +59,17 @@ export const originMatcher = (origin: string): ((url: URL) => boolean) => {
  * origin whose auth is bypassed still needs the freshness half, and a render
  * that silently paints last hour's asset is the same bug whether or not a token
  * was involved.
+ *
+ * `headers` is for a caller that authenticates some other way: Morpha's render
+ * container sends a render pass instead of a token (render-container/server.ts).
+ * It goes through here rather than a second route of its own, so there stays one
+ * place deciding what a Morpha-origin request carries.
  */
 export const routeMorphaOrigin = async (
-  ctx: import("playwright").BrowserContext,
+  ctx: RoutableContext,
   origin: string,
   token?: string,
+  headers?: Record<string, string>,
 ): Promise<void> => {
   // route.continue() forwards the request natively (streaming intact) —
   // fetch()+fulfill() would buffer video range responses whole.
@@ -57,6 +84,7 @@ export const routeMorphaOrigin = async (
         // Revalidate rather than reuse: see (2) above.
         "cache-control": "no-cache",
         ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(headers ?? {}),
       },
     });
   });

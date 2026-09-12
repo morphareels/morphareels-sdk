@@ -19,6 +19,7 @@
 //   - "group.<id>"      — layer groups (transform composes onto descendants)
 import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 import { formatClockLabel } from "./clock-time.ts";
+import { DEFAULT_TEXT_FONT } from "./text-font.ts";
 // Cross-tree import: the font catalogues live in editor/src/ (the editor is
 // their primary consumer); the agent-facing list_fonts tool reuses them so
 // every source the picker knows about is also discoverable via MCP.
@@ -6924,8 +6925,6 @@ const removeEmbedOrigin: ToolDispatch<EmbedOriginArg> = (project, args) => {
 // size, or colour. Pass only the fields you want to change. Use
 // add_text_layer to create a new text layer; set_layer_text never creates
 // one and never touches image layers.
-
-const DEFAULT_TEXT_FONT = "Hanken Grotesk";
 
 // Validate + assign the optional text-style props shared by set_layer_text and
 // add_text_layer. Mutates `layer`; returns an error message on the first bad
