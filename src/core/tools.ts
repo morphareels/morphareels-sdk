@@ -10049,7 +10049,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_embed_origins",
       description:
-        "Replace the project's embed allowlist — the hostnames permitted to load this project through the public <morpha-video> embed. Pass the full desired list; it overwrites the previous one. An empty array turns embedding OFF (the public embed endpoint 404s the project). Each entry is normalized to a bare lowercased hostname (scheme, port, and path stripped, e.g. \"https://example.com/x\" → \"example.com\"); duplicates are dropped.",
+        "Replace the project's embed allowlist — the hostnames permitted to load this project through the public <morpha-video> embed. Pass the full desired list; it overwrites the previous one. An empty array turns embedding OFF (the public embed endpoint 404s the project). Each entry is normalized to a bare lowercased hostname (scheme, port, and path stripped, e.g. \"https://example.com/x\" → \"example.com\"); duplicates are dropped. Morpha sends the listed websites no request: the list decides which of them may load the project, so any page on an allowed host can show it. Reference: https://morphareels.ai/docs/tools#setembedoriginsorigins",
       parameters: {
         type: "object",
         properties: {
@@ -10069,7 +10069,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_embed_origin",
       description:
-        "Add one hostname to the project's embed allowlist (the hostnames permitted to load the public <morpha-video> embed). Idempotent — re-adding an existing entry is a no-op. The origin is normalized to a bare lowercased hostname (scheme/port/path stripped).",
+        "Add one hostname to the project's embed allowlist (the hostnames permitted to load the public <morpha-video> embed). Idempotent — re-adding an existing entry is a no-op. The origin is normalized to a bare lowercased hostname (scheme/port/path stripped). Morpha sends that website no request; any page on it may then load the project. Reference: https://morphareels.ai/docs/tools#addembedoriginorigin",
       parameters: {
         type: "object",
         properties: {
@@ -10088,7 +10088,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "remove_embed_origin",
       description:
-        "Remove one hostname from the project's embed allowlist. Idempotent — removing an entry that isn't present is a no-op. Removing the last entry turns embedding OFF (the public embed endpoint 404s the project).",
+        "Remove one hostname from the project's embed allowlist. Idempotent — removing an entry that isn't present is a no-op. Removing the last entry turns embedding OFF (the public embed endpoint 404s the project). Morpha sends that website no request; a page on it stops loading the project. Reference: https://morphareels.ai/docs/tools#removeembedoriginorigin",
       parameters: {
         type: "object",
         properties: {
@@ -10107,7 +10107,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_custom_font",
       description:
-        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (POST /api/upload-asset/<projectId>, raw bytes + X-Filename header; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path.",
+        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (POST /api/upload-asset/<projectId>, raw bytes + X-Filename header; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path. A URL is not fetched when this tool runs: Morpha's renderer and every browser that opens the project download it later. Reference: https://morphareels.ai/docs/tools#setcustomfontfamily-src-weight-style",
       parameters: {
         type: "object",
         properties: {

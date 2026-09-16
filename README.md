@@ -107,7 +107,7 @@ Same pixels as the one-at-a-time path; the saving is the fixed per-frame cost, s
 
 ## Export MP4 without ffmpeg
 
-`renderVideo()` exports the full composition to MP4 — the same in-browser WebCodecs H.264 pipeline the editor's Render button uses, driven by a real local browser. No ffmpeg dependency, no GPL, no server.
+`renderVideo()` exports the full composition to MP4 — the same in-browser WebCodecs H.264 pipeline the editor's Share → Download uses, driven by a real local browser. No ffmpeg dependency, no GPL, no server.
 
 ```ts
 import { renderVideo } from "morphareels-sdk";
