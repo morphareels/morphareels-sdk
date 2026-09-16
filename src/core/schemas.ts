@@ -1275,11 +1275,12 @@ export const layerStyleSchema = z
     borderAlign: z.enum(["inner", "center", "outer"]).optional(),
     boxShadow: z.string().optional(),
     // Uniform inset (canvas-stage px) between the box edge and the text.
-    // Honoured by TEXT layers only. It anchors left/right-aligned lines and
-    // top/bottom-aligned blocks, and in "hug" autofit it is how far the
-    // derived box extends past the measured text. It does not narrow the
-    // wrap: every non-hug line wraps in 0.92 × the box width, set or unset
-    // (textWrapWidth in editor/src/renderer.ts). Other layer kinds ignore it.
+    // Honoured by TEXT layers only. Lines wrap inside the padded area and
+    // "fit" / "shrink" size the font to it (textWrapWidth / textFitHeight in
+    // editor/src/renderer.ts); it anchors left/right-aligned lines and
+    // top/bottom-aligned blocks; and in "hug" autofit it is how far the
+    // derived box extends past the measured text. With none set, the legacy
+    // 0.92 inset stands in for it. Other layer kinds ignore it.
     padding: z.number().nonnegative().optional(),
     fit: fitModeSchema.optional(),
     // Object-position for cover/contain fit modes. 0..1 along each axis;

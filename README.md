@@ -19,6 +19,7 @@ const morpha = createClient({ token: process.env.MORPHA_API_KEY }); // origin de
 
 const [{ id }] = await morpha.listProjects();                 // typed workspace tool — no projectId
 await morpha.uploadImage(id, { url: "https://example.com/logo.png" }); // ingest, then reference by filename
+// or from disk: await morpha.uploadImage(id, { file: "./logo.png" });
 await morpha.callTool(id, "add_image_layer", { filename: "logo.png", x: 540, y: 600, width: 300, height: 300 });
 await morpha.saveVersion(id, { name: "add logo" });          // snapshot the change-set
 // restoreVersion(id, versionId) replaces the whole project (auto-checkpointed);

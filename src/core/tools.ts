@@ -5622,7 +5622,11 @@ const setGroupWindow: ToolDispatch<SetGroupWindowArgs> = (project, args) => {
 // ripple-delete — so an agent can shorten / fix / cut a comp without the editor.
 
 const DURATION_FPS = 30;
-const MAX_DURATION_SECONDS = 600;
+// The composition length has a 1-second floor and no ceiling. A 600-second
+// cap used to live here and in the editor store's duration writers; it was an
+// arbitrary product limit rather than anything the renderer needs, so a
+// long-form cut was silently truncated to ten minutes. Pinned by
+// test/tools-duration.test.ts and test/store-duration-no-ceiling.test.ts.
 
 // Clamp the loop region into a composition that is `endFrame` frames long.
 // `endFrame` is a frame COUNT (>= 1). Mutates the (already-cloned) project in
@@ -5650,7 +5654,7 @@ const setDuration: ToolDispatch<SetDurationArgs> = (project, args) => {
       },
     };
   }
-  const clamped = Math.max(1, Math.min(MAX_DURATION_SECONDS, seconds));
+  const clamped = Math.max(1, seconds);
   const next = cloneProject(project);
   next.duration_authored = true;
   next.duration_seconds = clamped;
@@ -5670,10 +5674,7 @@ const fitDurationToContent: ToolDispatch<Record<string, never>> = (project) => {
   next.duration_authored = false;
   const fitted = Math.max(
     1,
-    Math.min(
-      MAX_DURATION_SECONDS,
-      computeContentDurationSeconds(next, { floorSeconds: 1 }),
-    ),
+    computeContentDurationSeconds(next, { floorSeconds: 1 }),
   );
   next.duration_seconds = fitted;
   const endFrame = Math.max(1, Math.round(fitted * DURATION_FPS));
@@ -9341,7 +9342,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           padding: {
             type: "number",
             description:
-              "Uniform inset (canvas px) between the box edge and the text. 0 / omitted ⇒ no explicit padding.",
+              "Uniform inset (canvas px) between the box edge and the text. On a \"hug\" layer it is what sizes the box around the label; on a fixed-size layer (\"wrap\", \"fit\", \"shrink\") lines wrap inside the padded area, so padding narrows where they break. 0 / omitted ⇒ no explicit padding.",
           },
           cornerRadius: {
             type: "number",
@@ -9947,14 +9948,14 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_duration",
       description:
-        "Author an EXPLICIT composition length in seconds, pinning it (duration_authored=true) so the auto-fit no longer drives it. Morpha normally DERIVES the comp length from content (the furthest keyframe / video window / audio end); this overrides that with a fixed length — the stage becomes a fixed canvas you author into, and content past the end is kept but not played or exported. Clamped to [1, 600] s. Use it to shorten a comp to a target length (e.g. a 15-second cut) or to reserve a longer stage than the current content fills. Call fit_duration_to_content to release the pin.",
+        "Author an EXPLICIT composition length in seconds, pinning it (duration_authored=true) so the auto-fit no longer drives it. Morpha normally DERIVES the comp length from content (the furthest keyframe / video window / audio end); this overrides that with a fixed length — the stage becomes a fixed canvas you author into, and content past the end is kept but not played or exported. 1-second floor, no ceiling. Use it to shorten a comp to a target length (e.g. a 15-second cut) or to reserve a longer stage than the current content fills. Call fit_duration_to_content to release the pin.",
       parameters: {
         type: "object",
         properties: {
           seconds: {
             type: "number",
             description:
-              "Composition length in seconds (clamped to 1..600). 30 fps; durationInFrames = ceil(seconds*30).",
+              "Composition length in seconds (1-second floor, no ceiling). 30 fps; durationInFrames = ceil(seconds*30).",
           },
         },
         required: ["seconds"],
@@ -10241,7 +10242,13 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_text_layer",
       description:
-        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width 900, height 320, font_family \"Anton\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"hug\" default = box shrink-wraps the text at the fixed text_size, honouring literal newlines, so it can't re-wrap between preview and export — bake your own \"\\n\" line breaks / \"wrap\"=fixed size + word-wrap to the box / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
+        "Create a new text layer — a first-class leaf that animates, groups, and z-orders exactly like an image or shape. The renderer draws live typeset text (multi-line, auto-fit to the box). Defaults: x/y = canvas centre, width " +
+        DEFAULT_TEXT_W +
+        ", height " +
+        DEFAULT_TEXT_H +
+        ", font_family \"" +
+        DEFAULT_TEXT_FONT +
+        "\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"hug\" default = box shrink-wraps the text at the fixed text_size, honouring literal newlines, so it can't re-wrap between preview and export — bake your own \"\\n\" line breaks / \"wrap\"=fixed size + word-wrap to the box / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
       parameters: {
         type: "object",
         properties: {
@@ -10251,11 +10258,20 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           },
           x: { type: "number", description: "Centre x in canvas px. Defaults to canvas centre." },
           y: { type: "number", description: "Centre y in canvas px. Defaults to canvas centre." },
-          width: { type: "number", description: "Box width in px (> 0). Default 900." },
-          height: { type: "number", description: "Box height in px (> 0). Default 320." },
+          width: {
+            type: "number",
+            description: "Box width in px (> 0). Default " + DEFAULT_TEXT_W + ".",
+          },
+          height: {
+            type: "number",
+            description: "Box height in px (> 0). Default " + DEFAULT_TEXT_H + ".",
+          },
           font_family: {
             type: "string",
-            description: "Google Fonts family name, e.g. \"Anton\". Default \"Anton\".",
+            description:
+              "Google Fonts family name, e.g. \"Anton\". Defaults to \"" +
+              DEFAULT_TEXT_FONT +
+              "\".",
           },
           text_size: {
             type: "number",

@@ -248,10 +248,17 @@ export interface MorphaClient {
     source: AddVideoSource,
     opts?: { channel?: string; timeoutMs?: number; steps?: OptionalProcessStep[] },
   ): Promise<Record<string, unknown> & { filename: string; processing: ProcessClipOutcome }>;
+  /** Upload an image into a project. `{ url }` fetches a public http(s) link
+   *  server-side (the `upload_image` tool); `{ file }` streams a local path to
+   *  the raw asset route, the same way `uploadAudio({ file })` does. Returns the
+   *  stored `filename` — pass it to `add_image_layer`. Accepts
+   *  .png/.jpg/.jpeg/.gif/.webp/.svg; capped at 16 MB. */
   uploadImage(
     projectId: string,
-    opts: { url: string; filename?: string },
-  ): Promise<Record<string, unknown>>;
+    source:
+      | { url: string; filename?: string }
+      | { file: string; filename?: string },
+  ): Promise<Record<string, unknown> & { filename: string }>;
   /** Search Openverse's Creative Commons / public-domain pool for `query`
    *  FROM THIS MACHINE (the quota is yours, not one shared through Morpha),
    *  store the first downloadable, large-enough result in the project through
@@ -680,6 +687,21 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return json as Record<string, unknown> & { filename: string };
   };
 
+  // A local image or audio file, read from disk and sent through the asset
+  // route above. Behind both `uploadImage({ file })` and `uploadAudio({ file })`.
+  const uploadLocalAsset = async (
+    projectId: string,
+    source: { file: string; filename?: string },
+  ): Promise<Record<string, unknown> & { filename: string }> => {
+    const [{ readFile }, { basename }] = await Promise.all([
+      import("node:fs/promises"),
+      import("node:path"),
+    ]);
+    const bytes = await readFile(source.file);
+    const filename = source.filename ?? uniquifyDerivedName(basename(source.file));
+    return uploadAssetBytes(projectId, bytes, filename);
+  };
+
   // Upload a large local clip via R2 multipart — many bounded part PUTs instead
   // of one held-open request, so a big clip on a slow uplink can't trip undici's
   // headersTimeout. Mirrors editor/src/api.ts `uploadClipMultipart`.
@@ -932,8 +954,15 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       });
       return { ...uploaded, filename, processing };
     },
-    uploadImage: async (projectId, opts) =>
-      (await serverData("upload_image", projectId, { ...opts })) as Record<string, unknown>,
+    uploadImage: async (projectId, source) => {
+      if ("url" in source) {
+        return (await serverData("upload_image", projectId, {
+          url: source.url,
+          filename: source.filename,
+        })) as Record<string, unknown> & { filename: string };
+      }
+      return uploadLocalAsset(projectId, source);
+    },
     findPublicImage: async (projectId, query, opts) => {
       const pick = await searchPublicImage(query, opts);
       if (!pick) return null;
@@ -956,13 +985,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
           filename: source.filename,
         })) as Record<string, unknown> & { filename: string };
       }
-      const [{ readFile }, { basename }] = await Promise.all([
-        import("node:fs/promises"),
-        import("node:path"),
-      ]);
-      const bytes = await readFile(source.file);
-      const filename = source.filename ?? uniquifyDerivedName(basename(source.file));
-      return uploadAssetBytes(projectId, bytes, filename);
+      return uploadLocalAsset(projectId, source);
     },
     setCustomFont: async (projectId, opts) => {
       const data = (await serverData("set_custom_font", projectId, {
