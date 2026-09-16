@@ -51,6 +51,11 @@ export interface ClipProcessingStatus {
     clip: string;
     processed: boolean;
     steps: Record<string, string>;
+    /** Why `steps.audio_demux` is "unavailable", when it is. `no-audio` /
+     *  `unsupported`: the video is silent or its audio is not AAC. `miss` /
+     *  `over-budget`: the video may have sound, but the server could not read
+     *  its audio track; the editor takes the sound from the preview copy. */
+    audio_demux_reason?: "no-audio" | "unsupported" | "miss" | "over-budget";
   }>;
   allProcessed: boolean;
 }
