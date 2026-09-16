@@ -50,12 +50,10 @@ export interface ClipProcessingStatus {
   clips: Array<{
     clip: string;
     processed: boolean;
+    /** `proxy`, `audio_split`, `transcript`, `text_regions`. `audio_split`
+     *  stays "pending" until the user splits the clip's audio in the editor
+     *  or the `audio_split` step runs; an unsplit clip plays its own sound. */
     steps: Record<string, string>;
-    /** Why `steps.audio_demux` is "unavailable", when it is. `no-audio` /
-     *  `unsupported`: the video is silent or its audio is not AAC. `miss` /
-     *  `over-budget`: the video may have sound, but the server could not read
-     *  its audio track; the editor takes the sound from the preview copy. */
-    audio_demux_reason?: "no-audio" | "unsupported" | "miss" | "over-budget";
   }>;
   allProcessed: boolean;
 }

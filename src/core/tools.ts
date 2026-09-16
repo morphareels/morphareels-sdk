@@ -17,6 +17,7 @@
 //   - "image.<id>"      — image layers
 //   - "shapes.<id>"     — shape layers
 //   - "group.<id>"      — layer groups (transform composes onto descendants)
+import { collectMatteRelations } from "./matte-relations.ts";
 import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 import { formatClockLabel } from "./clock-time.ts";
 import { DEFAULT_TEXT_FONT } from "./text-font.ts";
@@ -1458,6 +1459,12 @@ type OverviewNode = {
   source_morpha_id?: string;
   source_version_label?: string;
   source_morpha_name?: string;
+  // Track matte (mask) relation, both ways, so an agent sees what the Layers
+  // panel shows a human with a glyph and nesting: a HOST carries `mask` (the
+  // source element id whose alpha clips it), a consumed SOURCE carries
+  // `mask_for` (the host it stencils). Absent on every other node.
+  mask?: string;
+  mask_for?: string;
   animated?: string[];
   children?: OverviewNode[];
 };
@@ -1465,6 +1472,7 @@ type OverviewNode = {
 const overviewNode = (
   project: Composition,
   node: { id: string; children?: { id: string; children?: unknown[] }[] },
+  matte: ReturnType<typeof collectMatteRelations> = collectMatteRelations(project),
 ): OverviewNode | null => {
   const elementId = node.id;
   const type = elementTypeOf(elementId);
@@ -1472,12 +1480,18 @@ const overviewNode = (
   const id = bareIdOf(elementId, type);
   const animated = animatedProps(project, elementId);
   const animField = animated.length > 0 ? { animated } : {};
+  const maskSource = matte.hostToSource.get(elementId);
+  const maskHost = matte.sourceToHost.get(elementId);
+  const maskField = {
+    ...(maskSource ? { mask: maskSource } : {}),
+    ...(maskHost ? { mask_for: maskHost } : {}),
+  };
 
   if (type === "group") {
     const g = project.groups.find((x) => x.id === id);
     if (!g) return null;
     const children = (node.children ?? [])
-      .map((c) => overviewNode(project, c as { id: string }))
+      .map((c) => overviewNode(project, c as { id: string }, matte))
       .filter((n): n is OverviewNode => n !== null)
       .reverse();
     return {
@@ -1499,6 +1513,7 @@ const overviewNode = (
           }
         : {}),
       ...animField,
+      ...maskField,
       children,
     };
   }
@@ -1516,6 +1531,7 @@ const overviewNode = (
       height: l.height,
       rotation: l.rotation,
       ...animField,
+      ...maskField,
     };
   }
   if (type === "video") {
@@ -1541,6 +1557,7 @@ const overviewNode = (
       ...(layerSpeed(v) !== 1 ? { speed: layerSpeed(v) } : {}),
       ...(v.lane_id !== undefined ? { lane_id: v.lane_id } : {}),
       ...animField,
+      ...maskField,
     };
   }
   if (type === "text") {
@@ -1558,6 +1575,7 @@ const overviewNode = (
       height: t.height,
       rotation: t.rotation,
       ...animField,
+      ...maskField,
     };
   }
   const s = project.shapes.find((x) => x.id === id);
@@ -1573,6 +1591,7 @@ const overviewNode = (
     height: s.height,
     rotation: s.rotation,
     ...animField,
+    ...maskField,
   };
 };
 
@@ -1588,9 +1607,10 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
   // resolveLayerTree returns roots back-to-front (render order); the canvas
   // backdrop is pinned at the bottom — drop it from the tree (reported in
   // `background`) and reverse so the tree reads top-of-z first.
+  const matte = collectMatteRelations(project);
   const tree = resolveLayerTree(project)
     .filter((n) => n.id !== bgElementId)
-    .map((n) => overviewNode(project, n))
+    .map((n) => overviewNode(project, n, matte))
     .filter((n): n is OverviewNode => n !== null)
     .reverse();
 
@@ -6417,6 +6437,30 @@ const setMatteSource: ToolDispatch<SetMatteSourceArgs> = (project, args) => {
     matte_source_id === null || matte_source_id === undefined
       ? null
       : matte_source_id;
+  // A consumed stencil has no window of its own: the host's window governs
+  // (the renderer ignores a stencil's block either way). So on attach the
+  // source loses its block and its edge ramps. A blocked layer's keyframes
+  // are stored block-relative, so they are re-anchored to absolute frames
+  // first (the same shift applyTimeShift makes), which keeps the authored
+  // motion at the same composition frames. A source with no stored block is
+  // untouched, so a second call changes nothing here.
+  let sourceWindowDropped = false;
+  if (value !== null) {
+    const source = findLayerByElementId(next, value);
+    if (source?.block) {
+      const start = source.block.start;
+      for (const track of numericTracks(source)) {
+        for (const kf of track) (kf as { frame: number }).frame += start;
+      }
+      delete source.block;
+      sourceWindowDropped = true;
+    }
+    if (source && (source.transition_in || source.transition_out)) {
+      delete source.transition_in;
+      delete source.transition_out;
+      sourceWindowDropped = true;
+    }
+  }
   // Invert flag: clearing the mask clears invert; an explicit boolean wins;
   // otherwise preserve the host's current value.
   const nextInverted = (prev: boolean | undefined): boolean | undefined =>
@@ -6481,7 +6525,13 @@ const setMatteSource: ToolDispatch<SetMatteSourceArgs> = (project, args) => {
       matte_inverted: nextInverted(next.groups[idx].matte_inverted),
     };
   }
-  return { project: next, result: { ok: true, data: { elementId, matte_source_id: value } } };
+  return {
+    project: next,
+    result: {
+      ok: true,
+      data: { elementId, matte_source_id: value, source_window_dropped: sourceWindowDropped },
+    },
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -10617,7 +10667,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_matte_source",
       description:
-        "Set (or clear) a track matte — the host shows only where the matte source is opaque. The HOST can be a leaf (image.<id>, video.<id>, shapes.<id>, text.<id>) OR a group.<id> (a group is a layer of sorts): a group host clips ALL its composited children to the source shape's path — e.g. a marching chevron strip + black backing shown only inside an arrow / band shape. For a leaf host the source can be any leaf (use a text.<id> source for video-/image-filled letterforms); for a group host the source must be a shape (shapes.<id>). Make the source layer hidden so it acts purely as the stencil. Pass null to clear.",
+        "Set (or clear) a track matte — the host shows only where the matte source is opaque. The HOST can be a leaf (image.<id>, video.<id>, shapes.<id>, text.<id>) OR a group.<id> (a group is a layer of sorts): a group host clips ALL its composited children to the source shape's path — e.g. a marching chevron strip + black backing shown only inside an arrow / band shape. For a leaf host the source can be any leaf (use a text.<id> source for video-/image-filled letterforms); for a group host the source must be a shape (shapes.<id>). The source is CONSUMED: it stops painting as a layer of its own, so do NOT hide it or set its opacity to 0 (an invisible stencil empties the mask and the host vanishes). It has no time window of its own: it follows the host's, and attaching drops its block and edge transitions (`source_window_dropped` in the result). Its position, scale, rotation and keyframes shape the mask. Pass null to clear.",
       parameters: {
         type: "object",
         properties: {
