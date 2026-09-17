@@ -461,9 +461,9 @@ export const renderVideoToFile = async (
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     // A crash surfaces in the wait below as a generic Playwright error, and
     // reporting it as a timeout sent people to raise timeoutMs, which can't
-    // help. The page writes the MP4 to disk as it encodes, so what runs it out
-    // of memory is the composition itself: 2× frames, and the sound mix, which
-    // is built whole.
+    // help. The page writes the MP4 to disk as it encodes and mixes the sound
+    // a second at a time, so what runs it out of memory is the frames: 2× and
+    // many large clips on screen at once.
     let crashed = false;
     page.on("crash", () => {
       crashed = true;
@@ -480,7 +480,7 @@ export const renderVideoToFile = async (
     } catch (err) {
       if (crashed) {
         throw new Error(
-          `The render page crashed while exporting project ${opts.projectId}. That is usually the browser running out of memory, which frames at 2× and long sound tracks make likelier. Try { scale: 1 } or a shorter project.`,
+          `The render page crashed while exporting project ${opts.projectId}. That is usually the browser running out of memory, which frames at 2× make likelier. Try { scale: 1 }.`,
         );
       }
       if (err instanceof pw.errors.TimeoutError) {

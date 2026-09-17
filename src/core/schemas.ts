@@ -1482,6 +1482,18 @@ export const overlayPlaybackMix = (
   ];
 };
 
+// Solo/mute filter shared between preview playback and every export. If ANY
+// overlay is soloed, only soloed overlays are audible (mute is ignored on
+// the soloed rows themselves — soloing wins). Otherwise every overlay plays
+// except those explicitly muted.
+export const filterAudibleOverlays = (
+  overlays: readonly AudioOverlay[],
+): AudioOverlay[] => {
+  const anySoloed = overlays.some((o) => o.soloed === true);
+  if (anySoloed) return overlays.filter((o) => o.soloed === true);
+  return overlays.filter((o) => o.muted !== true);
+};
+
 // The video layer a welded overlay was split out of, or null when the overlay
 // is standalone / the weld dangles (its source layer was re-id'd or removed).
 export const weldedSourceLayer = (
