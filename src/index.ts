@@ -40,12 +40,14 @@ export type { CaptionLine, TranscriptWordLike } from "./core/captions.ts";
 
 // ── Rendering (real local browser, no ffmpeg, no server) ────────────────────
 // renderFrame → one composited PNG; renderVideo → the full MP4 (the same
-// in-browser WebCodecs pipeline the editor's Share → Download uses).
-export { renderFrame, renderFrames, renderVideo } from "./render.ts";
+// in-browser WebCodecs pipeline the editor's Share → Download uses), and
+// renderVideoToFile → that MP4 written to disk as it arrives.
+export { renderFrame, renderFrames, renderVideo, renderVideoToFile } from "./render.ts";
 export type {
   RenderFrameOptions,
   RenderFramesOptions,
   RenderVideoOptions,
+  RenderVideoToFileOptions,
 } from "./render.ts";
 
 // ── Processing (real local browser) — proxy / audio split / transcription /

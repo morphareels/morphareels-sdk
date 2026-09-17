@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
+import { access, constants, mkdtemp, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { routeMorphaOrigin } from "./browser-auth.ts";
 import { DEFAULT_EXPORT_SCALE, type ExportScale } from "./core/export-scale.ts";
 import type { ExportPageGlobals } from "./core/render-export-protocol.ts";
@@ -80,7 +81,7 @@ export const renderCanvasUrl = (
 
 /** URL for the /render-export headless route (full MP4 encode), at `scale`
  * (1× the canvas's own size, 2× double it), asking for the chunked handoff
- * readExportChunks reads. Fail-fast on any other scale, like pageQuery. */
+ * writeExportChunks reads. Fail-fast on any other scale, like pageQuery. */
 export const renderExportUrl = (
   origin: string,
   projectId: string,
@@ -291,27 +292,45 @@ export const renderFrame = async (opts: RenderFrameOptions): Promise<Buffer> => 
 export const EXPORT_CHUNK_BYTES = 8 * 1024 * 1024;
 
 /** Pull `size` bytes through `readChunk(offset, length)`, which returns each
- * chunk as base64, and check the total, so a short read fails instead of
- * returning a truncated MP4. */
-export const readExportChunks = async (
+ * chunk as base64, into the file at `path`. Each chunk is written at its own
+ * offset as it arrives, so no more than one chunk is ever held, whatever the
+ * file's size. The file is built beside `path` and renamed into place once
+ * every byte has arrived: a chunk shorter than asked for fails the handoff,
+ * and a failed handoff leaves nothing at `path`. */
+export const writeExportChunks = async (
   readChunk: (offset: number, length: number) => Promise<string>,
   size: number,
+  path: string,
   chunkBytes: number = EXPORT_CHUNK_BYTES,
-): Promise<Buffer> => {
-  const parts: Buffer[] = [];
-  let received = 0;
-  for (let offset = 0; offset < size; offset += chunkBytes) {
-    const part = Buffer.from(
-      await readChunk(offset, Math.min(chunkBytes, size - offset)),
-      "base64",
-    );
-    parts.push(part);
-    received += part.length;
+): Promise<void> => {
+  const partial = `${path}.partial`;
+  const file = await open(partial, "w");
+  try {
+    for (let offset = 0; offset < size; offset += chunkBytes) {
+      const length = Math.min(chunkBytes, size - offset);
+      const piece = Buffer.from(await readChunk(offset, length), "base64");
+      if (piece.length !== length) {
+        throw new Error(
+          `Morpha export handoff returned ${piece.length} bytes at offset ${offset} where ${length} were asked for, of ${size}`,
+        );
+      }
+      for (let written = 0; written < length; ) {
+        const { bytesWritten } = await file.write(
+          piece,
+          written,
+          length - written,
+          offset + written,
+        );
+        written += bytesWritten;
+      }
+    }
+    await file.close();
+    await rename(partial, path);
+  } catch (err) {
+    await file.close().catch(() => {});
+    await rm(partial, { force: true }).catch(() => {});
+    throw err;
   }
-  if (received !== size) {
-    throw new Error(`Morpha export handoff returned ${received} of ${size} bytes`);
-  }
-  return Buffer.concat(parts, size);
 };
 
 export interface RenderVideoOptions {
@@ -358,6 +377,12 @@ export interface RenderVideoOptions {
   cacheDir?: string;
 }
 
+export interface RenderVideoToFileOptions extends RenderVideoOptions {
+  /** Where to write the MP4. Its directory must exist. The file appears there
+   * only once every byte has arrived; a failed render leaves nothing at it. */
+  path: string;
+}
+
 /**
  * Render a project's FULL composition to an MP4 Buffer using a REAL local
  * browser — the same in-browser WebCodecs H.264 pipeline the editor's Render
@@ -365,6 +390,10 @@ export interface RenderVideoOptions {
  * project loaded, waits for the encode to finish, and returns the MP4 bytes.
  * Requires `playwright` installed (optional peer dependency) and a browser
  * available (the default `channel: "chrome"`).
+ *
+ * The Buffer holds the whole file, so a long render at 2× needs that much
+ * memory in this process. `renderVideoToFile` writes the same MP4 to disk
+ * instead and never holds it.
  *
  * It must run on macOS or Windows. No browser on Linux ships an AAC audio
  * encoder — measured on both Chrome and Chrome for Testing — and the render
@@ -375,12 +404,42 @@ export interface RenderVideoOptions {
  * feature, and `render_status` returns the download link.
  */
 export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "morpha-render-video-"));
+  try {
+    const { path: file } = await renderVideoToFile({
+      ...opts,
+      path: path.join(dir, "render.mp4"),
+    });
+    return await readFile(file);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+};
+
+/**
+ * Render a project's full composition to an MP4 file at `opts.path`, the same
+ * render as `renderVideo`. The file comes out of the browser in 8 MiB pieces,
+ * each written to disk as it arrives, so this process never holds more than
+ * one piece, however long the video. Returns the path and the file's size.
+ */
+export const renderVideoToFile = async (
+  opts: RenderVideoToFileOptions,
+): Promise<{ path: string; bytes: number }> => {
+  // Before the browser launches, so a render that would have nowhere to go
+  // fails now rather than after the encode.
+  try {
+    await access(path.dirname(opts.path), constants.W_OK);
+  } catch {
+    throw new Error(
+      `renderVideoToFile can't write to ${path.dirname(opts.path)}: the directory must exist and be writable`,
+    );
+  }
   let pw: typeof import("playwright");
   try {
     pw = await import("playwright");
   } catch {
     throw new Error(
-      "renderVideo() needs Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
+      "renderVideo() and renderVideoToFile() need Playwright. Install it: `npm i playwright`, and have Google Chrome available.",
     );
   }
   const origin = opts.origin ?? "https://morphareels.ai";
@@ -402,8 +461,9 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     // A crash surfaces in the wait below as a generic Playwright error, and
     // reporting it as a timeout sent people to raise timeoutMs, which can't
-    // help. The whole MP4 is held in the page's memory until it is handed
-    // over, so a long 2× export is what usually runs a page out of memory.
+    // help. The page writes the MP4 to disk as it encodes, so what runs it out
+    // of memory is the composition itself: 2× frames, and the sound mix, which
+    // is built whole.
     let crashed = false;
     page.on("crash", () => {
       crashed = true;
@@ -420,7 +480,7 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
     } catch (err) {
       if (crashed) {
         throw new Error(
-          `The render page crashed while exporting project ${opts.projectId}. That is usually the browser running out of memory, because the whole MP4 is held in memory until it is handed over. Try { scale: 1 } or a shorter project.`,
+          `The render page crashed while exporting project ${opts.projectId}. That is usually the browser running out of memory, which frames at 2× and long sound tracks make likelier. Try { scale: 1 } or a shorter project.`,
         );
       }
       if (err instanceof pw.errors.TimeoutError) {
@@ -466,7 +526,7 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
         `Morpha export produced an empty MP4 for project ${opts.projectId}`,
       );
     }
-    return await readExportChunks(
+    await writeExportChunks(
       (offset, length) =>
         page.evaluate(
           ([o, n]) =>
@@ -478,7 +538,9 @@ export const renderVideo = async (opts: RenderVideoOptions): Promise<Buffer> => 
           [offset, length] as [number, number],
         ),
       handoff.size,
+      opts.path,
     );
+    return { path: opts.path, bytes: (await stat(opts.path)).size };
   } finally {
     await ctx.close();
   }

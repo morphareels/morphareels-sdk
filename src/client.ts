@@ -26,6 +26,7 @@ import {
   renderFrame,
   renderFrames,
   renderVideo,
+  renderVideoToFile,
   type RenderFrameOptions,
   type RenderFramesOptions,
   type RenderVideoOptions,
@@ -365,6 +366,13 @@ export interface MorphaClient {
     projectId: string,
     opts?: Omit<RenderVideoOptions, "projectId">,
   ): Promise<Buffer>;
+  /** The same MP4 as `renderVideo`, written to `path` as it comes out of the
+   *  browser, so this process never holds the file. For long renders. */
+  renderVideoToFile(
+    projectId: string,
+    path: string,
+    opts?: Omit<RenderVideoOptions, "projectId">,
+  ): Promise<{ path: string; bytes: number }>;
 }
 
 const safeText = async (res: Response): Promise<string> => {
@@ -1032,5 +1040,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       renderFrames({ origin, token, ...opts, projectId, frames }),
     renderVideo: (projectId, opts = {}) =>
       renderVideo({ origin, token, ...opts, projectId }),
+    renderVideoToFile: (projectId, path, opts = {}) =>
+      renderVideoToFile({ origin, token, ...opts, projectId, path }),
   };
 };

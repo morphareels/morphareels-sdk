@@ -10049,7 +10049,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_embed_origins",
       description:
-        "Replace the project's embed allowlist — the hostnames permitted to load this project through the public <morpha-video> embed. Pass the full desired list; it overwrites the previous one. An empty array turns embedding OFF (the public embed endpoint 404s the project). Each entry is normalized to a bare lowercased hostname (scheme, port, and path stripped, e.g. \"https://example.com/x\" → \"example.com\"); duplicates are dropped. Morpha sends the listed websites no request: the list decides which of them may load the project, so any page on an allowed host can show it. Reference: https://morphareels.ai/docs/tools#setembedoriginsorigins",
+        "Replace the project's embed allowlist — the hostnames permitted to load this project through the public <morpha-video> embed. Pass the full desired list; it overwrites the previous one. An empty array turns embedding OFF (the public embed endpoint 404s the project). Each entry is normalized to a bare lowercased hostname (scheme, port, and path stripped, e.g. \"https://example.com/x\" → \"example.com\"); duplicates are dropped. Morpha sends the listed websites no request: the list decides which of them may load the project, so any page on an allowed host can show it. The embed serves only saved bookmarks (save_version), never unsaved edits, and leaves out who the project is shared with. Reference: https://morphareels.ai/docs/tools#setembedoriginsorigins",
       parameters: {
         type: "object",
         properties: {
