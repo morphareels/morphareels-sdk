@@ -21,6 +21,7 @@ import { collectMatteRelations } from "./matte-relations.ts";
 import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 import { formatClockLabel } from "./clock-time.ts";
 import { DEFAULT_TEXT_FONT } from "./text-font.ts";
+import { nameKeptAcrossSwap } from "./upload-contract.ts";
 // Cross-tree import: the font catalogues live in editor/src/ (the editor is
 // their primary consumer); the agent-facing list_fonts tool reuses them so
 // every source the picker knows about is also discoverable via MCP.
@@ -1677,6 +1678,8 @@ const describeVideo: ToolDispatch<Record<string, never>> = (project) => {
     // welded to that video layer's split-out audio. Empty ⇒ no standalone audio.
     audio_overlays: (project.audio_overlays ?? []).map((o) => ({
       id: o.id,
+      // The track's label (what people see); `filename` is the stored file.
+      name: o.name ?? null,
       filename: o.filename,
       startFrame: o.startFrame,
       endFrame: o.endFrame ?? null,
@@ -2606,10 +2609,11 @@ type AddImageLayerArgs = {
   width: number;
   height: number;
   block?: unknown;
+  name?: string;
 };
 
 const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
-  const { filename, x, y, width, height } = args;
+  const { filename, x, y, width, height, name } = args;
   if (!filename) {
     return { project, result: { ok: false, error: "filename is required" } };
   }
@@ -2625,6 +2629,9 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   if (!Number.isFinite(height) || height <= 0) {
     return { project, result: { ok: false, error: `invalid height: ${height}` } };
   }
+  if (name !== undefined && typeof name !== "string") {
+    return { project, result: { ok: false, error: "name must be a string" } };
+  }
   const parsedBlock = parseAddBlockArg(args.block);
   if (parsedBlock.error) {
     return { project, result: { ok: false, error: parsedBlock.error } };
@@ -2634,6 +2641,8 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   const layer: ImageLayer = {
     id,
     filename,
+    // The label people see. `filename` is the stored file's id.
+    ...(name && name.trim().length > 0 ? { name } : {}),
     // Base transform identity; see perElementDataFields.
     scale: 1,
     opacity: 1,
@@ -4711,6 +4720,7 @@ type AddAudioOverlayArgs = {
   fadeOutFrames?: number;
   endFrame?: number;
   sourceLayerId?: string;
+  name?: string;
 };
 
 const reserveAudioOverlayId = (existing: Set<string>): string => {
@@ -4732,6 +4742,7 @@ const addAudioOverlay: ToolDispatch<AddAudioOverlayArgs> = (project, args) => {
     fadeOutFrames,
     endFrame,
     sourceLayerId,
+    name,
   } = args;
   if (!filename || typeof filename !== "string") {
     return { project, result: { ok: false, error: "filename is required" } };
@@ -4744,6 +4755,9 @@ const addAudioOverlay: ToolDispatch<AddAudioOverlayArgs> = (project, args) => {
       project,
       result: { ok: false, error: "sourceLayerId must be a non-empty string" },
     };
+  }
+  if (name !== undefined && typeof name !== "string") {
+    return { project, result: { ok: false, error: "name must be a string" } };
   }
   if (!Number.isFinite(startFrame) || startFrame < 0) {
     return {
@@ -4804,6 +4818,8 @@ const addAudioOverlay: ToolDispatch<AddAudioOverlayArgs> = (project, args) => {
   const overlay: AudioOverlay = {
     id,
     filename,
+    // The label people see. `filename` is the stored file's id.
+    ...(name && name.trim().length > 0 ? { name } : {}),
     startFrame: Math.round(startFrame),
     gain: gain ?? 1,
     fadeInFrames:
@@ -4855,6 +4871,9 @@ type UpdateAudioOverlayArgs = {
   // Clean-strength wet/dry mix (0..1) while the AI-cleaned track is active;
   // null clears the field (full clean). Undefined leaves it untouched.
   denoiseStrength?: number | null;
+  // The track's label (the file's display name); null or "" removes it.
+  // Undefined leaves it untouched.
+  name?: string | null;
 };
 
 const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
@@ -4871,9 +4890,16 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     filename,
     sourceLayerId,
     denoiseStrength,
+    name,
   } = args;
   if (!id || typeof id !== "string") {
     return { project, result: { ok: false, error: "id is required" } };
+  }
+  if (name !== undefined && name !== null && typeof name !== "string") {
+    return {
+      project,
+      result: { ok: false, error: "name must be a string or null" },
+    };
   }
   if (
     sourceLayerId !== undefined &&
@@ -4981,6 +5007,15 @@ const updateAudioOverlay: ToolDispatch<UpdateAudioOverlayArgs> = (
     delete merged.denoiseStrength;
   } else if (denoiseStrength !== undefined) {
     merged.denoiseStrength = denoiseStrength;
+  }
+  if (name === null || (typeof name === "string" && name.trim().length === 0)) {
+    delete merged.name;
+  } else if (name !== undefined) {
+    merged.name = name;
+  } else if (filename !== undefined && filename !== cur.filename) {
+    // A swap that names no label keeps the one people see.
+    const kept = nameKeptAcrossSwap(cur.name, cur.filename);
+    if (kept !== null) merged.name = kept;
   }
   // Swapping the file (a "replace this track" edit) invalidates any AI-cleaned
   // companion of the OLD file: activeOverlayFilename would otherwise keep
@@ -6181,7 +6216,7 @@ const setEmbedOrigins: ToolDispatch<SetEmbedOriginsArgs> = (project, args) => {
 // and a custom_fonts duplicate would shadow that reliable loader with a
 // second source of truth. `src` is EITHER a full URL (https://…, data:…) OR an
 // uploaded asset filename in the project's asset bucket (uploaded via
-// POST /api/upload-asset/<projectId>, raw bytes + X-Filename header). Like
+// POST /api/upload-asset/<projectId>, raw bytes + X-Upload-Name header). Like
 // add_image_layer this does NOT verify an uploaded
 // filename exists. Dedupes by family+weight+style, replacing a matching face.
 // The editor/embed font loader (fonts.ts) decodes each via the FontFace API
@@ -8161,10 +8196,34 @@ const setCanvasSize: ProjectToolDispatch<SetCanvasSizeArgs> = (
 // <clip> (same precondition as add_video_layer); this dispatcher does not
 // verify it.
 
-type SetVideoClipArgs = { elementId?: unknown; clip?: unknown };
+type SetVideoClipArgs = { elementId?: unknown; clip?: unknown; name?: unknown };
+
+// A swap tool's optional label: a string relabels the layer (empty clears it),
+// null clears it, and absent keeps the label people see, the same rule the
+// editor's swap follows (store swapLayerSource), so an agent's swap and a
+// person's leave the same layer. `previousFilename` is the file being replaced.
+const swapLabelError = (name: unknown): string | null =>
+  name === undefined || name === null || typeof name === "string"
+    ? null
+    : "name must be a string or null";
+
+const applySwapLabel = (
+  layer: { name?: string },
+  name: unknown,
+  previousFilename: string | undefined,
+): void => {
+  if (name === undefined) {
+    const kept = nameKeptAcrossSwap(layer.name, previousFilename);
+    if (kept !== null) layer.name = kept;
+    return;
+  }
+  const label = typeof name === "string" ? name.trim() : "";
+  if (label.length > 0) layer.name = label;
+  else delete layer.name;
+};
 
 const setVideoClip: ToolDispatch<SetVideoClipArgs> = (project, args) => {
-  const { elementId, clip } = args;
+  const { elementId, clip, name } = args;
   if (typeof elementId !== "string" || !elementId.startsWith("video.")) {
     return {
       project,
@@ -8180,6 +8239,8 @@ const setVideoClip: ToolDispatch<SetVideoClipArgs> = (project, args) => {
       result: { ok: false, error: "clip must be a non-empty string" },
     };
   }
+  const nameError = swapLabelError(name);
+  if (nameError) return { project, result: { ok: false, error: nameError } };
   const id = elementId.slice("video.".length);
   const next = cloneProject(project);
   const layer = next.video_layers.find((l) => l.id === id);
@@ -8189,6 +8250,7 @@ const setVideoClip: ToolDispatch<SetVideoClipArgs> = (project, args) => {
       result: { ok: false, error: `video layer not found: ${elementId}` },
     };
   }
+  applySwapLabel(layer, name, layer.clip);
   layer.clip = clip;
   return { project: next, result: { ok: true, data: { elementId, clip } } };
 };
@@ -8242,10 +8304,10 @@ const setVideoLayerMuted: ToolDispatch<SetVideoLayerMutedArgs> = (project, args)
 // asset must already exist at users/<userId>/assets/<projectId>/<filename>
 // (same precondition as add_image_layer); this dispatcher does not verify it.
 
-type SetImageFilenameArgs = { elementId?: unknown; filename?: unknown };
+type SetImageFilenameArgs = { elementId?: unknown; filename?: unknown; name?: unknown };
 
 const setImageFilename: ToolDispatch<SetImageFilenameArgs> = (project, args) => {
-  const { elementId, filename } = args;
+  const { elementId, filename, name } = args;
   if (typeof elementId !== "string" || !elementId.startsWith("image.")) {
     return {
       project,
@@ -8261,6 +8323,8 @@ const setImageFilename: ToolDispatch<SetImageFilenameArgs> = (project, args) => 
       result: { ok: false, error: "filename must be a non-empty string" },
     };
   }
+  const nameError = swapLabelError(name);
+  if (nameError) return { project, result: { ok: false, error: nameError } };
   const id = elementId.slice("image.".length);
   const next = cloneProject(project);
   const layer = next.image_layers.find((l) => l.id === id);
@@ -8279,6 +8343,7 @@ const setImageFilename: ToolDispatch<SetImageFilenameArgs> = (project, args) => 
       },
     };
   }
+  applySwapLabel(layer, name, layer.filename);
   layer.filename = filename;
   return { project: next, result: { ok: true, data: { elementId, filename } } };
 };
@@ -9079,11 +9144,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_image_layer",
       description:
-        "Add an image layer. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Filename header). To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
+        "Add an image layer. The asset must already be uploaded (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header). Every upload returns { filename, name }: pass `filename` (the stored file's id) here, and `name` as the layer's label. To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
-          filename: { type: "string", description: "Asset filename in the project's assets bucket, e.g. star.png." },
+          filename: { type: "string", description: "The stored filename an upload returned (an id such as 3f2a9c1e-….png, or an older project's own name)." },
           x: { type: "number", description: "Centre x in 1080-wide base coords." },
           y: { type: "number", description: "Centre y in 1920-tall base coords." },
           width: { type: "number", description: "Width in px (must be > 0)." },
@@ -9098,6 +9163,11 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
             },
             required: ["start", "duration"],
           },
+          name: {
+            type: "string",
+            description:
+              "Optional label people see in the Inspector and Timeline: pass the upload's returned `name`. Without it the layer is labelled by an older project's own filename, or by kind; never by a stored id.",
+          },
         },
         required: ["filename", "x", "y", "width", "height"],
       },
@@ -9108,16 +9178,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_video_layer",
       description:
-        "Add a video layer. The clip must already exist at users/<userId>/clips/<projectId>/<clip> (uploaded via /api/upload-clip). To duplicate an existing layer, reuse its clip filename — the editor auto-assigns a fresh id.",
+        "Add a video layer. The clip must already be uploaded (the morphareels-sdk's client.addVideo, or the editor). An upload returns { filename, name }: pass `filename` (the stored clip's id) as `clip`, and `name` as the layer's label. To duplicate an existing layer, reuse its clip filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
-          clip: { type: "string", description: "Clip filename in the project's clips bucket, e.g. demo.mp4." },
+          clip: { type: "string", description: "The stored clip filename an upload returned (an id such as 3f2a9c1e-….mp4, or an older project's own name)." },
           x: { type: "number", description: "Centre x in 1080-wide base coords." },
           y: { type: "number", description: "Centre y in 1920-tall base coords." },
           width: { type: "number", description: "Width in px (must be > 0)." },
           height: { type: "number", description: "Height in px (must be > 0)." },
-          name: { type: "string", description: "Optional friendly label shown in the Inspector + Timeline." },
+          name: { type: "string", description: "Optional label people see in the Inspector and Timeline: pass the upload's returned `name`." },
         },
         required: ["clip", "x", "y", "width", "height"],
       },
@@ -9724,13 +9794,18 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_audio_overlay",
       description:
-        "Add an audio overlay (mp3/m4a/wav/ogg) scheduled at a frame-aligned start. The asset must already exist at users/<userId>/assets/<projectId>/<filename>. 30 fps; convert seconds with frames = round(s * 30). Plays in the editor preview and is mixed into the MP4 export.",
+        "Add an audio overlay (mp3/m4a/wav/ogg) scheduled at a frame-aligned start. The asset must already be uploaded (upload_audio, create_upload_link, or the editor); pass the upload's returned `filename`, and its `name` as the track's label. 30 fps; convert seconds with frames = round(s * 30). Plays in the editor preview and is mixed into the MP4 export.",
       parameters: {
         type: "object",
         properties: {
           filename: {
             type: "string",
-            description: "Audio asset filename in the project's assets bucket.",
+            description: "The stored audio filename an upload returned.",
+          },
+          name: {
+            type: "string",
+            description:
+              "Optional label people see on the track: pass the upload's returned `name`.",
           },
           startFrame: {
             type: "number",
@@ -9787,7 +9862,16 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
         type: "object",
         properties: {
           id: { type: "string" },
-          filename: { type: "string" },
+          filename: {
+            type: "string",
+            description:
+              "Replace the track's audio: the stored filename an upload returned.",
+          },
+          name: {
+            type: ["string", "null"],
+            description:
+              "The track's label people see (pass the upload's returned `name` alongside a replacement `filename`), or null to remove it.",
+          },
           startFrame: { type: "number" },
           gain: { type: "number", description: "Linear gain 0..2." },
           fadeInFrames: { type: "number" },
@@ -10107,7 +10191,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_custom_font",
       description:
-        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (POST /api/upload-asset/<projectId>, raw bytes + X-Filename header; .woff2/.woff/.ttf/.otf). Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path. A URL is not fetched when this tool runs: Morpha's renderer and every browser that opens the project download it later. Reference: https://morphareels.ai/docs/tools#setcustomfontfamily-src-weight-style",
+        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (create_upload_link, or POST /api/upload-asset/<projectId> with raw bytes + an X-Upload-Name header; .woff2/.woff/.ttf/.otf): pass the filename the upload returned. Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path. A URL is not fetched when this tool runs: Morpha's renderer and every browser that opens the project download it later. Reference: https://morphareels.ai/docs/tools#setcustomfontfamily-src-weight-style",
       parameters: {
         type: "object",
         properties: {
@@ -10621,7 +10705,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_image_filename",
       description:
-        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (uploaded via the editor's drag-drop, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Filename header). Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
+        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
       parameters: {
         type: "object",
         properties: {
@@ -10632,7 +10716,12 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           filename: {
             type: "string",
             description:
-              "Asset filename in the project's assets bucket, e.g. drake.png.",
+              "The uploaded file's id: the `filename` its upload returned.",
+          },
+          name: {
+            type: ["string", "null"],
+            description:
+              "Optional label people see for the layer: pass the upload's returned `name`. Omit to keep the current label; null or an empty string clears it.",
           },
         },
         required: ["elementId", "filename"],
@@ -10644,7 +10733,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_video_clip",
       description:
-        "Repoint an existing video layer at a different uploaded clip — keeps the layer's id, position, size, animations, styles, and trim window; only the source mp4 changes. The clip must already exist at users/<userId>/clips/<projectId>/<clip> (uploaded via the editor's '+ Add video' button or /api/upload-clip). Use this to swap a video layer's source WITHOUT losing its keyframes.",
+        "Repoint an existing video layer at a different uploaded clip — keeps the layer's id, position, size, animations, styles, and trim window; only the source mp4 changes. The clip must already be uploaded (the editor's Add video, or the morphareels-sdk's client.addVideo); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a video layer's source WITHOUT losing its keyframes.",
       parameters: {
         type: "object",
         properties: {
@@ -10655,7 +10744,12 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
           clip: {
             type: "string",
             description:
-              "Clip filename in the project's clips bucket, e.g. mickey-tiktok.mp4.",
+              "The uploaded clip's id: the `filename` its upload returned.",
+          },
+          name: {
+            type: ["string", "null"],
+            description:
+              "Optional label people see for the layer: pass the upload's returned `name`. Omit to keep the current label; null or an empty string clears it.",
           },
         },
         required: ["elementId", "clip"],

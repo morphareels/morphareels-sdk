@@ -16,11 +16,23 @@
 // `callTool` or a typed convenience method below. `findPublicImage` is not a
 // catalog tool: it searches Openverse from THIS machine and stores the pick
 // through `upload_image`.
+//
+// Every upload here follows the contract in src/upload-contract.ts: Morpha
+// names each stored file itself (an opaque id such as `3f2a9c1e-….png`) and
+// answers with `{ filename, name }`. Reference `filename`; `name` is only what
+// people see. The SDK never sends a stored name of its own.
 
-import { randomUUID } from "node:crypto";
 import { migrateProject, projectSchema, type Project } from "./core/schemas.ts";
 import type { ToolFunction } from "./core/tools.ts";
 import type { PublicImagePick } from "./core/public-image.ts";
+import {
+  UPLOAD_NAME_HEADER,
+  ASSET_EXTENSIONS,
+  CLIP_EXTENSIONS,
+  displayNameOf,
+  extensionOf,
+  type UploadedFile,
+} from "./core/upload-contract.ts";
 import { searchPublicImage, type FindPublicImageOptions } from "./public-image.ts";
 import {
   renderFrame,
@@ -38,13 +50,33 @@ import {
   type OptionalProcessStep,
 } from "./process.ts";
 
+/** The options every upload source shares. */
+export interface UploadSourceOptions {
+  /** What people see for this file, such as `"Beach intro.mp4"`. Display only:
+   *  Morpha names the stored file itself and returns that as `filename`.
+   *  Defaults to the URL's or the local file's own name. Keep the extension,
+   *  which is how Morpha knows the file's type; a `name` for a local file that
+   *  has none gets the file's. */
+  name?: string;
+  /** Removed in 0.11. The caller no longer chooses the stored name, and a
+   *  file can no longer be replaced by uploading under the same name. Pass
+   *  `name`, and reference the `filename` the call returns. */
+  filename?: never;
+}
+
 /** Where the bytes for `addVideo` come from: a public URL the worker fetches
  *  (no duration needed — it's parsed from the header), or a LOCAL file path the
- *  SDK uploads (small files via presign→PUT→finalize, large files via chunked
+ *  SDK uploads (small files via init→PUT→finalize, large files via chunked
  *  multipart; requires `durationSeconds`). */
 export type AddVideoSource =
-  | { url: string; filename?: string; durationSeconds?: number }
-  | { file: string; filename?: string; durationSeconds: number };
+  | (UploadSourceOptions & { url: string; durationSeconds?: number })
+  | (UploadSourceOptions & { file: string; durationSeconds: number });
+
+/** Where the bytes for `uploadImage` / `uploadAudio` come from: a public URL
+ *  the worker fetches, or a local file path the SDK sends. */
+export type UploadAssetSource =
+  | (UploadSourceOptions & { url: string })
+  | (UploadSourceOptions & { file: string });
 
 /** Per-clip processing status from `clipProcessingStatus`. */
 export interface ClipProcessingStatus {
@@ -83,7 +115,7 @@ export interface ToolCallResult {
   result: ToolResultEnvelope;
   /** The project AFTER the tool ran. Present for pure mutation tools (the server
    *  has already persisted it when `result.ok`); ABSENT for server tools that
-   *  don't mutate a single project (e.g. `list_projects`, `upload_clip`). */
+   *  don't mutate a single project (e.g. `list_projects`, `upload_image`). */
   project?: Project;
   /** Tappable link that opens this project in the editor (pure mutation tools). */
   editorUrl?: string;
@@ -237,72 +269,76 @@ export interface MorphaClient {
   ): Promise<{ deleted: boolean; versionId: string }>;
 
   // ── Ingest ────────────────────────────────────────────────────────────────
+  // Every upload returns `{ filename, name }`. `filename` is the stored file's
+  // id, which Morpha mints: reference it in every later call, and never show
+  // it to a person. `name` is what people see. Two uploads under one name are
+  // two files with two ids.
+
   /** Add a video: upload it AND run the processing pipeline (proxy, audio
-   *  split, transcription, OCR) in one call — the ONLY way to put a clip in a
-   *  project through the SDK (the raw upload routes are not exposed here or
-   *  over MCP/HTTP, so a clip cannot arrive without its preview proxy being
-   *  attempted). Returns the stored `filename` (pass it to `add_video_layer`)
-   *  plus the `processing` outcome; `processing.ok` is true only once the
-   *  mandatory proxy landed. `steps` narrows the OPTIONAL steps only. A
-   *  `{ url }` source is fetched server-side; a `{ file }` source is a local
-   *  path streamed from disk (needs `durationSeconds`). Processing drives a
-   *  real local Chrome (Playwright) — install it and have Chrome available. */
+   *  split, transcription, OCR) in one call. This is the ONLY way to put a clip
+   *  in a project through the SDK (the raw upload routes are not exposed here
+   *  or over MCP/HTTP, so a clip cannot arrive without its preview proxy being
+   *  attempted). Returns the stored `filename`, which you pass to
+   *  `add_video_layer` as `clip` (and `name` as its `name`), plus the
+   *  `processing` outcome; `processing.ok` is true only once the mandatory
+   *  proxy landed. `steps` narrows the OPTIONAL steps only. A `{ url }` source
+   *  is fetched server-side; a `{ file }` source is a local path streamed from
+   *  disk (needs `durationSeconds`). Processing drives a real local Chrome
+   *  (Playwright), so install it and have Chrome available. */
   addVideo(
     projectId: string,
     source: AddVideoSource,
     opts?: { channel?: string; timeoutMs?: number; steps?: OptionalProcessStep[] },
-  ): Promise<Record<string, unknown> & { filename: string; processing: ProcessClipOutcome }>;
+  ): Promise<Record<string, unknown> & UploadedFile & { processing: ProcessClipOutcome }>;
   /** Upload an image into a project. `{ url }` fetches a public http(s) link
    *  server-side (the `upload_image` tool); `{ file }` streams a local path to
-   *  the raw asset route, the same way `uploadAudio({ file })` does. Returns the
-   *  stored `filename` — pass it to `add_image_layer`. Accepts
+   *  the raw asset route, the same way `uploadAudio({ file })` does. Returns
+   *  `{ filename, name }`: pass the returned `filename` to `add_image_layer`
+   *  or `set_image_filename`, and `name` as the layer's `name`. Accepts
    *  .png/.jpg/.jpeg/.gif/.webp/.svg; capped at 16 MB. */
   uploadImage(
     projectId: string,
-    source:
-      | { url: string; filename?: string }
-      | { file: string; filename?: string },
-  ): Promise<Record<string, unknown> & { filename: string }>;
+    source: UploadAssetSource,
+  ): Promise<Record<string, unknown> & UploadedFile>;
   /** Search Openverse's Creative Commons / public-domain pool for `query`
    *  FROM THIS MACHINE (the quota is yours, not one shared through Morpha),
    *  store the first downloadable, large-enough result in the project through
-   *  `upload_image`, and return `{ filename, attribution, dimensions }` ready
-   *  for `add_image_layer`. Returns null when the first page held nothing
-   *  usable; throws when Openverse itself does not answer. The connector
-   *  surfaces (MCP / HTTP) have no equivalent: there an agent finds a URL with
-   *  its own web search and calls `uploadImage`. */
+   *  `upload_image`, and return `{ filename, name, attribution, dimensions }`.
+   *  Pass the returned `filename` to `add_image_layer`. Returns null when the
+   *  first page held nothing usable; throws when Openverse itself does not
+   *  answer. The connector surfaces (MCP / HTTP) have no equivalent: there an
+   *  agent finds a URL with its own web search and calls `uploadImage`. */
   findPublicImage(
     projectId: string,
     query: string,
     opts?: FindPublicImageOptions,
   ): Promise<
-    | (Record<string, unknown> & {
-        filename: string;
-        attribution: PublicImagePick["attribution"];
-        dimensions: PublicImagePick["dimensions"];
-      })
+    | (Record<string, unknown> &
+        UploadedFile & {
+          attribution: PublicImagePick["attribution"];
+          dimensions: PublicImagePick["dimensions"];
+        })
     | null
   >;
-  /** Upload an audio track into a project — the only way to get audio bytes in
+  /** Upload an audio track into a project, the only way to get audio bytes in
    *  programmatically. `{ url }` fetches a public http(s) link server-side (the
    *  `upload_audio` tool); `{ file }` streams a local path to the raw asset
-   *  route. Returns the stored `filename` — pass it to `add_audio_overlay` (add
-   *  a second track) or `update_audio_overlay` `{ id, filename }` (replace an
-   *  existing track's file; find the `id` in `describe_video`'s `audio_overlays`).
+   *  route. Returns `{ filename, name }`: pass the returned `filename` to
+   *  `add_audio_overlay` (add a second track) or `update_audio_overlay`
+   *  `{ id, filename }` (replace an existing track's file; find the `id` in
+   *  `describe_video`'s `audio_overlays`), with `name` as the track's `name`.
    *  Accepts .mp3/.m4a/.wav/.ogg/.aac; capped at 50 MB. */
   uploadAudio(
     projectId: string,
-    source:
-      | { url: string; filename?: string }
-      | { file: string; filename?: string },
-  ): Promise<Record<string, unknown> & { filename: string }>;
+    source: UploadAssetSource,
+  ): Promise<Record<string, unknown> & UploadedFile>;
   /** Register a typeface Morpha does NOT ship, so text layers can reference it
    *  by `font_family`. Families already in the built-in catalogs (anything
    *  list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are
    *  REJECTED — they need no registration; just set font_family to the name.
-   *  `src` is a full font URL (https://…/font.woff2) OR a font filename already
-   *  uploaded to the project's asset bucket (.woff2/.woff/.ttf/.otf). Dedupes
-   *  by family+weight+style. Returns the project's full custom-font list. */
+   *  `src` is a full font URL (https://…/font.woff2) OR the `filename` a font
+   *  upload into the project returned (.woff2/.woff/.ttf/.otf). Dedupes by
+   *  family+weight+style. Returns the project's full custom-font list. */
   setCustomFont(
     projectId: string,
     opts: {
@@ -432,29 +468,54 @@ const unquoteEtag = (raw: string): string => {
   return v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
 };
 
-/** Append a short random token before the extension, so a name the CALLER did
- *  not choose cannot land on a key that already exists.
- *
- *  Both R2 namespaces are keyed by bare filename and both writers put straight
- *  at that key, so uploading `clip.mp4` twice overwrote the first — and every
- *  layer referencing it switched footage. When a caller passes an explicit
- *  `filename` they have named the thing and keep control (that is how you
- *  deliberately replace bytes in place); when the name is merely DERIVED from a
- *  local path, it is an accident of the caller's disk and must not collide.
- *  Mirrors the editor's uniquelyNamedUpload. */
-export const uniquifyDerivedName = (raw: string): string => {
-  const base = raw.replace(/^.*[\\/]/, "");
-  const dot = base.lastIndexOf(".");
-  const stem = dot > 0 ? base.slice(0, dot) : base;
-  const ext = dot > 0 ? base.slice(dot) : "";
-  const token = randomUUID().replace(/-/g, "").slice(0, 8);
-  // Leave room for the token under the server's name cap. It trims overflow
-  // off the END of the stem, which is where the token sits — so a long name
-  // lost the token and collided again. The stem is the part that can afford to
-  // lose characters.
-  const room = 100 - ext.length - token.length - 1;
-  const keep = room > 0 ? stem.slice(0, room) : "";
-  return `${keep}-${token}${ext}`;
+/** Refuse a source that still carries `filename`. Under the old contract that
+ *  option chose the stored name, and uploading under a name that was already
+ *  there replaced the file. Morpha now mints every stored name, so the option
+ *  would be ignored and the caller would go on referencing a file that does
+ *  not exist. Plain JavaScript gets no compile error, so it gets this one. */
+const refuseChosenFilename = (method: string, source: object): void => {
+  if ((source as { filename?: unknown }).filename !== undefined) {
+    throw new Error(
+      `${method}: \`filename\` is no longer an option, because Morpha names every stored file itself. ` +
+        "Pass `name` (what people see) and reference the `filename` this call returns.",
+    );
+  }
+};
+
+const takesExtension = (ext: string): boolean =>
+  ASSET_EXTENSIONS.has(ext) || CLIP_EXTENSIONS.has(ext);
+
+/** The display name a local file is sent under: the caller's `name`, or the
+ *  file's own name. The server takes the stored file's type from this name's
+ *  extension, so a `name` without a media extension Morpha takes ("Company
+ *  logo", "Dr. Smith") gets the file's own. */
+export const localUploadName = (filePath: string, name?: string): string => {
+  const own = displayNameOf(filePath);
+  if (name === undefined) return own;
+  if (takesExtension(extensionOf(name))) return name;
+  const ownExt = extensionOf(own);
+  return takesExtension(ownExt) ? `${name}${own.slice(own.length - ownExt.length)}` : name;
+};
+
+/** The `{ filename, name }` an upload answered with. A response with no
+ *  `filename` is an error: the SDK has no name of its own to fall back to,
+ *  and referencing anything else points at no file. `sentName`, the display
+ *  name the SDK sent, stands in for a missing `name`; the id never does,
+ *  because an id is never shown to a person. */
+const uploadedFileOf = (
+  what: string,
+  data: Record<string, unknown>,
+  sentName?: string,
+): Record<string, unknown> & UploadedFile => {
+  const { filename } = data;
+  const name = typeof data.name === "string" && data.name.length > 0 ? data.name : sentName;
+  if (typeof filename !== "string" || filename.length === 0 || name === undefined) {
+    throw new Error(
+      `${what}: the upload did not answer with { filename, name }. ` +
+        "This morphareels-sdk expects a Morpha server that names stored files itself.",
+    );
+  }
+  return { ...data, filename, name };
 };
 
 /** Every unique clip filename a project references. A project is pages-only —
@@ -669,18 +730,21 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     throw lastErr ?? new Error("R2 PUT failed");
   };
 
-  // POST raw bytes to the asset route (`/api/upload-asset/:projectId`, filename
-  // in the X-Filename header, Content-Type derived server-side). The transport
-  // behind uploadAudio's `{ file }` branch — the editor uses the same route.
+  // POST raw bytes to the asset route (`/api/upload-asset/:projectId`, the
+  // display name in the X-Upload-Name header, Content-Type derived
+  // server-side). One call: the server mints the stored name itself, the same
+  // as an init would, and answers `{ filename, name }`. The transport behind
+  // the `{ file }` branch of uploadImage and uploadAudio; the editor uses the
+  // same route.
   const uploadAssetBytes = async (
     projectId: string,
     bytes: Uint8Array,
-    filename: string,
-  ): Promise<Record<string, unknown> & { filename: string }> => {
+    name: string,
+  ): Promise<Record<string, unknown> & UploadedFile> => {
     const dispatcher = usingDefaultFetch ? await getUploadDispatcher() : undefined;
     const init: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
-      headers: headers({ "X-Filename": filename }),
+      headers: headers({ [UPLOAD_NAME_HEADER]: encodeURIComponent(name) }),
       body: bytes as unknown as BodyInit,
       ...(dispatcher ? { dispatcher } : {}),
     };
@@ -689,49 +753,48 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       init,
     );
     const json = (await res.json().catch(() => null)) as
-      | (Record<string, unknown> & { filename?: string; error?: string })
+      | (Record<string, unknown> & { error?: string })
       | null;
-    if (!res.ok || !json || typeof json.filename !== "string") {
+    if (!res.ok || !json || json.ok === false) {
       const msg = json && typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
       throw new Error(`upload-asset failed: ${msg}`);
     }
-    return json as Record<string, unknown> & { filename: string };
+    const { ok: _ok, ...data } = json;
+    return uploadedFileOf("upload-asset", data, name);
   };
 
   // A local image or audio file, read from disk and sent through the asset
   // route above. Behind both `uploadImage({ file })` and `uploadAudio({ file })`.
   const uploadLocalAsset = async (
     projectId: string,
-    source: { file: string; filename?: string },
-  ): Promise<Record<string, unknown> & { filename: string }> => {
-    const [{ readFile }, { basename }] = await Promise.all([
-      import("node:fs/promises"),
-      import("node:path"),
-    ]);
+    source: { file: string; name?: string },
+  ): Promise<Record<string, unknown> & UploadedFile> => {
+    const { readFile } = await import("node:fs/promises");
     const bytes = await readFile(source.file);
-    const filename = source.filename ?? uniquifyDerivedName(basename(source.file));
-    return uploadAssetBytes(projectId, bytes, filename);
+    return uploadAssetBytes(projectId, bytes, localUploadName(source.file, source.name));
   };
 
   // Upload a large local clip via R2 multipart — many bounded part PUTs instead
   // of one held-open request, so a big clip on a slow uplink can't trip undici's
-  // headersTimeout. Mirrors editor/src/api.ts `uploadClipMultipart`.
+  // headersTimeout. Mirrors editor/src/api.ts `uploadClipMultipart`. The init
+  // mints the stored name and issues a ticket; complete and abort present the
+  // ticket, so they can only act on the file this init named.
   const uploadLocalFileMultipart = async (
     projectId: string,
     bytes: Uint8Array,
-    filename: string,
+    name: string,
     durationSeconds: number,
   ): Promise<Record<string, unknown>> => {
     const totalBytes = bytes.byteLength;
     const init = (await postRaw("/api/upload-clip/multipart/init", {
       projectId,
-      filename,
+      name,
       durationSeconds,
       totalBytes,
       partSize: MULTIPART_CHUNK_BYTES,
     })) as {
       uploadId: string;
-      filename: string;
+      ticket: string;
       partSize: number;
       parts: Array<{ partNumber: number; uploadUrl: string }>;
     };
@@ -767,7 +830,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       // Release the parts already in R2 so a failed upload doesn't dangle.
       await postRaw("/api/upload-clip/multipart/abort", {
         projectId,
-        filename: init.filename,
+        ticket: init.ticket,
         uploadId: init.uploadId,
       }).catch(() => {});
       throw err instanceof Error ? err : new Error(String(err));
@@ -778,42 +841,49 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       .sort((a, b) => a.partNumber - b.partNumber);
     return postRaw("/api/upload-clip/multipart/complete", {
       projectId,
-      filename: init.filename,
+      ticket: init.ticket,
       uploadId: init.uploadId,
       durationSeconds,
       parts: completedParts,
     });
   };
 
-  // Upload a local file: single presign→PUT→finalize for small clips, chunked
-  // multipart for large ones. Shared by addVideo's `{ file }` branch.
+  // Upload a local file: single init→PUT→finalize for small clips, chunked
+  // multipart for large ones. Shared by addVideo's `{ file }` branch. The init
+  // mints the stored name and issues a ticket, and finalize presents the
+  // ticket rather than a name.
   const uploadLocalFile = async (
     projectId: string,
     filePath: string,
     durationSeconds: number,
-    overrideName?: string,
-  ): Promise<Record<string, unknown>> => {
-    const [{ readFile }, { basename }] = await Promise.all([
-      import("node:fs/promises"),
-      import("node:path"),
-    ]);
+    name?: string,
+  ): Promise<Record<string, unknown> & UploadedFile> => {
+    const { readFile } = await import("node:fs/promises");
     const bytes = await readFile(filePath);
-    const filename = overrideName ?? uniquifyDerivedName(basename(filePath));
+    const displayName = localUploadName(filePath, name);
     if (bytes.byteLength > MULTIPART_CHUNK_BYTES) {
-      return uploadLocalFileMultipart(projectId, bytes, filename, durationSeconds);
+      return uploadedFileOf(
+        "addVideo",
+        await uploadLocalFileMultipart(projectId, bytes, displayName, durationSeconds),
+        displayName,
+      );
     }
     const presign = (await postRaw("/api/upload-clip/init", {
       projectId,
-      filename,
+      name: displayName,
       durationSeconds,
       fileSize: bytes.byteLength,
-    })) as { uploadUrl: string; filename: string; contentType: string };
+    })) as { uploadUrl: string; ticket: string; contentType: string };
     await putToR2(presign.uploadUrl, bytes, presign.contentType);
-    return postRaw("/api/upload-clip/finalize", {
-      projectId,
-      filename: presign.filename,
-      durationSeconds,
-    });
+    return uploadedFileOf(
+      "addVideo",
+      await postRaw("/api/upload-clip/finalize", {
+        projectId,
+        ticket: presign.ticket,
+        durationSeconds,
+      }),
+      displayName,
+    );
   };
 
   return {
@@ -936,41 +1006,39 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       },
 
     addVideo: async (projectId, source, opts = {}) => {
+      refuseChosenFilename("addVideo", source);
       const uploaded =
         "url" in source
-          ? await postRaw("/api/upload-clip/from-url", {
-              projectId,
-              url: source.url,
-              filename: source.filename,
-              durationSeconds: source.durationSeconds,
-            })
-          : await uploadLocalFile(
-              projectId,
-              source.file,
-              source.durationSeconds,
-              source.filename,
-            );
-      const filename = String(uploaded.filename ?? source.filename ?? "");
-      if (!filename) {
-        throw new Error("addVideo: upload did not return a filename");
-      }
+          ? uploadedFileOf(
+              "addVideo",
+              await postRaw("/api/upload-clip/from-url", {
+                projectId,
+                url: source.url,
+                name: source.name,
+                durationSeconds: source.durationSeconds,
+              }),
+              source.name,
+            )
+          : await uploadLocalFile(projectId, source.file, source.durationSeconds, source.name);
       const processing = await processClipHeadless({
         origin,
         token,
         projectId,
-        clip: filename,
+        clip: uploaded.filename,
         channel: opts.channel,
         timeoutMs: opts.timeoutMs,
         steps: opts.steps,
       });
-      return { ...uploaded, filename, processing };
+      return { ...uploaded, processing };
     },
     uploadImage: async (projectId, source) => {
+      refuseChosenFilename("uploadImage", source);
       if ("url" in source) {
-        return (await serverData("upload_image", projectId, {
+        const data = (await serverData("upload_image", projectId, {
           url: source.url,
-          filename: source.filename,
-        })) as Record<string, unknown> & { filename: string };
+          name: source.name,
+        })) as Record<string, unknown>;
+        return uploadedFileOf("uploadImage", data, source.name);
       }
       return uploadLocalAsset(projectId, source);
     },
@@ -979,22 +1047,22 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
       if (!pick) return null;
       const stored = (await serverData("upload_image", projectId, {
         url: pick.url,
-        filename: pick.filename,
-      })) as Record<string, unknown> & { filename?: unknown };
-      const filename = typeof stored.filename === "string" ? stored.filename : pick.filename;
+        name: pick.filename,
+      })) as Record<string, unknown>;
       return {
-        ...stored,
-        filename,
+        ...uploadedFileOf("findPublicImage", stored, pick.filename),
         attribution: pick.attribution,
         dimensions: pick.dimensions,
       };
     },
     uploadAudio: async (projectId, source) => {
+      refuseChosenFilename("uploadAudio", source);
       if ("url" in source) {
-        return (await serverData("upload_audio", projectId, {
+        const data = (await serverData("upload_audio", projectId, {
           url: source.url,
-          filename: source.filename,
-        })) as Record<string, unknown> & { filename: string };
+          name: source.name,
+        })) as Record<string, unknown>;
+        return uploadedFileOf("uploadAudio", data, source.name);
       }
       return uploadLocalAsset(projectId, source);
     },

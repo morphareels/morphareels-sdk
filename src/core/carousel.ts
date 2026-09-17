@@ -20,7 +20,7 @@ import type { Composition, PageComposition, Project } from "./schemas.ts";
  *  pages have no limit, and the per-page export gives one MP4 per page. The
  *  MCP instructions, the add_page and duplicate_project descriptions and both
  *  assistant prompts interpolate it rather than restating it. It is short on
- *  purpose: the keyless MCP text has to stay inside Claude Code's 2,048
+ *  purpose: the MCP instructions have to stay inside Claude Code's 2,048
  *  characters (worker/src/mcp-instructions.ts). */
 export const VERSIONS_AS_PAGES_GUIDANCE =
   "For several versions of one video (hooks, languages, a sheet's rows), make pages of one project " +

@@ -89,5 +89,10 @@ export type {
   ToolResultEnvelope,
   CacheReadResult,
   AddVideoSource,
+  UploadAssetSource,
+  UploadSourceOptions,
   ClipProcessingStatus,
 } from "./client.ts";
+// What every upload returns: the stored `filename` to reference, and the
+// `name` people see.
+export type { UploadedFile } from "./core/upload-contract.ts";

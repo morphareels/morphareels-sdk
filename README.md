@@ -18,9 +18,10 @@ import { createClient } from "morphareels-sdk";
 const morpha = createClient({ token: process.env.MORPHA_API_KEY }); // origin defaults to https://morphareels.ai
 
 const [{ id }] = await morpha.listProjects();                 // typed workspace tool — no projectId
-await morpha.uploadImage(id, { url: "https://example.com/logo.png" }); // ingest, then reference by filename
+const { filename, name } = await morpha.uploadImage(id, { url: "https://example.com/logo.png" });
 // or from disk: await morpha.uploadImage(id, { file: "./logo.png" });
-await morpha.callTool(id, "add_image_layer", { filename: "logo.png", x: 540, y: 600, width: 300, height: 300 });
+// `filename` is the stored file's id, which Morpha mints. `name` is what people see.
+await morpha.callTool(id, "add_image_layer", { filename, name, x: 540, y: 600, width: 300, height: 300 });
 await morpha.saveVersion(id, { name: "add logo" });          // snapshot the change-set
 // restoreVersion(id, versionId) replaces the whole project (auto-checkpointed);
 // restoreVersion(id, versionId, { pageIndex }) reverts just one page.
@@ -31,6 +32,14 @@ await morpha.renderVideoToFile(id, "video.mp4"); // the same MP4 written to disk
 ```
 
 `createClient` calls the same tool catalog as Morpha's MCP server, over the same Worker endpoints (`GET /api/project/:id`, `GET /api/tools`, `POST /api/tool/:name`) — `callTool` does the load → dispatch → write round-trip server-side. The token is your `mp_…` API key from `/app/settings` (any signed-in account mints keys — MCP and the API are free on every plan; the free plan's limits are 1 GB of storage, 5 projects and 500 MB per uploaded clip). Pure mutation tools return `{ result, project, editorUrl }`; workspace/upload/vision tools return `{ result }` (no `project`), and the typed methods unwrap `result.data` for you. Cache-backed vision/transcript reads can come back `not-ready` until the clip is opened once in the editor.
+
+## Uploads return the file's id
+
+Every upload (`addVideo`, `uploadImage`, `uploadAudio` and `findPublicImage`) returns `{ filename, name }`. Morpha names each stored file itself with an opaque id, such as `3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b.png`. Pass that `filename` to the layer tools exactly as returned, and never show it to a person. `name` is what people see: the file's own name unless you pass `{ name }`, and the label to give the layer or track. Two uploads under one name are two separate files, each with its own id.
+
+To swap a layer's picture, upload the new file and pass its `filename` to `set_image_filename`, which keeps the layer and its animation.
+
+**Breaking change in 0.11.** Earlier versions took a `filename` option that chose the stored name, and uploading under a name that was already there replaced that file. The option is now `name`, and it only sets what people see. An earlier SDK is refused, and nothing is written, when it sends a stored name: a clip or a file from disk gets HTTP 409 `upload-client-outdated`, and a URL upload that passes `filename` gets a tool error. Update to this version and use the `filename` each call returns.
 
 ## Make a video in code
 
@@ -56,16 +65,18 @@ Clip ingest is npm-only, and `addVideo` is the only way in: it uploads the clip 
 ```ts
 const morpha = createClient({ token: process.env.MORPHA_API_KEY });
 
-const { filename, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
+const { filename, name, processing } = await morpha.addVideo(id, { url: "https://example.com/clip.mp4" });
+// filename           → the stored clip's id: reference it, never show it
+// name               → what people see ("clip.mp4" here)
 // processing.ok      → true only once the preview proxy landed
 // processing.steps   → { proxy, audio_split, transcript, text_regions }
 // processing.reasons → per-step failure reason when a step didn't succeed
-await morpha.callTool(id, "add_video_layer", { clip: filename, x: 540, y: 960, width: 1080, height: 1920 });
+await morpha.callTool(id, "add_video_layer", { clip: filename, name, x: 540, y: 960, width: 1080, height: 1920 });
 
 const t = await morpha.transcribeClip(id, filename); // now { status: "ready", data: { words, … } }
 ```
 
-`addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). Large local files upload in **chunked multipart**, so a big clip on a slow uplink won't time out.
+`addVideo` also takes `{ file }` (a local path; needs `durationSeconds`). Large local files upload in **chunked multipart**, so a big clip on a slow uplink won't time out. Either source takes an optional `name` for what people see.
 
 **The preview proxy is mandatory.** It is what the editor plays instead of the full-bitrate original, so every processing run builds it and `steps` cannot name it (the type will not let you). `processing.ok` is false when it did not land, with the reason in `processing.error`; check it.
 
@@ -74,7 +85,7 @@ const t = await morpha.transcribeClip(id, filename); // now { status: "ready", d
 ```ts
 const { filename, processing } = await morpha.addVideo(
   id,
-  { file: "/abs/clip.mp4", durationSeconds: 61 },
+  { file: "/abs/clip.mp4", name: "Interview.mp4", durationSeconds: 61 },
   { steps: ["transcript", "audio_split"] }, // skip OCR; the proxy still builds
 );
 // processing.steps.transcript === "ready" in seconds → captions ready

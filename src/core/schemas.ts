@@ -1412,6 +1412,10 @@ export const audioOverlaySchema = z
   .object({
     id: z.string().min(1),
     filename: z.string().min(1),
+    // The track's label: what the person called the file. `filename` is the
+    // stored file's id (src/upload-contract.ts) and is never shown. Absent on
+    // tracks from before ids were minted, whose filename is their label.
+    name: z.string().optional(),
     startFrame: z.number().int().nonnegative(),
     gain: z.number().min(0).max(2).default(1),
     fadeInFrames: z.number().int().nonnegative().default(0),
