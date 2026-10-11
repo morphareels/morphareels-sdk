@@ -10,8 +10,10 @@
 // therefore one anonymous Openverse quota, and it asked for 24 results where
 // anonymous callers are capped at 20, so every search answered 401 from the
 // day it shipped. The connector surfaces (Claude.ai, ChatGPT, Gemini) have no
-// client-side runtime, so they have no search tool: a chat agent finds a
-// direct image URL with its own web search and passes it to `upload_image`.
+// client-side runtime, so they have no search tool: a chat agent passes
+// `upload_image` a direct image URL, such as one the person gave it. Morpha's
+// tool text never tells the model to go and search the web for one
+// (test/mcp-text-budget.test.ts).
 
 /** Openverse's cap on results per page for a caller with no token. */
 export const OPENVERSE_ANONYMOUS_PAGE_SIZE = 20;

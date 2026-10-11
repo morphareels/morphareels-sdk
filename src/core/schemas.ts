@@ -342,7 +342,7 @@ export const videoLayerSchema = z
     // is derived by integrating this curve, so if the curve were anchored to
     // absolute project frames, sliding a clip would slide the curve underneath
     // it and CHANGE ITS DURATION — and every op that moves a clip would have to
-    // remember to remap the keyframes (cut_range did; move_band, shift_group
+    // remember to remap the keyframes (cut_range did; set_embed_start, shift_group
     // and the clip drag did not). Clip-relative removes the chance to forget.
     // The `add_speed_keyframe` / `remove_speed_keyframe` TOOLS still take a
     // project frame, because that is what a caller with a playhead has; they

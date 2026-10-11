@@ -99,6 +99,7 @@ import {
   MAX_SPEED,
   LAYER_CLIP_DEFAULT_FRAMES,
   layerSpeed,
+  resolveLeafOrder,
   sourceFrameAtTimelineOffset,
   type LoopPass,
   type PageComposition,
@@ -2810,13 +2811,41 @@ const addShape: ToolDispatch<AddShapeArgs> = (project, args) => {
     // Window AND edge transitions together — see bornLayerDefaults.
     ...bornLayerDefaults(parsedBlock.block),
   };
+  const hidden = layersHiddenByCanvasFill(project, shape);
   next.shapes = [...next.shapes, shape];
   next.layer_order = [...next.layer_order, `shapes.${id}`];
   return {
     project: next,
-    result: { ok: true, data: { id, elementId: `shapes.${id}` } },
+    result: {
+      ok: true,
+      data: {
+        id,
+        elementId: `shapes.${id}`,
+        ...(hidden.length > 0 && { warning: canvasFillWarning(hidden) }),
+      },
+    },
   };
 };
+
+// A new shape stacks on top, so one that covers the whole canvas hides every
+// layer already there. Models reach for a canvas-sized rectangle as a
+// "background" after placing the text; ChatGPT did exactly that and buried
+// its own headline.
+const layersHiddenByCanvasFill = (project: Composition, shape: Shape): string[] => {
+  const coversCanvas =
+    shape.x - shape.width / 2 <= 0 &&
+    shape.x + shape.width / 2 >= project.canvas_width &&
+    shape.y - shape.height / 2 <= 0 &&
+    shape.y + shape.height / 2 >= project.canvas_height;
+  if (!coversCanvas) return [];
+  const backdrop = `image.${BACKGROUND_LAYER_ID}`;
+  return resolveLeafOrder(project).filter((elementId) => elementId !== backdrop);
+};
+
+const canvasFillWarning = (hidden: readonly string[]): string =>
+  `This shape covers the whole canvas and sits on top, so it hides the ${hidden.length} layer${hidden.length === 1 ? "" : "s"} below it (${hidden.join(", ")}). ` +
+  'For a background colour, remove this shape and call set_layer_fill on "background.canvas". ' +
+  "To keep the shape as a backdrop, call reorder_layer with newIndex 0 to move it under the other layers.";
 
 // ---------------------------------------------------------------------------
 // add_curve — the editable line / arrow primitive: a stroked quadratic bezier
@@ -5166,7 +5195,7 @@ const setVideoLayerTrim: ToolDispatch<SetVideoLayerTrimArgs> = (
 };
 
 // ---------------------------------------------------------------------------
-// set_layer_block / move_band — timeline placement (blocks)
+// set_layer_block / set_embed_start — timeline placement (blocks)
 // ---------------------------------------------------------------------------
 
 type SetLayerBlockArgs = {
@@ -5389,7 +5418,7 @@ const moveBand: ToolDispatch<MoveBandArgs> = (project, args) => {
 //   set_group_window — TRIM it: the group's own visible window narrows, and the
 //                      contents are left exactly where they are.
 // A morpha band is excluded from both: its block already IS its subtree's time
-// origin, so `set_layer_block` / `move_band` already move it as a unit.
+// origin, so `set_layer_block` / `set_embed_start` already move it as a unit.
 // ---------------------------------------------------------------------------
 
 type ShiftGroupArgs = { elementId: string; start: number };
@@ -8673,14 +8702,14 @@ export const dispatch: Record<string, ToolDispatch<never>> = decodingTable({
   rename_group: renameGroup as ToolDispatch<never>,
   add_to_collection: addToCollection as ToolDispatch<never>,
   remove_from_collection: removeFromCollection as ToolDispatch<never>,
-  add_morpha_layer: addMorphaLayer as ToolDispatch<never>,
+  embed_project: addMorphaLayer as ToolDispatch<never>,
   add_audio_overlay: addAudioOverlay as ToolDispatch<never>,
   remove_audio_overlay: removeAudioOverlay as ToolDispatch<never>,
   update_audio_overlay: updateAudioOverlay as ToolDispatch<never>,
   set_video_layer_trim: setVideoLayerTrim as ToolDispatch<never>,
   set_layer_block: setLayerBlock as ToolDispatch<never>,
   set_layer_transition: setLayerTransition as ToolDispatch<never>,
-  move_band: moveBand as ToolDispatch<never>,
+  set_embed_start: moveBand as ToolDispatch<never>,
   shift_group: shiftGroup as ToolDispatch<never>,
   set_group_window: setGroupWindow as ToolDispatch<never>,
   set_duration: setDuration as ToolDispatch<never>,
@@ -9201,7 +9230,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
         (d) => d.id,
       ).join(
         " | ",
-      )}. All are native vector shapes; never substitute an image layer for one. Default-positioned in canvas centre if x/y/w/h omitted.`,
+      )}. All are native vector shapes; never substitute an image layer for one. Default-positioned in canvas centre if x/y/w/h omitted. A new shape stacks ON TOP of every existing layer: for a background colour or gradient use set_layer_fill on \"background.canvas\", not a canvas-sized shape, and to place a shape behind other layers follow with reorder_layer. A shape that covers the whole canvas returns a warning naming the layers it hides.`,
       parameters: {
         type: "object",
         properties: {
@@ -9769,7 +9798,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
-      name: "add_morpha_layer",
+      name: "embed_project",
       description:
         "Embed another of the user's projects (\"a morpha\") inside this one as a version-pinned band. The source's layers are inlined into the host as a collapsible group, re-keyed to fresh ids, pinned to one immutable version of the source. Pass the source project's id as source_morpha_id (and optionally a version label); the server resolves and inlines the pinned version. Editing the band's inner layers only affects THIS video — the change is local and never propagates back to the source. To pin the band to a different saved version, re-pin it from the editor's Inspector. describe_video marks an embedded band with morpha:true + source_morpha_id so you can tell it apart from a plain group.",
       parameters: {
@@ -9931,7 +9960,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_layer_block",
       description:
-        "Set (or replace) a layer's timeline BLOCK — the [start, start+duration) window it exists for. The layer is drawn ONLY inside that window, and its animation keyframes are sampled RELATIVE to the block start, so moving or trimming the block re-anchors its intro instead of leaving it behind. This is how a layer 'starts' at a point like an iMovie clip rather than being present for the whole composition. Works on any leaf or group. Frames are in the layer's parent timeline (composition frames at root; band-local inside an embedded morpha band). To place a whole embedded reel, use move_band.",
+        "Set (or replace) a layer's timeline BLOCK — the [start, start+duration) window it exists for. The layer is drawn ONLY inside that window, and its animation keyframes are sampled RELATIVE to the block start, so moving or trimming the block re-anchors its intro instead of leaving it behind. This is how a layer 'starts' at a point like an iMovie clip rather than being present for the whole composition. Works on any leaf or group. Frames are in the layer's parent timeline (composition frames at root; band-local inside an embedded morpha band). To place a whole embedded reel, use set_embed_start.",
       parameters: {
         type: "object",
         properties: {
@@ -10005,7 +10034,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
   {
     type: "function",
     function: {
-      name: "move_band",
+      name: "set_embed_start",
       description:
         "Place an embedded morpha band on the host timeline: set its TIME ORIGIN (the frame it starts). The band's whole inner reel plays relative to this frame, so its intro animations fire when the band appears instead of at 0:00 (the fix for 'the embedded intro doesn't animate'). Keeps the band's current window length; if it had none, the band spans from start to the composition end. Pass the band group's id (from describe_video — a group with morpha:true).",
       parameters: {

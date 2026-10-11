@@ -69,6 +69,19 @@ export const OUTDATED_UPLOAD_CLIENT = {
     "stored `filename` to reference, and takes the name people see as `name`.",
 } as const;
 
+/**
+ * The refusal a clip init gets when its stored name already holds a clip or a
+ * sidecar beside one: a presigned PUT never writes over a stored file. Fresh
+ * inits mint a free id, so this reaches only an upload ticket replayed after
+ * its upload was admitted.
+ */
+export const CLIP_ALREADY_STORED = {
+  status: 409,
+  code: "clip-already-stored",
+  error: (name: string): string =>
+    `${name} is already stored in this project. A stored clip is never written over: start a new upload.`,
+} as const;
+
 /** The extensions an asset upload takes: images, audio, and custom typefaces
  *  (project.custom_fonts, loaded with the FontFace API). */
 export const ASSET_EXTENSIONS: ReadonlySet<string> = new Set([
