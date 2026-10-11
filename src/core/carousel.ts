@@ -23,8 +23,9 @@ import type { Composition, PageComposition, Project } from "./schemas.ts";
  *  purpose: the MCP instructions have to stay inside Claude Code's 2,048
  *  characters (worker/src/mcp-instructions.ts). */
 export const VERSIONS_AS_PAGES_GUIDANCE =
-  "For several versions of one video (hooks, languages, a sheet's rows), make pages of one project " +
-  "with add_page and duplicate_index. Exporting gives one video per page, and pages have no limit.";
+  "Versions or options of one video (styles to pick from, hooks, languages, a sheet's rows) are pages " +
+  "of ONE project (add_page, duplicate_index), never separate projects: the preview turns pages " +
+  "and exports one video per page.";
 
 export const clampActiveIndex = (project: Project): number =>
   Math.min(Math.max(0, project.active_index), project.pages.length - 1);

@@ -52,6 +52,11 @@ export interface UploadedFile {
   filename: string;
   /** The display name. */
   name: string;
+  /** An image's pixel size, read from its header at upload; null for audio,
+   *  a font, or an image whose header did not say. Size an image layer from
+   *  it (or pass add_image_layer one side and let it keep the aspect). */
+  width?: number | null;
+  height?: number | null;
 }
 
 /**

@@ -609,6 +609,28 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return parsed.data;
   };
 
+  // The route the editor's Delete uses, not the delete_project tool: the tool
+  // only returns a link for a person to confirm in their browser, and a script
+  // calling this method is that decision.
+  const deleteProject = async (
+    projectId: string,
+  ): Promise<{ projectId: string } & Record<string, unknown>> => {
+    const res = await doFetch(
+      `${origin}/api/project/${encodeURIComponent(projectId)}`,
+      { method: "DELETE", headers: headers() },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `deleteProject(${projectId}) failed: HTTP ${res.status} ${await safeText(res)}`.trim(),
+      );
+    }
+    const { ok: _ok, ...summary } = (await res.json()) as {
+      ok?: boolean;
+      projectId: string;
+    } & Record<string, unknown>;
+    return summary;
+  };
+
   const listTools = async (): Promise<ToolFunction[]> => {
     const res = await doFetch(`${origin}/api/tools`, { headers: headers() });
     if (!res.ok) {
@@ -967,10 +989,7 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         assetsMoved: number;
         clipsMoved: number;
       },
-    deleteProject: async (projectId) =>
-      (await serverData("delete_project", projectId)) as {
-        projectId: string;
-      } & Record<string, unknown>,
+    deleteProject,
 
     saveVersion: async (projectId, opts = {}) =>
       (await serverData("save_version", projectId, { name: opts.name })) as {

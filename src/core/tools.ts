@@ -21,6 +21,12 @@ import { collectMatteRelations } from "./matte-relations.ts";
 import { SHAPE_DEFS, SHAPE_IDS } from "./shapes.ts";
 import { formatClockLabel } from "./clock-time.ts";
 import { DEFAULT_TEXT_FONT } from "./text-font.ts";
+import {
+  measureTextLayer,
+  textLayerReport,
+  type TextBoxMetrics,
+  type TextFit,
+} from "./text-measure.ts";
 import { nameKeptAcrossSwap } from "./upload-contract.ts";
 // Cross-tree import: the font catalogues live in editor/src/ (the editor is
 // their primary consumer); the agent-facing list_fonts tool reuses them so
@@ -1468,6 +1474,11 @@ type OverviewNode = {
   mask?: string;
   mask_for?: string;
   animated?: string[];
+  // Text layers only: where width/height came from (a hug layer's is its
+  // painted box, not the stored one) and whether the box stays inside the
+  // canvas and the platform safe area at its static position.
+  metrics?: TextBoxMetrics;
+  fits?: TextFit;
   children?: OverviewNode[];
 };
 
@@ -1566,6 +1577,7 @@ const overviewNode = (
     const t = project.text_layers.find((x) => x.id === id);
     if (!t) return null;
     const text = t.text.length > 60 ? `${t.text.slice(0, 60)}…` : t.text;
+    const box = measureTextLayer(t, t.style);
     return {
       elementId,
       type,
@@ -1573,8 +1585,10 @@ const overviewNode = (
       text,
       x: t.x,
       y: t.y,
-      width: t.width,
-      height: t.height,
+      width: box.width,
+      height: box.height,
+      metrics: box.metrics,
+      fits: textLayerReport(project, t).fits,
       rotation: t.rotation,
       ...animField,
       ...maskField,
@@ -1793,6 +1807,7 @@ const fullLayerRecord = (
     ...layer,
     ...(speedKfs ? { speed_keyframes: speedKfs } : {}),
     ...canvasGeom,
+    ...(type === "text" ? textLayerReport(project, layer as TextLayer) : {}),
     animations: layer.animations ?? null,
     color_tracks: layer.color_tracks ?? null,
     track_loops: layer.track_loops ?? null,
@@ -2602,16 +2617,25 @@ const parseAddBlockArg = (
 // Headless callers should pre-check that the asset exists at
 // users/<userId>/assets/<projectId>/<filename> in R2; this dispatcher does
 // NOT verify the file. The editor adapter retains its XHR HEAD pre-check.
+//
+// The box keeps the picture's aspect when one side is omitted: the Worker
+// (dispatchPureTool) fills the other side from the size it recorded at upload,
+// and the editor adapter from the loaded image. This pure dispatcher cannot
+// see the file, so by the time it runs both sides are present; a caller that
+// reaches it directly with a side missing is told where the fill happens.
 
 type AddImageLayerArgs = {
   filename: string;
   x: number;
   y: number;
-  width: number;
-  height: number;
+  width?: number;
+  height?: number;
   block?: unknown;
   name?: string;
 };
+
+const MISSING_SIDE =
+  "the other side is filled from the image's own aspect over MCP / HTTP (from the size the upload recorded) and in the editor; here pass both width and height";
 
 const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   const { filename, x, y, width, height, name } = args;
@@ -2623,6 +2647,12 @@ const addImageLayer: ToolDispatch<AddImageLayerArgs> = (project, args) => {
   }
   if (!Number.isFinite(y)) {
     return { project, result: { ok: false, error: `invalid y: ${y}` } };
+  }
+  if (width === undefined && height === undefined) {
+    return { project, result: { ok: false, error: "width or height is required (px, > 0); omit the other to keep the image's aspect" } };
+  }
+  if (width === undefined || height === undefined) {
+    return { project, result: { ok: false, error: `${width === undefined ? "width" : "height"} is missing: ${MISSING_SIDE}` } };
   }
   if (!Number.isFinite(width) || width <= 0) {
     return { project, result: { ok: false, error: `invalid width: ${width}` } };
@@ -3864,7 +3894,10 @@ const setTextBackground: ToolDispatch<SetTextBackgroundArgs> = (
   }
   if (!merged.borderColor) delete merged.borderColor;
   layer.style = Object.keys(merged).length === 0 ? undefined : merged;
-  return { project: next, result: { ok: true } };
+  return {
+    project: next,
+    result: { ok: true, data: textLayerReport(next, layer) },
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -7326,6 +7359,7 @@ const setLayerText: ToolDispatch<SetLayerTextArgs> = (project, args) => {
         stroke_width: layer.stroke_width ?? null,
         stroke_color: layer.stroke_color ?? null,
         decorations: layer.decorations ?? null,
+        ...textLayerReport(next, layer),
       },
     },
   };
@@ -7479,7 +7513,10 @@ const addTextLayer: ToolDispatch<AddTextLayerArgs> = (project, args) => {
   next.layer_order = [...next.layer_order, `text.${id}`];
   return {
     project: next,
-    result: { ok: true, data: { id, elementId: `text.${id}` } },
+    result: {
+      ok: true,
+      data: { id, elementId: `text.${id}`, ...textLayerReport(next, layer) },
+    },
   };
 };
 
@@ -8894,7 +8931,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "describe_video",
       description:
-        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, platform_safe_area (the part of the canvas TikTok / Reels UI and Instagram's feed crop leave visible: keep text, captions, logos and buttons inside it; null when nothing is covered or cropped), the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a multi-page project the tree describes the ACTIVE page and the data carries a `pages` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
+        "Structural OVERVIEW of the composition (the table of contents) — canvas size, duration, platform_safe_area (the part of the canvas TikTok / Reels UI and Instagram's feed crop leave visible: keep text, captions, logos and buttons inside it; null when nothing is covered or cropped), the backdrop summary, and a z-ordered tree (top of stack first) of every layer with its elementId, type, name, type label (filename/clip/text/kind), geometry (x/y/width/height; a hug text layer's is its painted box, measured from the font, with metrics saying so), fits for every text layer ({canvas, safe_area} at its static position), and which properties are animated. Does NOT include keyframe values or styles — those are unbounded. On a multi-page project the tree describes the ACTIVE page and the data carries a `pages` block ({ page_count, active_index, pages: [{ index, name, has_video }] }) — content tools target that active page; use select_page to switch which page they target, add_page / delete_page / reorder_pages to manage the pages. Start here, then call inspect_layers([elementId, …]) for full detail on the specific layers you'll change. Don't guess keyframe/style values from this overview.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -9173,15 +9210,15 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_image_layer",
       description:
-        "Add an image layer. The asset must already be uploaded (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header). Every upload returns { filename, name }: pass `filename` (the stored file's id) here, and `name` as the layer's label. To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
+        "Add an image layer. The asset must already be uploaded (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header). Every upload returns { filename, name, width, height }: pass `filename` (the stored file's id) here, and `name` as the layer's label. SIZE THE BOX TO THE PICTURE: pass `width` alone (or `height` alone) and the other side is filled from the image's own aspect, so the picture is never stretched; a box with both sides that does not match the image's aspect stretches the picture to fill it. To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
           filename: { type: "string", description: "The stored filename an upload returned (an id such as 3f2a9c1e-….png, or an older project's own name)." },
           x: { type: "number", description: "Centre x in 1080-wide base coords." },
           y: { type: "number", description: "Centre y in 1920-tall base coords." },
-          width: { type: "number", description: "Width in px (must be > 0)." },
-          height: { type: "number", description: "Height in px (must be > 0)." },
+          width: { type: "number", description: "Width in px (> 0). Omit it to derive it from `height` and the image's aspect." },
+          height: { type: "number", description: "Height in px (> 0). Omit it to derive it from `width` and the image's aspect; the usual call passes `width` alone." },
           block: {
             type: "object",
             description:
@@ -9198,7 +9235,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
               "Optional label people see in the Inspector and Timeline: pass the upload's returned `name`. Without it the layer is labelled by an older project's own filename, or by kind; never by a stored id.",
           },
         },
-        required: ["filename", "x", "y", "width", "height"],
+        required: ["filename", "x", "y"],
       },
     },
   },
@@ -9479,7 +9516,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_text_background",
       description:
-        "Add or update the rounded background box behind a TEXT layer (text.<id>) in one call — sets the backdrop fill plus the box's padding, corner radius, and optional stroke. Pass only the fields you want to change. New text layers are already text_autofit \"hug\", so padding alone shrink-wraps the box to the text — ideal for caption / sticker chips; set_layer_text(text_autofit:\"hug\") is only needed when adding a box to an OLDER layer still on \"wrap\". THIS IS HOW YOU BUILD A BUTTON: a button / CTA / chip / tag / pill / labelled badge is ONE text layer with a native background, never a rounded-rect shape with a text layer parked on top — padding is what sizes the box around the label, so the two can't drift apart when the text or the scale changes and the user drags one layer instead of two. The one exception: the box is NOT painted on CURVED text (a straight box behind a bent line reads as broken), so an arc-shaped chip genuinely needs a shape behind it. Pass fill null to remove the box. Text layers only; for shapes/images/video use set_layer_fill.",
+        "Add or update the rounded background box behind a TEXT layer (text.<id>) in one call — sets the backdrop fill plus the box's padding, corner radius, and optional stroke. Pass only the fields you want to change. New text layers are already text_autofit \"hug\", so padding alone shrink-wraps the box to the text — ideal for caption / sticker chips; set_layer_text(text_autofit:\"hug\") is only needed when adding a box to an OLDER layer still on \"wrap\". THIS IS HOW YOU BUILD A BUTTON: a button / CTA / chip / tag / pill / labelled badge is ONE text layer with a native background, never a rounded-rect shape with a text layer parked on top — padding is what sizes the box around the label, so the two can't drift apart when the text or the scale changes and the user drags one layer instead of two. The one exception: the box is NOT painted on CURVED text (a straight box behind a bent line reads as broken), so an arc-shaped chip genuinely needs a shape behind it. Pass fill null to remove the box. Text layers only; for shapes/images/video use set_layer_fill. Returns text_box and fits for the padded box, with a warning when it runs past the canvas or the safe area.",
       parameters: {
         type: "object",
         properties: {
@@ -10282,7 +10319,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_layer_text",
       description:
-        "Edit an existing text layer (text.<id>). Patches its text content, font, size, colour, and full type styling — pass only the fields you want to change. Does NOT create layers and does NOT touch image layers; use add_text_layer to make a new one. `font_family` is a Google Fonts family name (e.g. \"Anton\", \"Bebas Neue\"). `text_size` is the font size in px (omit to keep the current size). `text_color` is #rrggbb. Styling: font_weight (100-900, e.g. 800 for a black/heavy logo look), font_style (italic), text_transform (uppercase/lowercase), letter_spacing (px, may be negative for tight tracking), line_height (multiplier), text_align, text_autofit (\"wrap\" default = fixed size + word-wrap, the size you set is what renders; \"fit\"=auto-size to fill the box, grows and shrinks; \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom block alignment), an outline via stroke_width + stroke_color, and a text_shadow. To make text MASK another layer (video/image-filled letterforms) use set_matte_source with this layer's id as the matte source. Only `elementId` is required.",
+        "Edit an existing text layer (text.<id>). Patches its text content, font, size, colour, and full type styling — pass only the fields you want to change. Does NOT create layers and does NOT touch image layers; use add_text_layer to make a new one. `font_family` is a Google Fonts family name (e.g. \"Anton\", \"Bebas Neue\"). `text_size` is the font size in px (omit to keep the current size). `text_color` is #rrggbb. Styling: font_weight (100-900, e.g. 800 for a black/heavy logo look), font_style (italic), text_transform (uppercase/lowercase), letter_spacing (px, may be negative for tight tracking), line_height (multiplier), text_align, text_autofit (\"wrap\" default = fixed size + word-wrap, the size you set is what renders; \"fit\"=auto-size to fill the box, grows and shrinks; \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom block alignment), an outline via stroke_width + stroke_color, and a text_shadow. To make text MASK another layer (video/image-filled letterforms) use set_matte_source with this layer's id as the matte source. Only `elementId` is required. The result carries text_box, fits and a warning when the text runs past the canvas or the safe area (see add_text_layer).",
       parameters: {
         type: "object",
         properties: {
@@ -10411,7 +10448,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
         DEFAULT_TEXT_H +
         ", font_family \"" +
         DEFAULT_TEXT_FONT +
-        "\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"hug\" default = box shrink-wraps the text at the fixed text_size, honouring literal newlines, so it can't re-wrap between preview and export — bake your own \"\\n\" line breaks / \"wrap\"=fixed size + word-wrap to the box / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>).",
+        "\", text_size derived from existing text layers (or ~10% of canvas height). Also accepts full type styling: font_weight (100-900), font_style (italic), text_transform, letter_spacing, line_height, text_align, text_autofit (\"hug\" default = box shrink-wraps the text at the fixed text_size, honouring literal newlines, so it can't re-wrap between preview and export — bake your own \"\\n\" line breaks / \"wrap\"=fixed size + word-wrap to the box / \"fit\"=auto-size to fill the box, grows and shrinks / \"shrink\"=legacy shrink-only), text_valign (top/middle/bottom), an outline (stroke_width + stroke_color), and text_shadow. Returns the new layer's id + element id (text.<id>), plus text_box (the painted box, measured from the font's glyphs), fits ({canvas, safe_area}, judged at the layer's static position) and, when the text runs past either, a warning naming the text_size that fits: add \\n line breaks or lower text_size.",
       parameters: {
         type: "object",
         properties: {

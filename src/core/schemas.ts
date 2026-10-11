@@ -3565,9 +3565,10 @@ export const versionSchema = z
      * Assigned across BOTH kinds at save time; the editor's bookmarks-only
      * V<n> display label is computed by filtering to kind=="bookmark" and
      * indexing, NOT by reading this field directly.
-     * Optional only for backwards-compat with legacy versions saved before
-     * the field was introduced; the worker backfills missing values on read
-     * by timestamp-ascending order and persists the result. */
+     * Optional because an auto-snapshot has none. A stored bookmark always
+     * has one: assigned at save, or by the one-shot `just stamp-versions` for
+     * the bookmarks saved before the field existed; the worker's version
+     * reader throws on a bookmark without one rather than guessing. */
     version_number: z.number().int().positive().optional(),
     project: projectSchema,
   })

@@ -258,7 +258,7 @@ export const platformSafeAreaFor = (
 export const PLATFORM_SAFE_AREA_GUIDANCE =
   "TikTok and Instagram Reels draw their own buttons, captions and tab bar " +
   "over the edges of a full-screen 9:16 video, and Instagram's feed crops " +
-  "tall videos to 4:5. describe_video's platform_safe_area is the part of " +
-  "the canvas that stays visible (null when nothing is covered or cropped). " +
-  "Put text, captions, logos, buttons and other key content inside it; " +
-  "backgrounds, footage and decoration can run to the canvas edge.";
+  "tall videos to 4:5. describe_video's platform_safe_area is the part that " +
+  "stays visible (null when nothing is covered or cropped). Keep text, " +
+  "captions, logos, buttons and other key content inside it; backgrounds, " +
+  "footage and decoration can run to the edge.";
