@@ -9210,7 +9210,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_image_layer",
       description:
-        "Add an image layer. The asset must already be uploaded (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header). Every upload returns { filename, name, width, height }: pass `filename` (the stored file's id) here, and `name` as the layer's label. SIZE THE BOX TO THE PICTURE: pass `width` alone (or `height` alone) and the other side is filled from the image's own aspect, so the picture is never stretched; a box with both sides that does not match the image's aspect stretches the picture to fill it. To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
+        "Add an image layer. The image must already be uploaded: upload_image takes a web URL or a file attached in the chat, and a file from the person's disk is uploaded in the editor. Every upload returns { filename, name, width, height }: pass `filename` (the stored file's id) here, and `name` as the layer's label. SIZE THE BOX TO THE PICTURE: pass `width` alone (or `height` alone) and the other side is filled from the image's own aspect, so the picture is never stretched; a box with both sides that does not match the image's aspect stretches the picture to fill it. To duplicate an existing layer, reuse its filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
@@ -9244,7 +9244,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_video_layer",
       description:
-        "Add a video layer. The clip must already be uploaded (the morphareels-sdk's client.addVideo, or the editor). An upload returns { filename, name }: pass `filename` (the stored clip's id) as `clip`, and `name` as the layer's label. To duplicate an existing layer, reuse its clip filename — the editor auto-assigns a fresh id.",
+        "Add a video layer. The clip must already be uploaded; clips are uploaded in the MorphaReels editor. An upload returns { filename, name }: pass `filename` (the stored clip's id) as `clip`, and `name` as the layer's label. To duplicate an existing layer, reuse its clip filename — the editor auto-assigns a fresh id.",
       parameters: {
         type: "object",
         properties: {
@@ -9721,7 +9721,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "group_layers",
       description:
-        "Wrap sibling elements in a new group. USE THIS whenever several layers are one thing — a butterfly assembled from wings + body + antennae, an icon built from primitives, a card + its title + badge, a lower-third — and name the group what the thing is; a multi-shape object left as loose siblings is a defect the user has to clean up, and the group's name is their only handle on it. The group composes its x/y/scale/rotation/opacity onto its descendants (so one track flies/spins/fades the whole thing) and pivots rotate/scale at its (pivotX, pivotY), seeded to the centroid of its children at create time. The group's x/y track values are translation offsets applied around the pivot — groups have no static body of their own. All listed elementIds must currently share the same parent (root, or one existing group).",
+        "Wrap sibling elements in a new group, which the Layers panel shows as one named row the person can select, move and animate as one thing (a butterfly assembled from wings + body + antennae, an icon built from primitives, a card + its title + badge, a lower-third). `name` is that row's label. The group composes its x/y/scale/rotation/opacity onto its descendants (so one track flies/spins/fades the whole thing) and pivots rotate/scale at its (pivotX, pivotY), seeded to the centroid of its children at create time. The group's x/y track values are translation offsets applied around the pivot — groups have no static body of their own. All listed elementIds must currently share the same parent (root, or one existing group).",
       parameters: {
         type: "object",
         properties: {
@@ -9860,7 +9860,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "add_audio_overlay",
       description:
-        "Add an audio overlay (mp3/m4a/wav/ogg) scheduled at a frame-aligned start. The asset must already be uploaded (upload_audio, create_upload_link, or the editor); pass the upload's returned `filename`, and its `name` as the track's label. 30 fps; convert seconds with frames = round(s * 30). Plays in the editor preview and is mixed into the MP4 export.",
+        "Add an audio overlay (mp3/m4a/wav/ogg) scheduled at a frame-aligned start. The asset must already be uploaded (upload_audio, or the editor for a file from the person's disk); pass the upload's returned `filename`, and its `name` as the track's label. 30 fps; convert seconds with frames = round(s * 30). Plays in the editor preview and is mixed into the MP4 export.",
       parameters: {
         type: "object",
         properties: {
@@ -10257,7 +10257,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_custom_font",
       description:
-        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file already uploaded to the project's asset bucket (create_upload_link, or POST /api/upload-asset/<projectId> with raw bytes + an X-Upload-Name header; .woff2/.woff/.ttf/.otf): pass the filename the upload returned. Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path. A URL is not fetched when this tool runs: Morpha's renderer and every browser that opens the project download it later. Reference: https://morphareels.ai/docs/tools#setcustomfontfamily-src-weight-style",
+        "Register a typeface Morpha does NOT ship, so text layers can use it by family name via font_family (exactly like a built-in family). Families already in the built-in catalogs (anything list_fonts returns from google/bunny/fontshare/fontsource/velvetyne) are REJECTED — they need no registration; just set font_family to them directly. `src` is EITHER a full URL (https://…) OR a font file (.woff2/.woff/.ttf/.otf) already uploaded to the project in the editor: pass the filename the upload returned. Like add_image_layer, this does NOT verify an uploaded filename exists. Dedupes by family+weight+style, replacing a matching face. After registering, set a text layer's font_family to this family (add_text_layer / set_layer_text). NOTE: a pasted URL only loads if that host sends permissive CORS headers — uploading the font (served same-origin) is the robust path. A URL is not fetched when this tool runs: Morpha's renderer and every browser that opens the project download it later. Reference: https://morphareels.ai/docs/tools#setcustomfontfamily-src-weight-style",
       parameters: {
         type: "object",
         properties: {
@@ -10771,7 +10771,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_image_filename",
       description:
-        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The asset must already exist at users/<userId>/assets/<projectId>/<filename> (the editor's drag-drop, upload_image, create_upload_link, or POST /api/upload-asset/<projectId> with the raw bytes and an X-Upload-Name header); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
+        "Repoint an existing image layer at a different uploaded asset — keeps the layer's id, position, size, animations, and styles; only the bitmap changes. The image must already be uploaded (upload_image for a web URL or a file attached in the chat; the editor for a file from the person's disk); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a layer's image WITHOUT losing its keyframes — `remove_layer` + `add_image_layer` would mint a new id and drop the animations.",
       parameters: {
         type: "object",
         properties: {
@@ -10799,7 +10799,7 @@ export const TOOL_DEFINITIONS: ToolFunction[] = [
     function: {
       name: "set_video_clip",
       description:
-        "Repoint an existing video layer at a different uploaded clip — keeps the layer's id, position, size, animations, styles, and trim window; only the source mp4 changes. The clip must already be uploaded (the editor's Add video, or the morphareels-sdk's client.addVideo); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a video layer's source WITHOUT losing its keyframes.",
+        "Repoint an existing video layer at a different uploaded clip — keeps the layer's id, position, size, animations, styles, and trim window; only the source mp4 changes. The clip must already be uploaded (the editor's Add video); pass the `filename` the upload returned, and its `name` as the label. Use this to swap a video layer's source WITHOUT losing its keyframes.",
       parameters: {
         type: "object",
         properties: {

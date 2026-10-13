@@ -92,6 +92,7 @@ export type {
   UploadAssetSource,
   UploadSourceOptions,
   ClipProcessingStatus,
+  TrashedProjectSummary,
 } from "./client.ts";
 // What every upload returns: the stored `filename` to reference, and the
 // `name` people see.

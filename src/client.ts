@@ -130,6 +130,17 @@ export interface CacheReadResult {
   note?: string;
 }
 
+/** One row of Recently deleted (listTrash). Times are epoch ms; `purgeAt` is
+ *  when the project is deleted for good. */
+export interface TrashedProjectSummary {
+  id: string;
+  name: string;
+  trashedAt: number;
+  purgeAt: number;
+  deletedBy: { kind: "you" | "person" | "agent"; label: string };
+  canEdit: boolean;
+}
+
 export interface MorphaClient {
   /** Fetch a hosted project's JSON (migrated + schema-validated). */
   getProject(projectId: string): Promise<Project>;
@@ -238,9 +249,17 @@ export interface MorphaClient {
     assetsMoved: number;
     clipsMoved: number;
   }>;
-  /** Permanently delete a project. Requires edit access (owner, workspace
-   * editor+, or direct-share editor); deleting your last project is allowed. */
-  deleteProject(projectId: string): Promise<{ projectId: string } & Record<string, unknown>>;
+  /** Move a project to Recently deleted, where it can be restored until
+   * `purgeAt` (epoch ms, 30 days on). Requires edit access (owner, workspace
+   * editor+, or direct-share editor); deleting your last project is allowed.
+   * Deleting for good is a person's step on their projects page; the SDK has
+   * no method for it. */
+  deleteProject(projectId: string): Promise<{ trashed: true; name: string; purgeAt: number }>;
+  /** The projects in Recently deleted: your personal ones, or with
+   * `workspaceId` that workspace's. */
+  listTrash(opts?: { workspaceId?: string }): Promise<TrashedProjectSummary[]>;
+  /** Bring a project back from Recently deleted. */
+  restoreProject(projectId: string): Promise<{ projectId: string; name: string }>;
 
   // ── Versions ──────────────────────────────────────────────────────────────
   saveVersion(
@@ -609,26 +628,53 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
     return parsed.data;
   };
 
-  // The route the editor's Delete uses, not the delete_project tool: the tool
-  // only returns a link for a person to confirm in their browser, and a script
-  // calling this method is that decision.
+  // Recently deleted, over the routes the dashboard uses. A delete here moves
+  // the project to Recently deleted, the same as the editor's Delete and the
+  // delete_project tool.
+  const trashRoute = async <T>(
+    label: string,
+    path: string,
+    method: "GET" | "POST" | "DELETE",
+  ): Promise<T> => {
+    const res = await doFetch(`${origin}${path}`, { method, headers: headers() });
+    if (!res.ok) {
+      throw new Error(`${label} failed: HTTP ${res.status} ${await safeText(res)}`.trim());
+    }
+    return (await res.json()) as T;
+  };
+
   const deleteProject = async (
     projectId: string,
-  ): Promise<{ projectId: string } & Record<string, unknown>> => {
-    const res = await doFetch(
-      `${origin}/api/project/${encodeURIComponent(projectId)}`,
-      { method: "DELETE", headers: headers() },
+  ): Promise<{ trashed: true; name: string; purgeAt: number }> => {
+    const { trashed, name, purgeAt } = await trashRoute<{
+      trashed: true;
+      name: string;
+      purgeAt: number;
+    }>(`deleteProject(${projectId})`, `/api/project/${encodeURIComponent(projectId)}`, "DELETE");
+    return { trashed, name, purgeAt };
+  };
+
+  const listTrash = async (
+    opts: { workspaceId?: string } = {},
+  ): Promise<TrashedProjectSummary[]> => {
+    const query = opts.workspaceId ? `?org=${encodeURIComponent(opts.workspaceId)}` : "";
+    const { items } = await trashRoute<{ items: TrashedProjectSummary[] }>(
+      "listTrash",
+      `/api/trash${query}`,
+      "GET",
     );
-    if (!res.ok) {
-      throw new Error(
-        `deleteProject(${projectId}) failed: HTTP ${res.status} ${await safeText(res)}`.trim(),
-      );
-    }
-    const { ok: _ok, ...summary } = (await res.json()) as {
-      ok?: boolean;
-      projectId: string;
-    } & Record<string, unknown>;
-    return summary;
+    return items;
+  };
+
+  const restoreProject = async (
+    projectId: string,
+  ): Promise<{ projectId: string; name: string }> => {
+    const { name } = await trashRoute<{ name: string }>(
+      `restoreProject(${projectId})`,
+      `/api/trash/${encodeURIComponent(projectId)}/restore`,
+      "POST",
+    );
+    return { projectId, name };
   };
 
   const listTools = async (): Promise<ToolFunction[]> => {
@@ -990,6 +1036,8 @@ export const createClient = (options: MorphaClientOptions = {}): MorphaClient =>
         clipsMoved: number;
       },
     deleteProject,
+    listTrash,
+    restoreProject,
 
     saveVersion: async (projectId, opts = {}) =>
       (await serverData("save_version", projectId, { name: opts.name })) as {
