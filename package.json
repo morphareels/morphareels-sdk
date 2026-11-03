@@ -65,7 +65,7 @@
     "prepublishOnly": "tsup"
   },
   "dependencies": {
-    "zod": "4.3.6"
+    "zod": "4.6.6"
   },
   "peerDependencies": {
     "playwright": ">=1.40.0"
